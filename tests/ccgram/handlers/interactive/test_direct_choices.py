@@ -32,6 +32,105 @@ def _button_data(keyboard) -> list[str]:
 
 
 class TestParseDirectChoices:
+    def test_claude_header_checkbox_is_not_multi_select(self) -> None:
+        # Current Claude Code renders the AskUserQuestion header as
+        # "☐ <header>" even for single-select: the checkbox is decorative
+        # and must not trip the multi-select guard.
+        choices = parse_direct_choices(
+            " ☐ Next step\n"
+            "│ What would you like to do next?\n"
+            "❯ 1. Just testing the flow\n"
+            "     Confirm this prompt rendered correctly and stop here.\n"
+            "  2. Build a ccgram repro\n"
+            "     Set up an actual reproduction for the bridge.\n"
+            "  3. Ask another question\n"
+            "     Fire another AskUserQuestion to exercise the surface.\n"
+            "  4. Type something.\n"
+            "Enter to select · ↑/↓ to navigate · Esc to cancel"
+        )
+        assert choices == (
+            ("1", "1. Just testing the flow"),
+            ("2", "2. Build a ccgram repro"),
+            ("3", "3. Ask another question"),
+            ("4", "4. Type something."),
+        )
+
+    def test_checkbox_after_the_label_rejects_multi_select(self) -> None:
+        assert (
+            parse_direct_choices(
+                "Pick your fixes:\n  1. Alpha ☐\n  2. Beta ☐\nEnter to select"
+            )
+            == ()
+        )
+
+    def test_described_plan_prose_above_an_editor_hint_is_not_a_menu(self) -> None:
+        # Plan bodies and markdown lists carry numbered steps with indented
+        # continuations; a vim or pager hint below them is not a selection
+        # footer, and tapping a step would type a digit into a prompt.
+        assert (
+            parse_direct_choices(
+                "  1. Refactor the parser\n"
+                "     extract a shared helper\n"
+                "  2. Add regression tests\n"
+                "     cover the case\n"
+                "  3. Update docs\n"
+                "ctrl-g to edit in vim"
+            )
+            == ()
+        )
+
+    def test_codex_confirm_footer_anchors_cursorless_menu(self) -> None:
+        # Codex approval menus have no cursor in the pane (cursors are
+        # stripped by normalization); the confirm/esc footer is their only
+        # anchor, and those verbs are menu verbs, not pager verbs.
+        assert parse_direct_choices(
+            "1. Allow once\n"
+            "2. Allow for this session\n"
+            "3. Deny\n"
+            "Press enter to confirm or esc to cancel"
+        ) == (
+            ("1", "1. Allow once"),
+            ("2", "2. Allow for this session"),
+            ("3", "3. Deny"),
+        )
+
+    def test_arrow_or_quoted_prose_line_is_not_a_cursor_anchor(self) -> None:
+        # A blockquote marker or an arrow starting a prose line must not
+        # adopt the numbered list below it; only a cursor on an option
+        # line anchors a menu.
+        assert (
+            parse_direct_choices(
+                "→ see the migration guide for details\n"
+                "  1. Refactor the parser\n"
+                "     extract a shared helper\n"
+                "  2. Add regression tests"
+            )
+            == ()
+        )
+
+    def test_described_prose_above_enter_to_continue_is_not_a_menu(self) -> None:
+        assert (
+            parse_direct_choices(
+                "Summary:\n"
+                "  1. Fix the parser\n"
+                "     it drops lines\n"
+                "  2. Add tests\n"
+                "Enter to continue"
+            )
+            == ()
+        )
+
+    def test_trailing_checkbox_options_reject_multi_select(self) -> None:
+        # A multi-select can render the checkbox after the number; those
+        # option lines still match the numbered-option regex, so only the
+        # multi-select guard stands between them and false buttons.
+        assert (
+            parse_direct_choices(
+                "Pick several:\n  1. ☐ Alpha\n  2. ☐ Beta\nEnter to select"
+            )
+            == ()
+        )
+
     def test_parses_bounded_numbered_single_select_options(self) -> None:
         choices = parse_direct_choices(
             "Pick a deployment:\n  ❯ 1. Staging\n    2. Production\n  Enter to select"

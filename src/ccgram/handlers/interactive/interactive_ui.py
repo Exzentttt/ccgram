@@ -1,4 +1,4 @@
-"""Interactive UI handling for Claude Code prompts.
+"""Interactive UI handling for terminal agent prompts.
 
 Handles interactive terminal UIs displayed by Claude Code:
   - AskUserQuestion: Multi-choice question prompts
@@ -26,7 +26,6 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Message
 from telegram.error import BadRequest, NetworkError, RetryAfter, TelegramError, TimedOut
 
 from ...providers import get_provider_for_window
-from ...providers.pi import PI_QUESTION_FOOTER
 from ...telegram_client import TelegramClient
 from ...window_query import get_window_provider
 from ...thread_router import thread_router
@@ -103,11 +102,24 @@ INTERACTIVE_INSTRUCTION_LINE = (
 _TELEGRAM_MAX_TEXT = 4096
 _MAX_DIRECT_CHOICES = 8
 _MIN_NUMBERED_DIRECT_CHOICES = 2
-_CURSOR_MARKER_RE = re.compile(r"^\s*[←→❯>]")
+_CURSOR_PREFIX = r"(?:[←→❯>]\s*)?"
+# A cursor marker on an option line (the selected entry of a live menu).
+_CURSOR_OPTION_RE = re.compile(r"^\s*[←→❯>]\s*\d+\.")
+# Selection footers carry a menu verb; pager or editor hints ("Enter to
+# continue", "ctrl-g to edit") must not anchor numbered prose as a menu.
+# The verb set mirrors the footer vocabulary in providers/codex_format.py
+# and providers/gemini.py, minus the pager verb "continue".
 _DIRECT_CHOICE_ACTION_RE = re.compile(
-    r"(?i)^\s*(?:Esc to|Enter to|Press enter to|ctrl-g to edit)"
+    r"(?i)^\s*(?:(?:press )?enter to (?:select|confirm|submit)"
+    r"|enter select|esc to (?:cancel|exit))"
 )
-_NUMBERED_OPTION_RE = re.compile(r"^\s*(?:[←→❯>]\s*)?(\d+)\.\s+(.+?)\s*$")
+_NUMBERED_OPTION_RE = re.compile(r"^\s*" + _CURSOR_PREFIX + r"(\d+)\.\s+(.+?)\s*$")
+# A checkbox on an option line, in any position, marks a real multi-select;
+# a bare checkbox elsewhere is decoration (Claude Code renders the question
+# header as "☐ <header>" even for single-select).
+_OPTION_CHECKBOX_RE = re.compile(
+    r"(?m)^\s*" + _CURSOR_PREFIX + r"(?:[☐☑]\s*\d+\.|\d+\..*[☐☑])"
+)
 _MULTI_SELECT_RE = re.compile(
     r"(?i)\b(?:select|choose|pick)\b[^\n]*(?:all|multiple|more than one)\b"
 )
@@ -261,10 +273,16 @@ def get_interactive_msg_id(
 
 def _numbered_menu_blocks(
     lines: list[str],
-    *,
-    allow_descriptions: bool = False,
 ) -> list[tuple[int, int, tuple[tuple[str, str], ...]]]:
-    """Find contiguous sequential numbered menu blocks and their line ranges."""
+    """Find contiguous sequential numbered menu blocks and their line ranges.
+
+    Lines indented past the option number are consumed as its description,
+    including numbered prose inside a description: Claude Code and Pi both
+    indent option descriptions this way. Unrelated numbered prose elsewhere
+    in the capture is kept out of the buttons by the anchors in
+    ``parse_direct_choices`` (a cursor-prefixed option or a selection
+    footer); the ranking there only disambiguates between candidate blocks.
+    """
     blocks: list[tuple[int, int, tuple[tuple[str, str], ...]]] = []
     index = 0
     while index < len(lines):
@@ -277,11 +295,8 @@ def _numbered_menu_blocks(
         choices: list[tuple[str, str]] = []
         expected = 1
         while index < len(lines):
-            # Pi indents descriptions past the option number, including numbered prose.
-            if (
-                allow_descriptions
-                and lines[index].strip()
-                and lines[index].startswith(" " * (first.start(1) + 1))
+            if lines[index].strip() and lines[index].startswith(
+                " " * (first.start(1) + 1)
             ):
                 index += 1
                 continue
@@ -311,18 +326,18 @@ def parse_direct_choices(content: str) -> tuple[tuple[str, str], ...]:
     prevents unrelated numbered prose elsewhere in a terminal capture from
     becoming one-tap input. Explicit multi-select prompts never get buttons.
     """
-    if "☐" in content or "☑" in content or _MULTI_SELECT_RE.search(content):
+    if _OPTION_CHECKBOX_RE.search(content) or _MULTI_SELECT_RE.search(content):
         return ()
 
     lines = content.splitlines()
-    blocks = _numbered_menu_blocks(
-        lines,
-        allow_descriptions=any(line.strip() == PI_QUESTION_FOOTER for line in lines),
-    )
+    blocks = _numbered_menu_blocks(lines)
+    # Anchors must themselves be menu-shaped: a cursor ON an option line, or
+    # a selection footer. A bare arrow, blockquote marker, pager hint, or
+    # editor hint in surrounding prose must not adopt a numbered list.
     anchors = [
         index
         for index, line in enumerate(lines)
-        if _CURSOR_MARKER_RE.search(line) or _DIRECT_CHOICE_ACTION_RE.search(line)
+        if _CURSOR_OPTION_RE.match(line) or _DIRECT_CHOICE_ACTION_RE.search(line)
     ]
     if anchors:
         ranked = sorted(
@@ -332,7 +347,7 @@ def parse_direct_choices(content: str) -> tuple[tuple[str, str], ...]:
             )
             for start, end, choices in blocks
         )
-        if ranked and ranked[0][0] < len(lines):
+        if ranked:
             nearest_distance, nearest_choices = ranked[0]
             if (
                 len(nearest_choices) <= _MAX_DIRECT_CHOICES
