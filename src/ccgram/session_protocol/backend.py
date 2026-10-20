@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import json
 import socket
+from subprocess import TimeoutExpired
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
@@ -382,7 +383,7 @@ class MultiplexerSessionBackend:
                 workspace_id=data.get("workspaceId"),
             )
             return await self._created_target(ok, target_id)
-        except (OSError, RuntimeError) as exc:
+        except (OSError, RuntimeError, TimeoutExpired) as exc:
             raise ProtocolError(
                 503, "backend_unavailable", _CREATION_UNCONFIRMED
             ) from exc
@@ -401,8 +402,12 @@ class MultiplexerSessionBackend:
             raise ProtocolError(
                 400, "invalid_request", "Directory is not eligible for a worktree"
             )
-        branch = data.get("branch") or await asyncio.to_thread(
-            suggest_branch_name, data.get("title"), eligibility.repo_path
+        branch = (
+            data["branch"]
+            if "branch" in data
+            else await asyncio.to_thread(
+                suggest_branch_name, None, eligibility.repo_path
+            )
         )
         if not isinstance(branch, str) or not await asyncio.to_thread(
             validate_branch_name, branch

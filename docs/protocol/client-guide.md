@@ -134,6 +134,8 @@ Backend creation failures, including a failed inspection after launch, return
 `503 backend_unavailable`. Check the session list and terminal first.
 Native worktree creation cannot select an existing workspace. Combining `worktree`
 with `workspaceId` on that backend returns `422` before creating anything.
+For worktrees, supply `branch` or let the server choose an unused `ccg/agent-N`
+name. Undeclared creation fields, including `title`, are ignored.
 
 ## Requests
 

@@ -1,4 +1,5 @@
 from dataclasses import replace
+import subprocess
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, call
 from uuid import uuid4
@@ -16,6 +17,85 @@ from ccgram.session_protocol.service import LocalSessionService
 from ccgram.window_state_ports import identity_state
 from ccgram.window_state_ports.identity_state import IdentityProjection, get_identity
 from ccgram.window_state_store import WindowState, WindowStateStore
+
+
+@pytest.fixture
+def git_probes(monkeypatch, tmp_path):
+    outputs = {
+        ("rev-parse", "--is-inside-work-tree"): "true",
+        ("rev-parse", "--is-bare-repository"): "false",
+        ("rev-parse", "--abbrev-ref", "HEAD"): "main",
+        ("rev-parse", "--git-dir"): str(tmp_path / ".git"),
+        ("rev-parse", "--show-toplevel"): str(tmp_path),
+    }
+
+    def run(argv, **kwargs):
+        args = tuple(argv[3:] if argv[1] == "-C" else argv[1:])
+        return subprocess.CompletedProcess(argv, 0, outputs.get(args, ""), "")
+
+    boundary = MagicMock(side_effect=run)
+    monkeypatch.setattr("ccgram.worktrees.subprocess.run", boundary)
+    return boundary, run
+
+
+@pytest.mark.parametrize("probe", [("branch", "--list"), ("worktree", "list")])
+async def test_worktree_branch_probe_timeout_is_structured(
+    mux, tmp_path, git_probes, probe
+):
+    boundary, run = git_probes
+
+    def timeout(argv, **kwargs):
+        if tuple(argv[3:5]) == probe:
+            raise subprocess.TimeoutExpired(argv, 5)
+        return run(argv, **kwargs)
+
+    boundary.side_effect = timeout
+    with pytest.raises(ProtocolError) as error:
+        await MultiplexerSessionBackend(mux, "/tmp").create(
+            {"directory": str(tmp_path), "provider": "claude", "worktree": True}
+        )
+    assert error.value.status == 503
+    assert error.value.code == "backend_unavailable"
+    mux.create_window.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    "title", [1, True, {"text": "title"}, ["title"], "ignored title"]
+)
+async def test_worktree_creation_ignores_undeclared_title(
+    mux, tmp_path, git_probes, title
+):
+    mux.create_window.return_value = (True, "", "", "@1")
+    target = await MultiplexerSessionBackend(mux, "/tmp").create(
+        {
+            "directory": str(tmp_path),
+            "provider": "claude",
+            "worktree": True,
+            "title": title,
+        }
+    )
+    assert target.id == "@1"
+    assert mux.create_window.await_args.args[0] == str(
+        tmp_path.parent / f"{tmp_path.name}.worktrees" / "ccg-agent-1"
+    )
+
+
+@pytest.mark.parametrize("branch", [None, "", False, 0, {}, []])
+async def test_worktree_creation_rejects_present_invalid_branch(
+    mux, tmp_path, git_probes, branch
+):
+    with pytest.raises(ProtocolError) as error:
+        await MultiplexerSessionBackend(mux, "/tmp").create(
+            {
+                "directory": str(tmp_path),
+                "provider": "claude",
+                "worktree": True,
+                "branch": branch,
+            }
+        )
+    assert error.value.status == 400
+    assert error.value.code == "invalid_request"
+    mux.create_window.assert_not_awaited()
 
 
 async def test_tmux_session_setup_failure_returns_structured_creation_error(
