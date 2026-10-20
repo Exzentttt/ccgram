@@ -1,3 +1,4 @@
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, call
 from uuid import uuid4
@@ -131,6 +132,34 @@ async def test_native_worktree_rejects_selected_workspace(mux, tmp_path):
 
 
 @pytest.mark.parametrize(
+    "kind,raw", [("message.send", False), ("session.resume", True)]
+)
+async def test_action_uses_agent_submission_or_raw_shell_input(
+    mux, store, kind, raw, monkeypatch
+):
+    conversation = str(uuid4())
+    identity = identity_state.get_identity("@1")
+    assert identity is not None
+    monkeypatch.setattr(
+        identity_state,
+        "get_identity",
+        lambda _: replace(identity, session_id=conversation),
+    )
+    if raw:
+        mux.foreground.return_value = ForegroundInfo(23, 23, ["bash"], "/tmp")
+        mux.capture_pane.return_value = mux.capture_pane_by_id.return_value = "⌘0⌘"
+    service = LocalSessionService(MultiplexerSessionBackend(mux, "/tmp"), store)
+    session = (await service.list_sessions())[0]
+    data = {"conversationId": conversation} if raw else {"text": "hello"}
+    result, status = await service.execute(
+        session.id, Action(str(uuid4()), session.binding_version, kind, data)
+    )
+    assert status == 200 and result.outcome == "sent"
+    assert mux.send_to_pane.await_args.kwargs["raw"] is raw
+    assert mux.send_to_pane.await_args.kwargs["window_id"] == "@1"
+
+
+@pytest.mark.parametrize(
     "text,expected",
     [
         ("hello", [("i", False, True), ("hello", False, True), ("", True, False)]),
@@ -161,7 +190,7 @@ async def test_tmux_safe_message_stays_on_pinned_pane(monkeypatch, text, expecte
     sleeps = AsyncMock()
     monkeypatch.setattr("ccgram.multiplexer.tmux.asyncio.sleep", sleeps)
     try:
-        assert await manager.send_to_pane("%1", text, window_id="@1")
+        assert await manager.send_to_pane("%1", text, window_id="@1", raw=False)
         assert pane.send_keys.call_args_list == [
             call(value, enter=enter, literal=literal)
             for value, enter, literal in expected

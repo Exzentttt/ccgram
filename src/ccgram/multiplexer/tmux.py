@@ -1159,9 +1159,10 @@ class TmuxManager:
         enter: bool = True,
         literal: bool = True,
         window_id: str | None = None,
+        raw: bool = True,
     ) -> bool:
         """Send to a pinned pane, preserving safe TUI submission for messages."""
-        if literal and enter:
+        if literal and enter and not raw:
             # Resolve ownership once, then pin every capture/key in the sequence.
             def owner() -> str | None:
                 session = self.get_session()

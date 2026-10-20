@@ -841,12 +841,13 @@ class AgtermManager:
         enter: bool = True,
         literal: bool = True,
         window_id: str | None = None,
+        raw: bool = True,
     ) -> bool:
         """Reject raw pane locators; only a session id may authorise a write."""
         if window_id is None or pane_id != window_id:
             logger.warning("Rejected raw agterm pane write")
             return False
-        return await self.send(window_id, text, enter=enter, literal=literal)
+        return await self.send(window_id, text, enter=enter, literal=literal, raw=raw)
 
     async def send_keys_to_pane(
         self,

@@ -141,6 +141,7 @@ class RequestStore:
         hook = self._hooks.get(session_id)
         bound = self._hook_prompts.get(session_id)
         if bound and bound[0] == hook and bound[1:] != (prompt.fingerprint, version):
+            self._hook_prompts[session_id] = (bound[0], "", 0)
             hook = None
         structured = (
             hook is not None and bound == (hook, prompt.fingerprint, version)

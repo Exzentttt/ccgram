@@ -77,7 +77,8 @@ actions. Its identity stays present, and healthy sessions continue to refresh.
 
 tmux message submission uses the existing vim recovery, command-mode handling, and
 delayed Enter while pinning every capture and key to the verified pane. Raw paste
-and terminal keys retain their direct input behavior.
+and terminal keys retain their direct input behavior. Shell launches and resume
+also use raw input, so cached agent vim state cannot add editing keys to a command.
 
 The current history builder reads the transcript before paging. Large conversations
 therefore cost a full parse when content changes or history is requested. Add an

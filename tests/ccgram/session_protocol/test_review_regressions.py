@@ -89,7 +89,7 @@ def test_question_answers_have_unique_exact_menu_keys():
     "multi,screen",
     [
         (True, "Where?\n1. Staging\n2. Staging + production"),
-        (False, "Where? Select all that apply\n1. Staging\n2. Staging + production"),
+        (False, "Where?\nSelect all that apply\n1. Staging\n2. Staging + production"),
     ],
 )
 def test_multiselect_prompts_have_no_structured_controls(multi, screen):

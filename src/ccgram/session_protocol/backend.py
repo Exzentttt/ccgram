@@ -274,9 +274,20 @@ class MultiplexerSessionBackend:
     async def send_text(self, target: Target, text: str, *, enter: bool) -> bool:
         if target.pane_id:
             return await self.mux.send_to_pane(
-                target.pane_id, text, enter=enter, literal=True, window_id=target.id
+                target.pane_id,
+                text,
+                enter=enter,
+                literal=True,
+                window_id=target.id,
+                raw=target.provider in {"shell", "unknown"},
             )
-        return await self.mux.send(target.id, text, enter=enter, literal=True)
+        return await self.mux.send(
+            target.id,
+            text,
+            enter=enter,
+            literal=True,
+            raw=target.provider in {"shell", "unknown"},
+        )
 
     async def send_key(self, target: Target, key: str) -> bool:
         if target.pane_id:

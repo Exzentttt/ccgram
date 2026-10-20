@@ -261,6 +261,10 @@ class ActionExecutor:
                 422, "unsupported_action", "Use the terminal for this response"
             )
         prompt = await self.service.backend.prompt(target)
+        if self.service.requests.get(session_id) is not current:
+            raise ProtocolError(
+                409, "request_closed", "Request changed during validation"
+            )
         if prompt is None or prompt.fingerprint != current.fingerprint:
             self.service.requests.close(session_id, "vanished")
             raise ProtocolError(
@@ -299,12 +303,19 @@ class ActionExecutor:
         self, session_id: str, target: Target, action: Action
     ) -> bool:
         backend = self.service.backend
-        if self.service.requests.get(session_id):
+        request = self.service.requests.get(session_id)
+        if request:
             if not await backend.send_key(target, "Escape"):
                 return False
             if not await self._prompt_gone(target):
                 return False
-            self.service.requests.close(session_id, "dismissed")
+            current = self.service.requests.get(session_id)
+            if current is not None and current is not request:
+                raise ProtocolError(
+                    409, "request_open", "A new request opened during dismissal"
+                )
+            if current is request:
+                self.service.requests.close(session_id, "dismissed")
         text = self.service.uploads.message_text(
             action.data["text"], action.data.get("files", [])
         )
@@ -312,7 +323,10 @@ class ActionExecutor:
 
     async def _respond(self, session_id: str, target: Target, action: Action) -> bool:
         current = self.service.requests.get(session_id)
-        assert current is not None
+        if current is None or current.request.id != action.data["requestId"]:
+            raise ProtocolError(
+                409, "request_closed", "Request changed before dispatch"
+            )
         key = (
             current.option_keys[action.data["optionId"]]
             if "optionId" in action.data
@@ -322,7 +336,8 @@ class ActionExecutor:
             return False
         if not await self._prompt_gone(target):
             return False
-        self.service.requests.close(session_id, "answered")
+        if self.service.requests.get(session_id) is current:
+            self.service.requests.close(session_id, "answered")
         return True
 
     async def _prompt_gone(self, target: Target) -> bool:

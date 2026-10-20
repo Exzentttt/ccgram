@@ -1,0 +1,173 @@
+import asyncio
+import time
+from unittest.mock import AsyncMock, MagicMock, call
+from uuid import uuid4
+
+import pytest
+
+from ccgram.multiplexer.tmux import TmuxManager
+from ccgram.multiplexer.vim_state import notify_vim_insert_seen, reset_vim_state
+from ccgram.session_protocol.backend import Prompt
+from ccgram.session_protocol.events import EventHub
+from ccgram.session_protocol.models import Action
+from ccgram.session_protocol.requests import PendingHook, RequestStore
+
+
+def test_hook_cannot_return_after_an_intervening_prompt(monkeypatch):
+    requests = RequestStore(EventHub())
+    now = time.time()
+    hook = PendingHook("conv", "permission", "Bash", {"command": "git status"}, now)
+    first_prompt = Prompt("git status\n1. Yes\n2. No", "permission")
+    requests.observe_hook("s", hook)
+    first = requests.reconcile("s", "conv", 1, first_prompt)
+    assert first is not None and first.request.source == "hook"
+    requests.reconcile(
+        "s", "conv", 1, Prompt("different command\n1. Yes\n2. No", "permission")
+    )
+    monkeypatch.setattr("ccgram.session_protocol.requests.time.time", lambda: now + 31)
+    returning = requests.reconcile("s", "conv", 1, first_prompt)
+    assert returning is not None and returning.request.source == "screen"
+    assert not returning.option_keys
+
+
+@pytest.mark.parametrize("replacement", ["different", "closed", "same_screen"])
+async def test_response_rejects_replacement_during_pending_capture(
+    service, backend, replacement
+):
+    session = (await service.list_sessions())[0]
+    first_prompt = Prompt("first command\n1. Yes\n2. No", "permission")
+    backend.current_prompt = first_prompt
+    service.requests.observe_hook(
+        session.id,
+        PendingHook(
+            "conv", "permission", "Bash", {"command": "first command"}, time.time()
+        ),
+    )
+    snapshot = await service.get_session(session.id)
+    request = snapshot.open_requests[0]
+    intent = Action(
+        str(uuid4()),
+        snapshot.binding_version,
+        "request.respond",
+        {"requestId": request.id, "optionId": "1"},
+    )
+    entered, release = asyncio.Event(), asyncio.Event()
+    original_prompt = backend.prompt
+    calls = 0
+
+    async def delayed_prompt(target):
+        nonlocal calls
+        calls += 1
+        captured = await original_prompt(target)
+        if calls == 3:
+            entered.set()
+            await release.wait()
+        return captured
+
+    backend.prompt = delayed_prompt
+    backend.clear_on_input = True
+    pending = asyncio.create_task(service.execute(session.id, intent))
+    await entered.wait()
+    command = "second command" if replacement == "different" else "first command"
+    backend.current_prompt = (
+        None
+        if replacement == "closed"
+        else Prompt(f"{command}\n1. Yes\n2. No", "permission")
+    )
+    service.requests.observe_hook(
+        session.id,
+        PendingHook(
+            "conv",
+            "permission",
+            "Bash",
+            {"command": command, "newInput": True},
+            time.time(),
+        ),
+    )
+    await service.refresh()
+    release.set()
+    result, status = await pending
+    assert status == 409 and result.outcome == "rejected"
+    assert backend.sent == []
+
+
+async def test_raw_pinned_shell_launch_bypasses_stale_vim_state(monkeypatch):
+    manager = TmuxManager.__new__(TmuxManager)
+    pane = MagicMock()
+    pane.pane_id = "%1"
+    pane.capture_pane.return_value = ["⌘0⌘"]
+    window = MagicMock()
+    window.window_id, window.panes, window.active_pane = "@1", [pane], pane
+    session = MagicMock()
+    session.windows.__iter__.side_effect = lambda: iter([window])
+    session.windows.get.return_value = window
+    manager.get_session = MagicMock(return_value=session)
+    monkeypatch.setattr("ccgram.multiplexer.tmux.asyncio.sleep", AsyncMock())
+    reset_vim_state()
+    notify_vim_insert_seen("@1")
+    try:
+        assert await manager.send_to_pane("%1", "claude", window_id="@1")
+        assert pane.send_keys.call_args_list == [
+            call("claude", enter=True, literal=True)
+        ]
+    finally:
+        reset_vim_state()
+
+
+@pytest.mark.parametrize("kind", ["request.respond", "message.send"])
+async def test_completion_preserves_a_request_opened_during_confirmation(
+    service, backend, kind
+):
+    session = (await service.list_sessions())[0]
+    backend.current_prompt = Prompt("first command\n1. Yes\n2. No", "permission")
+    service.requests.observe_hook(
+        session.id,
+        PendingHook(
+            "conv", "permission", "Bash", {"command": "first command"}, time.time()
+        ),
+    )
+    snapshot = await service.get_session(session.id)
+    data = (
+        {"requestId": snapshot.open_requests[0].id, "optionId": "1"}
+        if kind == "request.respond"
+        else {"text": "must not reach second prompt", "dismissRequest": True}
+    )
+    intent = Action(str(uuid4()), snapshot.binding_version, kind, data)
+    original_prompt = backend.prompt
+    entered, release = asyncio.Event(), asyncio.Event()
+    calls = 0
+    confirmation_call = 4 if kind == "request.respond" else 3
+
+    async def delayed_confirmation(target):
+        nonlocal calls
+        calls += 1
+        captured = await original_prompt(target)
+        if calls == confirmation_call:
+            assert captured is None
+            entered.set()
+            await release.wait()
+        return captured
+
+    backend.prompt = delayed_confirmation
+    backend.clear_on_input = True
+    pending = asyncio.create_task(service.execute(session.id, intent))
+    await entered.wait()
+    backend.current_prompt = Prompt("second command\n1. Yes\n2. No", "permission")
+    service.requests.observe_hook(
+        session.id,
+        PendingHook(
+            "conv", "permission", "Bash", {"command": "second command"}, time.time()
+        ),
+    )
+    await service.refresh()
+    second = service.requests.get(session.id)
+    assert second is not None and second.request.id != snapshot.open_requests[0].id
+    release.set()
+    result, _ = await pending
+    assert service.requests.get(session.id) is second
+    if kind == "request.respond":
+        assert result.outcome == "sent"
+        assert backend.sent == [("text", "1", False)]
+    else:
+        assert result.outcome == "unknown"
+        assert backend.sent == [("key", "Escape", False)]

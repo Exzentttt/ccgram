@@ -107,6 +107,7 @@ that ID and body. Reusing an ID for a different body or session is an error.
 | `unknown` | Stop retries and show “Delivery unknown. Check the terminal.” A crash or a partial composite input can cause this result. |
 | `409 binding_conflict` | Read the current snapshot in `error.details`, keep the draft, and require a new user intent with the new binding version. |
 | `409 request_open` | Confirm dismissal with the operator before making a new `message.send` with `dismissRequest: true`. |
+| `409 request_closed` | Refresh the requests. A replaced or closed request requires a new user intent. |
 | `429 rate_limited` | Wait `error.details.retryAfterMs`, then retry the same action. |
 
 A known action ID returns its original result even when its session is now gone.
@@ -139,6 +140,8 @@ A `screen` request has no structured response controls. Show the terminal and ke
 bar. A `hook` request can expose supported once-only options after its tool input
 digest matches the transcript and its prompt matches the screen. The executor reads
 the screen again before answering and verifies that the prompt closed afterward.
+If another observation replaces or closes the request during that screen read,
+the server rejects the response before sending input.
 Hook evidence belongs to one prompt fingerprint and binding. A changed prompt needs
 fresh evidence. Permission commands and question labels must match exactly.
 Ambiguous or decorated choices use terminal controls.
