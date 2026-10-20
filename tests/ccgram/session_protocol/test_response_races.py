@@ -228,7 +228,10 @@ async def test_screen_dismissal_with_unchanged_unmatched_hook_forwards_text(
 
 @pytest.mark.parametrize("new_hook", [False, True])
 @pytest.mark.parametrize("retirement", ["absent_prompt", "explicit_close"])
-def test_request_retirement_preserves_only_new_unconsumed_hook(new_hook, retirement):
+@pytest.mark.parametrize("intervening_poll", [False, True])
+def test_request_retirement_preserves_only_new_unconsumed_hook(
+    new_hook, retirement, intervening_poll
+):
     requests = RequestStore(EventHub())
     prompt = Prompt("git status\n1. Yes\n2. No", "permission")
     first_hook = PendingHook(
@@ -244,15 +247,22 @@ def test_request_retirement_preserves_only_new_unconsumed_hook(new_hook, retirem
                 "conv",
                 "permission",
                 "Bash",
-                {"command": "git status", "newInput": True},
+                {"command": "git diff"},
                 time.time(),
             ),
         )
+    if intervening_poll:
+        intermediate = requests.reconcile("s", "conv", 1, prompt)
+        assert intermediate is not None
+        assert intermediate.request.source == ("screen" if new_hook else "hook")
     if retirement == "absent_prompt":
         assert requests.reconcile("s", "conv", 1, None) is None
     else:
         requests.close("s", "turn_ended")
-    second = requests.reconcile("s", "conv", 1, prompt)
+    next_prompt = (
+        Prompt("git diff\n1. Yes\n2. No", "permission") if new_hook else prompt
+    )
+    second = requests.reconcile("s", "conv", 1, next_prompt)
     assert second is not None and second.request.id != first.request.id
     expected_source = "hook" if new_hook and retirement == "absent_prompt" else "screen"
     assert second.request.source == expected_source

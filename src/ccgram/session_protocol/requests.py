@@ -145,7 +145,7 @@ class RequestStore:
             if current:
                 pending = self._hooks.get(session_id)
                 self.close(session_id, "vanished")
-                if pending is not None and pending != current.observed_hook:
+                if pending is not None and pending != current.hook:
                     self.observe_hook(session_id, pending)
             return None
         hook = self._hooks.get(session_id)
