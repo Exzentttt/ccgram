@@ -1,9 +1,45 @@
 from uuid import uuid4
+import asyncio
 
 import pytest
 from aiohttp.test_utils import TestClient, TestServer
 
 from ccgram.api.server import build_app
+
+
+async def test_terminal_watch_emits_resizes_and_suppresses_identical_frames(
+    api, service, backend, monkeypatch
+):
+    client, _ = api
+    frame = {"pane": "p0", "rows": 24, "cols": 80, "ansi": "hello", "hash": "h1"}
+    sampled = asyncio.Queue()
+
+    async def terminal(target, pane):
+        await sampled.put(None)
+        return dict(frame)
+
+    monkeypatch.setattr(backend, "terminal", terminal)
+    session_id = (await service.list_sessions())[0].id
+    ws = await client.ws_connect("/v1/stream")
+    await ws.send_json({"type": "hello", "data": {"protocol": "ccgram/1"}})
+    await ws.receive_json(timeout=2)
+    await ws.send_json(
+        {
+            "type": "terminal.watch",
+            "data": {"sessionId": session_id, "pane": "p0", "intervalMs": 500},
+        }
+    )
+    assert (await ws.receive_json(timeout=2))["data"] == frame
+    await asyncio.wait_for(sampled.get(), 2)
+    await asyncio.wait_for(sampled.get(), 2)
+    frame["cols"] = 120
+    resized = await ws.receive_json(timeout=2)
+    assert resized["data"] == frame
+    frame["rows"] = 40
+    assert (await ws.receive_json(timeout=2))["data"] == frame
+    frame.update(ansi="changed", hash="h2")
+    assert (await ws.receive_json(timeout=2))["data"] == frame
+    await ws.close()
 
 
 @pytest.fixture

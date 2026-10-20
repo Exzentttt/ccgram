@@ -5,6 +5,60 @@ import pytest
 from ccgram.session_protocol.messages import SourceEntry, build_messages, read_entries
 
 
+@pytest.mark.parametrize("kind", ["user", "gemini", "info", "error"])
+@pytest.mark.parametrize("content", [None, "", [{"meta": "ignored"}]])
+def test_gemini_uses_display_content_when_content_has_no_parts(kind, content):
+    entry = SourceEntry(
+        0,
+        {"type": kind, "content": content, "displayContent": [{"text": "visible"}]},
+    )
+    messages = build_messages([entry], "conv", "gemini")
+    assert len(messages) == 1
+    assert messages[0].parts[0].text == "visible"
+
+
+def test_gemini_fallback_keeps_primary_tool_results():
+    entries = [
+        SourceEntry(
+            0,
+            {
+                "type": "gemini",
+                "id": "call",
+                "toolCalls": [{"id": "t1", "name": "read", "args": {}}],
+            },
+        ),
+        SourceEntry(
+            100,
+            {
+                "type": "gemini",
+                "id": "result",
+                "content": [
+                    {"type": "tool_result", "tool_use_id": "t1", "content": "done"}
+                ],
+                "displayContent": "visible",
+            },
+        ),
+    ]
+    messages = build_messages(entries, "conv", "gemini")
+    assert messages[0].parts[0].status == "completed"
+    assert messages[0].parts[0].output == {"text": "done", "truncated": False}
+    assert messages[1].parts[0].text == "visible"
+
+
+def test_gemini_primary_content_takes_precedence_over_display_content():
+    messages = build_messages(
+        [
+            SourceEntry(
+                0,
+                {"type": "gemini", "content": "primary", "displayContent": "fallback"},
+            )
+        ],
+        "conv",
+        "gemini",
+    )
+    assert messages[0].parts[0].text == "primary"
+
+
 @pytest.mark.parametrize(
     "provider,entry",
     [

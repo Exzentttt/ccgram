@@ -225,14 +225,20 @@ def _gemini(entry: SourceEntry) -> _Record | None:
     if kind not in {"user", "gemini", "info", "error"}:
         return None
     key = str(data.get("id") or f"o{entry.offset}")
-    content = data.get("content", data.get("displayContent", ""))
+    content = data.get("content", "")
     parts, results = _content(content)
+    if not parts:
+        display_content = data.get("displayContent", "")
+        parts, fallback_results = _content(display_content)
+        if parts:
+            content = display_content
+        results.extend(fallback_results)
     if kind in {"info", "error"}:
         parts = [
             {
                 "type": "notice",
                 "level": "error" if kind == "error" else "info",
-                "text": _text(content),
+                "text": _text(content) or _text(data.get("displayContent", "")),
             }
         ]
     calls = data.get("toolCalls")

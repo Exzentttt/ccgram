@@ -7,12 +7,70 @@ import pytest
 
 from ccgram.multiplexer.base import ForegroundInfo, Multiplexer, PaneInfo, WindowRef
 from ccgram.multiplexer.tmux import TmuxManager
+from ccgram.multiplexer.herdr import HerdrError
 from ccgram.multiplexer.vim_state import notify_vim_insert_seen, reset_vim_state
 from ccgram.session_protocol.backend import MultiplexerSessionBackend
 from ccgram.session_protocol.models import Action, ProtocolError
 from ccgram.session_protocol.service import LocalSessionService
 from ccgram.window_state_ports import identity_state
-from ccgram.window_state_ports.identity_state import IdentityProjection
+from ccgram.window_state_ports.identity_state import IdentityProjection, get_identity
+from ccgram.window_state_store import WindowState, WindowStateStore
+
+
+@pytest.mark.parametrize("native", [False, True])
+@pytest.mark.parametrize(
+    "failure", [HerdrError("deleted workspace"), OSError("offline")]
+)
+async def test_creation_errors_are_structured_and_warn_against_retry(
+    mux, tmp_path, native, failure
+):
+    mux.capabilities.native_topic_targets = native
+    boundary = mux.create_topic_target if native else mux.create_window
+    boundary.side_effect = failure
+    with pytest.raises(ProtocolError) as error:
+        await MultiplexerSessionBackend(mux, "/tmp").create(
+            {"directory": str(tmp_path), "provider": "claude"}
+        )
+    assert error.value.status == 503
+    assert error.value.code == "backend_unavailable"
+    assert "inspect the terminal before retrying" in str(error.value)
+
+
+@pytest.mark.parametrize("native", [False, True])
+async def test_disappearing_created_target_warns_against_retry(mux, tmp_path, native):
+    mux.capabilities.native_topic_targets = native
+    mux.create_topic_target.return_value = SimpleNamespace(target_id="@missing")
+    mux.create_window.return_value = (True, "", "", "@missing")
+    with pytest.raises(ProtocolError) as error:
+        await MultiplexerSessionBackend(mux, "/tmp").create(
+            {"directory": str(tmp_path), "provider": "claude"}
+        )
+    assert error.value.status == 503
+    assert "inspect the terminal before retrying" in str(error.value)
+
+
+@pytest.mark.parametrize("stored,reported", [("ab-CD", "AB-cd"), ("AB-cd", "ab-CD")])
+async def test_tracked_ineligible_target_preserves_identity_and_backend_id(
+    mux, monkeypatch, tmp_path, stored, reported
+):
+    state = WindowStateStore(
+        schedule_save=lambda: None, on_hookless_provider_switch=lambda _: None
+    )
+    path = tmp_path / "transcript.jsonl"
+    state.window_states[stored] = WindowState(
+        session_id="conv", provider_name="claude", transcript_path=str(path)
+    )
+    monkeypatch.setattr(identity_state, "get_identity", get_identity)
+    monkeypatch.setattr(identity_state, "window_store", state)
+    mux.list_windows_for_reconciliation.return_value = [
+        WindowRef(reported, "project", "/tmp", topic_eligible=False)
+    ]
+    targets = await MultiplexerSessionBackend(mux, "/tmp").targets()
+    assert len(targets) == 1
+    assert targets[0].id == reported
+    assert targets[0].conversation_id == "conv"
+    assert targets[0].transcript == path
+    mux.foreground.assert_awaited_once_with(reported)
 
 
 @pytest.fixture

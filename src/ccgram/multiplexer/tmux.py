@@ -595,7 +595,7 @@ class TmuxManager:
         literal: bool,
         pane_id: str | None = None,
     ) -> bool:
-        """Synchronous helper: send keys to the active pane of a window."""
+        """Send keys to the specified pane, or the active pane when omitted."""
         session = self.get_session()
         if not session:
             logger.debug("No tmux session found")

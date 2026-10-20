@@ -130,7 +130,8 @@ again before injecting the launch command. The conversation ID must name that
 previous conversation. A running agent must first return to its shell.
 Session creation is a separate HTTP operation
 and has no action ID: do not automatically retry an ambiguous creation failure.
-Check the session list and terminal first.
+Backend creation failures, including a failed inspection after launch, return
+`503 backend_unavailable`. Check the session list and terminal first.
 Native worktree creation cannot select an existing workspace. Combining `worktree`
 with `workspaceId` on that backend returns `422` before creating anything.
 
@@ -176,9 +177,10 @@ for allow actions, as required by the iOS design.
 ## Terminal and files
 
 `GET /v1/sessions/{id}/terminal?pane=p0` returns a full ANSI frame with dimensions
-and a content hash. `terminal.watch` sends changed frames at intervals from 500 to
-30,000 ms. These frames are ephemeral and have no sequence number. One active-pane
-view (`p0`) is exposed per control session. A new watch replaces the previous watch
+and a content hash. `terminal.watch` sends a frame when its content hash or dimensions
+change, at intervals from 500 to 30,000 ms. These frames are ephemeral and have no
+sequence number. One active-pane view (`p0`) is exposed per control session.
+A new watch replaces the previous watch
 on that connection. `terminal.unwatch` stops it.
 
 Upload bytes with `POST /v1/uploads`, the media type in `Content-Type`, and a plain

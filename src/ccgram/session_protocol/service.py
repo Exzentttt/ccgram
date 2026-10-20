@@ -209,6 +209,21 @@ class LocalSessionService:
         sid = next((sid for sid, t in self._targets.items() if t.id == target.id), "")
         return tuple(self._correlate(sid, message) for message in messages)
 
+    async def remember_delivery(
+        self,
+        action_id: str,
+        session_id: str,
+        conversation_id: str,
+        text: str,
+        sent_at: float,
+    ) -> None:
+        async with self._refresh_lock:
+            self.store.remember_delivery(
+                action_id, session_id, conversation_id, text, sent_at
+            )
+            # A refresh may have observed the user entry before send acknowledgement.
+            self._transcript_stamps.pop(session_id, None)
+
     async def _publish_messages(self, session_id: str, target: Target) -> None:
         if target.transcript is None:
             return

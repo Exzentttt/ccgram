@@ -375,12 +375,13 @@ class ProtocolAPI:
     async def _terminal_frames(
         self, ws: web.WebSocketResponse, session_id: str, pane: str, interval: int
     ) -> None:
-        previous = ""
+        previous = None
         try:
             while not ws.closed:
                 data = await self.service.terminal(session_id, pane)
-                if data["hash"] != previous:
-                    previous = data["hash"]
+                stamp = (data["hash"], data["rows"], data["cols"])
+                if stamp != previous:
+                    previous = stamp
                     await ws.send_json(
                         {
                             "v": 1,

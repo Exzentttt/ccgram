@@ -162,7 +162,7 @@ class ActionExecutor:
                     success = await self._perform(session_id, target, action)
                 result = ActionResult(action.id, "sent" if success else "unknown")
                 if success:
-                    self._record_delivery(session_id, target, action, sent_at)
+                    await self._record_delivery(session_id, target, action, sent_at)
         except ProtocolError as exc:
             if attempted:
                 result, status = (
@@ -238,14 +238,14 @@ class ActionExecutor:
             )
         return target
 
-    def _record_delivery(
+    async def _record_delivery(
         self, session_id: str, target: Target, action: Action, sent_at: float
     ) -> None:
         if action.kind == "message.send":
             text = self.service.uploads.message_text(
                 action.data["text"], action.data.get("files", [])
             )
-            self.service.store.remember_delivery(
+            await self.service.remember_delivery(
                 action.id, session_id, target.conversation_id, text, sent_at
             )
 

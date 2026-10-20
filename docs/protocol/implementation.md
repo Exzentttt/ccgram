@@ -29,6 +29,9 @@ History uses only the transcript binding already established by ccgram. It does
 not guess a conversation from the latest transcript in the same directory. Claude,
 Codex, Gemini, and Pi have structured history. Other or unbound transcripts use the
 terminal view.
+Persisted terminal identities resolve case-insensitively. Backend calls retain the
+backend-reported spelling. Gemini uses `displayContent` when its primary content
+has no displayable parts, while preserving primary tool results.
 
 The mobile builder reads native transcript records alongside the existing Telegram
 parser. The provider renderers, Telegram message queue, watermark logic, and delivery
@@ -83,6 +86,8 @@ Refresh, current-session inspection, creation, and hook transcript resolution sh
 one lock to serialize authoritative observations. An unavailable
 transcript or pane capture degrades only that session to unknown status with no
 actions. Its identity stays present, and healthy sessions continue to refresh.
+Successful delivery registration shares that lock and invalidates the transcript
+stamp, so the next refresh can correlate a user entry observed before send acknowledgement.
 
 tmux message submission uses the existing vim recovery, command-mode handling, and
 delayed Enter while pinning every capture and key to the verified pane. Raw paste
@@ -112,6 +117,9 @@ input, exact question labels, stale hook reuse, and multi-select fallback. They
 also cover per-session source failures, binding races, and transcript rewrites
 beyond the first page. Schema checks validate nonempty history and live
 message frames from all four providers, including internal Codex role filtering.
+Additional regressions cover Gemini display fallback, creation errors and failed
+post-launch inspection, persisted ID casing, delivery before acknowledgement, and
+terminal resizes without content changes.
 
 Golden payloads live in `protocol/v1/fixtures/`. `_manifest.json` maps each fixture
 to its shared JSON Schema. The server's builder output is compared with the golden

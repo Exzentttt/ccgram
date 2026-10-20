@@ -18,6 +18,43 @@ def append(path, data):
         stream.write(json.dumps(data) + "\n")
 
 
+async def test_delivery_correlates_after_transcript_was_published_during_send(
+    service, backend, tmp_path, monkeypatch
+):
+    path = tmp_path / "transcript.jsonl"
+    path.touch()
+    backend.target = replace(backend.target, transcript=path)
+    session = (await service.list_sessions())[0]
+    action = Action(
+        str(uuid4()), session.binding_version, "message.send", {"text": "hello"}
+    )
+
+    async def send_text(target, text, *, enter):
+        append(
+            path,
+            {
+                "type": "user",
+                "uuid": "early",
+                "timestamp": datetime.now(UTC).isoformat(),
+                "message": {"content": text},
+            },
+        )
+        await service.refresh()
+        return True
+
+    monkeypatch.setattr(backend, "send_text", send_text)
+    result, status = await service.execute(session.id, action)
+    assert status == 200 and result.outcome == "sent"
+    await service.refresh()
+    _, events = service.hub.replay(service.hub.epoch, 0)
+    assert any(
+        event.type == "action.updated"
+        and event.data.get("actionId") == action.id
+        and event.data.get("messageId") == "conv/early"
+        for event in events
+    )
+
+
 async def test_history_joins_results_beyond_page_and_rejects_cross_conversation_cursor(
     service, backend, tmp_path
 ):

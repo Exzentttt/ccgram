@@ -27,6 +27,10 @@ from ..worktrees import (
 )
 from .models import ProtocolError, Status, utc_now
 
+_CREATION_UNCONFIRMED = (
+    "Could not confirm session creation; inspect the terminal before retrying"
+)
+
 
 @dataclass(frozen=True, slots=True)
 class Target:
@@ -358,25 +362,30 @@ class MultiplexerSessionBackend:
         if candidate.capabilities.name != provider:
             raise ProtocolError(400, "invalid_request", "Unknown provider")
         command = resolve_launch_command(provider, approval_mode="normal")
-        worktree_path = directory
-        if data.get("worktree"):
-            created = await self._create_worktree(directory, data, command)
-            if isinstance(created, Target):
-                return created
-            worktree_path = created
-        if self.mux.capabilities.native_topic_targets:
-            created = await self.mux.create_topic_target(
+        try:
+            worktree_path = directory
+            if data.get("worktree"):
+                created = await self._create_worktree(directory, data, command)
+                if isinstance(created, Target):
+                    return created
+                worktree_path = created
+            if self.mux.capabilities.native_topic_targets:
+                created = await self.mux.create_topic_target(
+                    str(worktree_path),
+                    launch_command=command,
+                    workspace_id=data.get("workspaceId"),
+                )
+                return await self._created_target(True, created.target_id)
+            ok, _, _, target_id = await self.mux.create_window(
                 str(worktree_path),
                 launch_command=command,
                 workspace_id=data.get("workspaceId"),
             )
-            return await self.inspect(created.target_id)
-        ok, _, _, target_id = await self.mux.create_window(
-            str(worktree_path),
-            launch_command=command,
-            workspace_id=data.get("workspaceId"),
-        )
-        return await self._created_target(ok, target_id)
+            return await self._created_target(ok, target_id)
+        except (OSError, RuntimeError) as exc:
+            raise ProtocolError(
+                503, "backend_unavailable", _CREATION_UNCONFIRMED
+            ) from exc
 
     async def _create_worktree(
         self, directory: Path, data: dict[str, Any], command: str
@@ -421,6 +430,11 @@ class MultiplexerSessionBackend:
             raise ProtocolError(
                 503,
                 "backend_unavailable",
-                "Could not confirm session creation; inspect the terminal before retrying",
+                _CREATION_UNCONFIRMED,
             )
-        return await self.inspect(target_id)
+        try:
+            return await self.inspect(target_id)
+        except ProtocolError as exc:
+            raise ProtocolError(
+                503, "backend_unavailable", _CREATION_UNCONFIRMED
+            ) from exc
