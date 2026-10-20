@@ -125,6 +125,12 @@ class RequestStore:
             session_id, hook
         ):
             return
+        pending = self._hooks.get(session_id)
+        if pending is not None and pending != hook:
+            if hook.timestamp < pending.timestamp:
+                return
+            self._consume(session_id, pending)
+            self._hook_prompts.pop(session_id, None)
         self._hooks[session_id] = hook
 
     def close(

@@ -387,3 +387,41 @@ def test_continuously_active_hook_keeps_controls_after_matching_ttl(monkeypatch)
     monkeypatch.setattr("ccgram.session_protocol.requests.time.time", lambda: now + 31)
     requests.observe_hook("s", hook)
     assert requests.reconcile("s", "conv", 1, prompt) is opened
+
+
+@pytest.mark.parametrize("bound", [False, True])
+def test_superseded_hook_cannot_restore_old_request_before_reconciliation(bound):
+    requests = RequestStore(EventHub())
+    now = time.time()
+    first_hook = PendingHook(
+        "conv", "permission", "Edit", {"file_path": "/tmp/file", "content": "old"}, now
+    )
+    second_hook = PendingHook(
+        "conv", "permission", "Edit", {"file_path": "/tmp/file", "content": "new"}, now
+    )
+    prompt = Prompt("/tmp/file\n1. Yes\n2. No", "permission")
+    requests.observe_hook("s", first_hook)
+    first = requests.reconcile("s", "conv", 1, prompt) if bound else None
+    requests.observe_hook("s", second_hook)
+    requests.observe_hook("s", first_hook)
+    if first is not None:
+        assert not requests.is_current("s", first)
+    second = requests.reconcile("s", "conv", 1, prompt)
+    assert second is not None and second.request.source == "hook"
+    assert second.request.tool is not None
+    assert second.request.tool["input"]["content"] == "new"
+    requests.observe_hook("s", second_hook)
+    assert requests.is_current("s", second)
+
+
+def test_older_unseen_hook_cannot_replace_newer_pending_evidence():
+    requests = RequestStore(EventHub())
+    now = time.time()
+    newer = PendingHook("conv", "permission", "Bash", {"command": "newer"}, now)
+    older = PendingHook("conv", "permission", "Bash", {"command": "older"}, now - 1)
+    requests.observe_hook("s", newer)
+    requests.observe_hook("s", older)
+    opened = requests.reconcile(
+        "s", "conv", 1, Prompt("newer\n1. Yes\n2. No", "permission")
+    )
+    assert opened is not None and opened.request.source == "hook"

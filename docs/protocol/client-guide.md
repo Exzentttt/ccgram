@@ -151,6 +151,8 @@ Consumed or explicitly invalidated hooks stay blocked for their full matching
 window, including after a different hook binds. Duplicate events cannot reopen them.
 Consumed and expired observations are ignored before they can displace newer
 controls. A continuously active request keeps its bound evidence until it retires.
+A distinct hook supersedes pending evidence immediately, before screen
+reconciliation. Replays cannot restore the superseded request's controls.
 If polling closes the original request during dismissal, the server also stops
 before forwarding the message. Escape was already sent, so the outcome is
 `unknown`; refresh the session and ask for a new user intent.
