@@ -10,6 +10,16 @@ The Herdr adapter accepts socket protocols 14–22 without warnings and attempts
 
 [agterm](https://github.com/umputun/agterm) is macOS-native. Its adapter drives the `agtermctl` CLI through agterm's local control socket. An agterm session UUID is the neutral `window_id`; agterm persists that UUID across restarts, so no alias reconciliation is required. Discovery defaults to the `ccgram` workspace and can be scoped with `CCGRAM_AGTERM_WORKSPACES`; agterm supports workspace selection for new sessions.
 
+## Mobile session API
+
+The optional `ccgram/1` API lists eligible sessions independently of Telegram
+bindings. `session_protocol/` owns mobile snapshots, history, requests, replay,
+and crash-safe actions; `api/` owns HTTP/WebSocket transport and device auth.
+Telegram keeps its existing parser and delivery receipts. Text and interactive
+input share per-target locks with mobile actions. See the
+[protocol documentation](protocol/README.md) for setup, client rules, and the
+explicit Telegram migration boundary.
+
 ## System Overview
 
 ccgram maps each Telegram Forum topic to one terminal-multiplexer target running one agent CLI (Claude Code, Codex, Gemini, Pi, Antigravity, or Shell). Tmux routing remains keyed by window ID (`@0`, `@12`). Herdr routing is keyed only by opaque `herdr-session-v1-…` targets derived from `agent.list`; tab, pane, terminal, workspace, display, and focus values are short-lived locators inside a fresh guarded action, never persisted identity. Every Herdr session displays one pane-qualified topic, independent of sibling count. Missing, malformed, sessionless, and legacy targets fail closed; duplicate canonical targets are quarantined without disabling unrelated sessions; raw locator aliases and display-name recovery are never implicit. A target can change after the guard and before Herdr dispatches, so the adapter records a possible post-guard race rather than claiming atomic delivery. agterm routing is keyed by its durable session UUID. Multiplexer access goes through the `multiplexer/` seam (`Multiplexer` Protocol); tmux is the default backend, while herdr and agterm are selectable with `CCGRAM_MULTIPLEXER=herdr` and `CCGRAM_MULTIPLEXER=agterm`, respectively.

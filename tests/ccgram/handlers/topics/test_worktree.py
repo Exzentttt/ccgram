@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from ccgram.handlers.topics.worktree import (
+from ccgram.worktrees import (
     WorktreeError,
     check_worktree_eligibility,
     create_worktree,

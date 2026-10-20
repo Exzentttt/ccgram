@@ -37,7 +37,7 @@ from ..topics.directory_browser import (
     clear_window_picker_state,
     clear_worktree_state,
 )
-from ..topics.worktree import (
+from ...worktrees import (
     slug_for_path,
     validate_branch_name,
     worktree_path_for,
@@ -59,6 +59,8 @@ from ..telegram_origin import (
     send_telegram_to_window,
 )
 from ...topic_state_registry import topic_state
+from ...session_protocol.input_lock import input_lock
+from ...session_protocol.models import ProtocolError
 from ..user_state import (
     AWAITING_WORKTREE_BRANCH_NAME,
     PENDING_THREAD_ID,
@@ -593,22 +595,30 @@ async def _forward_message(
     # users in a dismissal loop; 2026-09-25 review: silently
     # FORWARDING after an unconfirmed dismissal is the same bug
     # mirrored).
-    interactive_window = get_interactive_window(
-        user_id, thread_id, chat_id=message.chat.id
-    )
-    interactive_dismissed = False
-    if interactive_window and interactive_window == window_id:
-        if not await _dismiss_interactive_prompt(
-            user_id, thread_id, window_id, message.chat.id, text, message
-        ):
-            return
-        interactive_dismissed = True
+    try:
+        async with input_lock(window_id):
+            interactive_window = get_interactive_window(
+                user_id, thread_id, chat_id=message.chat.id
+            )
+            interactive_dismissed = False
+            if interactive_window and interactive_window == window_id:
+                if not await _dismiss_interactive_prompt(
+                    user_id, thread_id, window_id, message.chat.id, text, message
+                ):
+                    return
+                interactive_dismissed = True
 
-    success, err_message = await send_telegram_to_window(
-        user_id, window_id, thread_id, text, message.chat.id
-    )
-    if not success:
-        await safe_reply(message, f"\u274c {err_message}")
+            success, err_message = await send_telegram_to_window(
+                user_id, window_id, thread_id, text, message.chat.id
+            )
+            if not success:
+                await safe_reply(message, f"\u274c {err_message}")
+                return
+
+    except ProtocolError as exc:
+        await safe_reply(
+            message, f"⚠ {exc.message}. Your text was not forwarded: {text}"
+        )
         return
 
     if interactive_dismissed:

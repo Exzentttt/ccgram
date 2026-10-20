@@ -1,0 +1,31 @@
+{
+  "src/ccgram/handlers/interactive/interactive_callbacks.py": [
+    "send_keys",
+    "send_keys",
+    "send_keys_to_pane",
+    "send_keys_to_pane"
+  ],
+  "src/ccgram/handlers/shell/shell_commands.py": [
+    "send_keys"
+  ],
+  "src/ccgram/handlers/split_command.py": [
+    "send_to_pane"
+  ],
+  "src/ccgram/handlers/status/status_bar_actions.py": [
+    "send_keys",
+    "send_keys",
+    "send_keys_to_pane"
+  ],
+  "src/ccgram/handlers/text/text_handler.py": [
+    "send_keys",
+    "send_keys_to_pane"
+  ],
+  "src/ccgram/handlers/toolbar/toolbar_callbacks.py": [
+    "send_keys",
+    "send_keys"
+  ],
+  "src/ccgram/handlers/topics/window_launch_service.py": [
+    "send_keys",
+    "send_keys"
+  ]
+}

@@ -15,6 +15,7 @@ import structlog
 
 from telegram import CallbackQuery, Update
 from ...telegram_client import PTBTelegramClient
+from ...session_protocol.input_lock import input_lock
 from ...multiplexer import multiplexer as tmux_manager
 from ..callback_data import (
     CB_ASK_CHOICE,
@@ -200,44 +201,50 @@ async def handle_interactive_callback(
         await query.answer("Not your session", show_alert=True)
         return
 
-    if cb_prefix == CB_ASK_CHOICE:
-        await _handle_direct_choice(
-            query,
-            user_id,
-            thread_id,
-            chat_id,
-            message.message_id if message is not None else None,
-            window_id,
-            pane_id,
-            parse_direct_choice_callback(data),
-        )
-        return
+    async with input_lock(window_id):
+        if cb_prefix == CB_ASK_CHOICE:
+            await _handle_direct_choice(
+                query,
+                user_id,
+                thread_id,
+                chat_id,
+                message.message_id if message is not None else None,
+                window_id,
+                pane_id,
+                parse_direct_choice_callback(data),
+            )
+            return
 
-    client = PTBTelegramClient(context.bot)
-    if cb_prefix == CB_ASK_REFRESH:
-        await handle_interactive_ui(
-            client, user_id, window_id, thread_id, pane_id=pane_id, chat_id=chat_id
-        )
-        await query.answer("\U0001f504")
-    else:
-        tmux_key, refresh_ui = INTERACTIVE_KEY_MAP[cb_prefix]
-        if pane_id:
-            sent = await tmux_manager.send_keys_to_pane(
-                pane_id, tmux_key, enter=False, literal=False, window_id=window_id
-            )
-        else:
-            w = await tmux_manager.find_window_by_id(window_id)
-            sent = bool(w) and await tmux_manager.send_keys(
-                w.window_id, tmux_key, enter=False, literal=False
-            )
-        if sent and refresh_ui:
-            await asyncio.sleep(0.5)
+        client = PTBTelegramClient(context.bot)
+        if cb_prefix == CB_ASK_REFRESH:
             await handle_interactive_ui(
                 client, user_id, window_id, thread_id, pane_id=pane_id, chat_id=chat_id
             )
-        elif sent and not refresh_ui:
-            await clear_interactive_msg(user_id, client, thread_id, chat_id=chat_id)
-        await query.answer(INTERACTIVE_KEY_LABELS.get(cb_prefix, ""))
+            await query.answer("\U0001f504")
+        else:
+            tmux_key, refresh_ui = INTERACTIVE_KEY_MAP[cb_prefix]
+            if pane_id:
+                sent = await tmux_manager.send_keys_to_pane(
+                    pane_id, tmux_key, enter=False, literal=False, window_id=window_id
+                )
+            else:
+                w = await tmux_manager.find_window_by_id(window_id)
+                sent = bool(w) and await tmux_manager.send_keys(
+                    w.window_id, tmux_key, enter=False, literal=False
+                )
+            if sent and refresh_ui:
+                await asyncio.sleep(0.5)
+                await handle_interactive_ui(
+                    client,
+                    user_id,
+                    window_id,
+                    thread_id,
+                    pane_id=pane_id,
+                    chat_id=chat_id,
+                )
+            elif sent and not refresh_ui:
+                await clear_interactive_msg(user_id, client, thread_id, chat_id=chat_id)
+            await query.answer(INTERACTIVE_KEY_LABELS.get(cb_prefix, ""))
 
 
 # --- Registry dispatch entry point ---

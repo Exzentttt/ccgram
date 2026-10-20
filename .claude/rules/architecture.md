@@ -256,3 +256,16 @@ Top-level (constants, leaves, top-level commands):
 - Live-session read contract. Volatile session state (`claude_task_state`, `session_lifecycle`, `session_monitor` idle tracker) is exposed to handlers exclusively through `session_state_ports/live_session_state.py`. Free functions (`get_task_snapshot`, `get_wait_header`, `has_task_snapshot`, `get_session_id`, `get_last_activity_ts`) and the frozen `LiveSessionSnapshot` projection are the approved read boundary. Write authority remains in `session_lifecycle` (all mutation methods). The fitness gate (`tests/ccgram/test_session_state_ports_audit.py`) bans direct handler imports of `get_claude_task_snapshot`, `get_claude_wait_header`, and `claude_task_state.has_snapshot`.
 - Window-state feature ports. `WindowStateStore` remains the single persistence kernel. `window_state_ports/{pane,identity,worktree,tool,lifecycle}_state.py` expose frozen projection dataclasses and cohesive feature writes. Reads return projections, not raw `WindowState`; writes only touch fields owned by the port. Provider/session identity writes still delegate to `SessionManager.set_window_provider` to preserve capability coordination. Boundary enforced by `tests/ccgram/test_window_state_access_audit.py`: raw feature-field access outside `window_state_store.py`, `window_state_ports/*`, `session.py`, `window_query.py`, and serialization tests fails the audit. A second import-boundary check (`tests/ccgram/test_window_store_import_boundary.py`) forbids handler/Mini App modules from importing `window_state_store.window_store` directly; the only allowed exceptions are `handlers/status/rc_probe.py` (transient in-memory RC-probe state never persisted) and `handlers/commands/forward.py` (`clear_window_session` coordination).
 - Lazy-import contract. `scripts/lint_lazy_imports.py` flags every in-function `Import`/`ImportFrom` not preceded by `# Lazy:`, not inside `if TYPE_CHECKING:`, and not inside `_reset_*_for_testing`. Walker recurses through compound statements (try/except/finally/if/else/with/for/while) and nested def/class bodies. Multi-line `# Lazy:` blocks supported. Wired into `make lint` as `lint-lazy`. All in-function imports annotated. Cycle test (`tests/integration/test_import_no_cycles.py`) enumerates all modules under `src/ccgram/`.
+
+## Mobile session protocol
+
+`session_protocol/` is the transport-neutral mobile core; `api/` is its optional
+HTTP/WebSocket adapter. Neither package imports Telegram handlers or Telegram types.
+`protocol/v1/` owns shared schemas and golden fixtures. `docs/protocol/` owns operator,
+client, and implementation documentation. `worktrees.py` owns shared git helpers.
+
+Keep mobile action deduplication durable before any terminal input. Keep foreground,
+active-pane, conversation, and source-generation checks in the binding. A screen-only
+request must never acquire structured approval controls. Do not make remote observers
+hold Telegram delivery receipts or watermarks. Telegram parser/renderer and direct
+input migrations are explicitly incomplete; see `docs/protocol/implementation.md`.

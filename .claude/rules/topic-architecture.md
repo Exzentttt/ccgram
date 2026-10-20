@@ -1,6 +1,6 @@
 # Topic-Only Architecture
 
-The bot operates exclusively in Telegram Forum (topics) mode. No `active_sessions`, no `/list`, no General topic routing, no backward-compat for non-topic modes.
+The Telegram adapter operates in Forum topics mode. Its topic routing remains separate from the optional mobile session list in `session_protocol/`. `GET /v1/sessions` includes eligible targets with no Telegram topic. No Telegram `active_sessions` store or non-topic routing is introduced.
 
 ## 1 Topic = 1 Window = 1 Session
 

@@ -65,12 +65,14 @@ if TYPE_CHECKING:
     from telegram.ext import Application
 
     from .providers.base import HookEvent
+    from .api.runtime import ProtocolRuntime
 
 logger = structlog.get_logger()
 
 session_monitor: SessionMonitor | None = None
 _status_poll_task: asyncio.Task[None] | None = None
 _callbacks_wired = False
+_protocol_runtime: ProtocolRuntime | None = None
 
 
 def install_global_exception_handler() -> None:
@@ -281,6 +283,8 @@ async def start_session_monitor(application: Application) -> SessionMonitor:
     monitor.set_new_window_callback(new_window_callback)
 
     async def hook_event_callback(event: HookEvent) -> None:
+        if _protocol_runtime is not None:
+            _protocol_runtime.observe_hook(event)
         await dispatch_hook_event(event, client)
 
     monitor.set_hook_event_callback(hook_event_callback)
@@ -349,12 +353,22 @@ def start_event_stream(application: Application) -> object | None:
 
 async def bootstrap_application(application: Application) -> None:
     """Run the full post_init sequence in the prescribed order."""
+    global _protocol_runtime
+
     install_global_exception_handler()
     wire_multiplexer()
     await ensure_multiplexer_session()
     await register_provider_commands(application)
     wire_runtime_callbacks()
+    prior_targets = {
+        (u, c, t): w for u, c, t, w in thread_router.iter_thread_bindings_with_chat()
+    }
     await session_manager.resolve_stale_ids()
+    recovered_targets = [
+        (prior_targets[(u, c, t)], w)
+        for u, c, t, w in thread_router.iter_thread_bindings_with_chat()
+        if (u, c, t) in prior_targets and prior_targets[(u, c, t)] != w
+    ]
     await recover_topic_provisioning(PTBTelegramClient(application.bot))
     await _adopt_unbound_windows(PTBTelegramClient(application.bot))
     verify_hooks_installed()
@@ -368,6 +382,20 @@ async def bootstrap_application(application: Application) -> None:
     from .main import start_miniapp_if_enabled
 
     await start_miniapp_if_enabled()
+
+    # Lazy: the mobile API is optional and has no Telegram dependencies.
+    from .api.runtime import start_if_enabled
+
+    # Lazy: backend key prefixes are configured only after multiplexer wiring.
+    from .session_map import session_map_prefix
+
+    _protocol_runtime = await start_if_enabled(
+        multiplexer,
+        config.config_dir,
+        str(config.claude_config_dir),
+        session_map_prefix(),
+        recovered_targets=recovered_targets,
+    )
 
 
 async def stop_delivery_runtime() -> None:
@@ -417,6 +445,12 @@ async def stop_delivery_runtime() -> None:
 
 async def shutdown_runtime() -> None:
     """Phase 2 (post_shutdown): teardown that needs no HTTP transport."""
+    global _protocol_runtime
+
+    if _protocol_runtime is not None:
+        await _protocol_runtime.close()
+        _protocol_runtime = None
+
     # Lazy: main → bot → bootstrap cycle (same as start path).
     from .main import stop_miniapp_if_enabled
 

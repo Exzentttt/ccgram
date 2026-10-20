@@ -17,6 +17,12 @@ the protocol.
 **Style.** The text uses ASD-STE100 rules (strict mode, without a check against the official dictionary). The
 words "must", "can", and "will" have their usual meaning. The text uses no other modal verbs.
 
+**Implementation:** The mobile backend, schemas, and tests are in place. See
+[protocol documentation](../protocol/README.md) for the current contract and
+[implementation boundary](../protocol/implementation.md) for corrections to this
+proposal and the remaining P0 Telegram refactors. APNs and headless mode remain
+outside this implementation.
+
 ## Contents
 
 1. [Summary](#1-summary)

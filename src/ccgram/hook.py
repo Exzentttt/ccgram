@@ -75,6 +75,8 @@ _HOOK_EVENT_TYPES: tuple[str, ...] = (
     "SubagentStop",
     "TeammateIdle",
     "TaskCompleted",
+    "PermissionRequest",
+    "PreToolUse",
 )
 
 # Events that should not block the agent (async: true)
