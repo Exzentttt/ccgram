@@ -1018,8 +1018,8 @@ class TmuxManager:
 
         # Create window in thread
         def _create_and_start() -> tuple[bool, str, str, str]:
-            session = self.get_or_create_session()
             try:
+                session = self.get_or_create_session()
                 # Create new window
                 window = session.new_window(
                     window_name=final_window_name,

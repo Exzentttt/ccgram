@@ -4,6 +4,7 @@ from unittest.mock import AsyncMock, MagicMock, call
 from uuid import uuid4
 
 import pytest
+from libtmux.exc import LibTmuxException
 
 from ccgram.multiplexer.base import ForegroundInfo, Multiplexer, PaneInfo, WindowRef
 from ccgram.multiplexer.tmux import TmuxManager
@@ -15,6 +16,24 @@ from ccgram.session_protocol.service import LocalSessionService
 from ccgram.window_state_ports import identity_state
 from ccgram.window_state_ports.identity_state import IdentityProjection, get_identity
 from ccgram.window_state_store import WindowState, WindowStateStore
+
+
+async def test_tmux_session_setup_failure_returns_structured_creation_error(
+    tmp_path, monkeypatch
+):
+    manager = TmuxManager(session_name="creation-regression")
+    server = MagicMock()
+    server.sessions.get.return_value = None
+    server.new_session.side_effect = LibTmuxException("cannot start server")
+    monkeypatch.setattr(manager, "_server", server)
+    with pytest.raises(ProtocolError) as error:
+        await MultiplexerSessionBackend(manager, "/tmp").create(
+            {"directory": str(tmp_path), "provider": "claude"}
+        )
+    assert error.value.status == 503
+    assert error.value.code == "backend_unavailable"
+    assert "inspect the terminal before retrying" in str(error.value)
+    server.new_session.assert_called_once()
 
 
 @pytest.mark.parametrize("native", [False, True])
