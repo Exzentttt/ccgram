@@ -70,8 +70,15 @@ The implementation makes these clarifications to the proposed design:
   authoritative input from the transcript. Hooks remain observations and return no
   permission decision.
 
-Refresh, current-session inspection, creation, and hook observation share one lock
-so an older observation cannot publish a regressed binding or request. An unavailable
+Raw hook intake and transcript resolution use the same `HookIdentity`: conversation,
+kind, tool name, input digest, and timestamp. `RequestStore` checks freshness,
+ordering, and replay before accepting either form. A distinct identity retires the
+previous request synchronously, before queueing or reading the transcript. Deferred
+tickets block approvals and messages until processing finishes. Expiry in the queue
+cannot restore the retired request.
+
+Refresh, current-session inspection, creation, and hook transcript resolution share
+one lock to serialize authoritative observations. An unavailable
 transcript or pane capture degrades only that session to unknown status with no
 actions. Its identity stays present, and healthy sessions continue to refresh.
 

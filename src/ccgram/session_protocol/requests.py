@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 import time
 from dataclasses import dataclass
@@ -32,12 +34,39 @@ def _choices(text: str) -> tuple[tuple[str, str], ...]:
 
 
 @dataclass(frozen=True, slots=True)
+class HookIdentity:
+    conversation_id: str
+    kind: str
+    tool_name: str
+    input_hash: str
+    timestamp: float
+
+
+def hook_input_hash(tool_input: dict[str, Any]) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            tool_input, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+        ).encode()
+    ).hexdigest()
+
+
+@dataclass(frozen=True, slots=True)
 class PendingHook:
     conversation_id: str
     kind: str
     tool_name: str
     tool_input: dict[str, Any]
     timestamp: float
+
+    @property
+    def identity(self) -> HookIdentity:
+        return HookIdentity(
+            self.conversation_id,
+            self.kind,
+            self.tool_name,
+            hook_input_hash(self.tool_input),
+            self.timestamp,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -110,7 +139,8 @@ class RequestStore:
         self._open: dict[str, OpenRequest] = {}
         self._hooks: dict[str, PendingHook] = {}
         self._hook_prompts: dict[str, tuple[PendingHook, str, int]] = {}
-        self._consumed_hooks: list[tuple[str, PendingHook]] = []
+        self._consumed_hooks: list[tuple[str, HookIdentity]] = []
+        self._latest_hooks: dict[str, HookIdentity] = {}
         self._deferred: dict[str, int] = {}
 
     def get(self, session_id: str) -> OpenRequest | None:
@@ -137,32 +167,43 @@ class RequestStore:
         return session_id in self._deferred
 
     def observe_hook(self, session_id: str, hook: PendingHook) -> None:
+        if self.observe_identity(session_id, hook.identity):
+            self._hooks[session_id] = hook
+
+    def observe_identity(self, session_id: str, hook: HookIdentity) -> bool:
         if abs(time.time() - hook.timestamp) > _HOOK_MATCH_TTL or self._is_consumed(
             session_id, hook
         ):
-            return
-        pending = self._hooks.get(session_id)
+            return False
+        pending = self._latest_hooks.get(session_id)
         if pending is not None and pending != hook:
             if hook.timestamp < pending.timestamp:
-                return
-            self._consume(session_id, pending)
-            self._hook_prompts.pop(session_id, None)
-        self._hooks[session_id] = hook
+                return False
+            self.close(session_id, "vanished")
+        self._latest_hooks[session_id] = hook
+        return True
 
     def close(
-        self, session_id: str, reason: str, *, preserve_hook: PendingHook | None = None
+        self,
+        session_id: str,
+        reason: str,
+        *,
+        preserve_identity: HookIdentity | None = None,
     ) -> None:
         if reason not in CLOSE_REASONS:
             raise ValueError(f"Unknown request close reason: {reason}")
         current = self._open.pop(session_id, None)
         pending = self._hooks.pop(session_id, None)
-        if pending is not None and pending != preserve_hook:
-            self._consume(session_id, pending)
+        if pending is not None and pending.identity != preserve_identity:
+            self._consume(session_id, pending.identity)
         bound = self._hook_prompts.pop(session_id, None)
         if bound:
-            self._consume(session_id, bound[0])
-        if preserve_hook is not None:
-            self._hooks[session_id] = preserve_hook
+            self._consume(session_id, bound[0].identity)
+        latest = self._latest_hooks.get(session_id)
+        if latest is not None and latest != preserve_identity:
+            self._consume(session_id, latest)
+        if pending is not None and pending.identity == preserve_identity:
+            self._hooks[session_id] = pending
         if current:
             self.hub.publish(
                 "request.closed",
@@ -170,11 +211,11 @@ class RequestStore:
                 {"requestId": current.request.id, "reason": reason},
             )
 
-    def _consume(self, session_id: str, hook: PendingHook) -> None:
+    def _consume(self, session_id: str, hook: HookIdentity) -> None:
         if not self._is_consumed(session_id, hook):
             self._consumed_hooks.append((session_id, hook))
 
-    def _is_consumed(self, session_id: str, hook: PendingHook) -> bool:
+    def _is_consumed(self, session_id: str, hook: HookIdentity) -> bool:
         now = time.time()
         self._consumed_hooks = [
             (sid, consumed)
@@ -189,19 +230,22 @@ class RequestStore:
         current = self.get(session_id)
         if prompt is None:
             if current:
-                pending = self._hooks.get(session_id)
+                pending = self._latest_hooks.get(session_id)
+                bound_identity = (
+                    current.hook.identity if current.hook is not None else None
+                )
                 self.close(
                     session_id,
                     "vanished",
-                    preserve_hook=pending if pending != current.hook else None,
+                    preserve_identity=pending if pending != bound_identity else None,
                 )
             return None
         hook = self._hooks.get(session_id)
-        if hook is not None and self._is_consumed(session_id, hook):
+        if hook is not None and self._is_consumed(session_id, hook.identity):
             hook = None
         bound = self._hook_prompts.get(session_id)
         if bound and bound[0] == hook and bound[1:] != (prompt.fingerprint, version):
-            self._consume(session_id, bound[0])
+            self._consume(session_id, bound[0].identity)
             self._hook_prompts.pop(session_id)
             hook = None
         structured = (
@@ -217,7 +261,7 @@ class RequestStore:
             return current
         if current:
             if current.hook is not None:
-                self._consume(session_id, current.hook)
+                self._consume(session_id, current.hook.identity)
                 self._hook_prompts.pop(session_id, None)
             # Retain a matching observation when promoting screen -> hook.
             self._open.pop(session_id)

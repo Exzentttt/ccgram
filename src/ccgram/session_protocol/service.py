@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import hashlib
 import json
 from collections.abc import AsyncIterator, Collection
 from dataclasses import replace
@@ -26,7 +25,7 @@ from .models import (
     Status,
     utc_now,
 )
-from .requests import PendingHook, RequestStore
+from .requests import HookIdentity, PendingHook, RequestStore, hook_input_hash
 from .store import ProtocolStore
 from .uploads import UploadStore
 
@@ -370,17 +369,14 @@ class LocalSessionService:
             await self._observe_hook(event, prefix)
 
     def defer_hook(self, event: HookEvent, prefix: str) -> tuple[str, ...]:
-        if event.event_type not in {
-            "PermissionRequest",
-            "PreToolUse",
-            "Stop",
-            "SessionEnd",
-        } or (
-            event.event_type == "PreToolUse"
-            and event.data.get("tool_name") != "AskUserQuestion"
-        ):
+        identity = self._hook_identity(event)
+        if identity is None:
             return ()
-        sessions = tuple(sid for sid, _ in self._hook_targets(event, prefix))
+        sessions = tuple(
+            sid
+            for sid, _ in self._hook_targets(event, prefix)
+            if self.requests.observe_identity(sid, identity)
+        )
         for sid in sessions:
             self.requests.defer(sid)
         return sessions
@@ -388,6 +384,27 @@ class LocalSessionService:
     def resolve_hook(self, sessions: tuple[str, ...]) -> None:
         for sid in sessions:
             self.requests.resolve(sid)
+
+    @staticmethod
+    def _hook_identity(event: HookEvent) -> HookIdentity | None:
+        tool_name = event.data.get("tool_name", "")
+        if event.event_type in {"Stop", "SessionEnd"}:
+            kind = "turn_ended"
+            tool_name = ""
+        elif event.event_type == "PermissionRequest" or (
+            event.event_type == "PreToolUse" and tool_name == "AskUserQuestion"
+        ):
+            kind = "question" if tool_name == "AskUserQuestion" else "permission"
+        else:
+            return None
+        digest = event.data.get("tool_input_hash", "")
+        return HookIdentity(
+            event.session_id,
+            kind,
+            tool_name if isinstance(tool_name, str) else "",
+            digest if isinstance(digest, str) else "",
+            event.timestamp,
+        )
 
     def _hook_targets(self, event: HookEvent, prefix: str) -> list[tuple[str, Target]]:
         target_id = event.window_key.removeprefix(prefix)
@@ -401,7 +418,12 @@ class LocalSessionService:
         ]
 
     async def _observe_hook(self, event: HookEvent, prefix: str) -> None:
+        identity = self._hook_identity(event)
+        if identity is None:
+            return
         for sid, target in self._hook_targets(event, prefix):
+            if not self.requests.observe_identity(sid, identity):
+                continue
             if event.event_type in {"Stop", "SessionEnd"}:
                 self.requests.close(sid, "turn_ended")
                 continue
@@ -425,14 +447,7 @@ class LocalSessionService:
                     or not isinstance(part.input, dict)
                 ):
                     continue
-                digest = hashlib.sha256(
-                    json.dumps(
-                        part.input,
-                        sort_keys=True,
-                        separators=(",", ":"),
-                        ensure_ascii=False,
-                    ).encode()
-                ).hexdigest()
+                digest = hook_input_hash(part.input)
                 if digest == event.data.get("tool_input_hash"):
                     self.requests.observe_hook(
                         sid,

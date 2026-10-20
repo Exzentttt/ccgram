@@ -155,12 +155,12 @@ controls. A continuously active request keeps its bound evidence until it retire
 A distinct hook supersedes pending evidence immediately, before screen
 reconciliation. Replays cannot restore the superseded request's controls.
 Hook intake blocks approvals and messages for the affected session until queued
-observations finish processing. An unmatched digest removes old controls and uses
+observations finish processing. A fresh unmatched digest removes old controls and uses
 terminal fallback. Queue overflow or processing failure keeps affected approvals
-blocked; see [operator recovery](operations.md#hook-processing-recovery).
+blocked. See [operator recovery](operations.md#hook-processing-recovery).
 If polling closes the original request during dismissal, the server also stops
 before forwarding the message. Escape was already sent, so the outcome is
-`unknown`; refresh the session and ask for a new user intent.
+`unknown`. Refresh the session and ask for a new user intent.
 Hook evidence belongs to one prompt fingerprint and binding. A changed prompt needs
 fresh evidence. Permission commands and question labels must match exactly.
 Ambiguous or decorated choices use terminal controls.
