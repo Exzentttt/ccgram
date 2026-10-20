@@ -59,6 +59,32 @@ async def test_worktree_branch_probe_timeout_is_structured(
     mux.create_window.assert_not_awaited()
 
 
+@pytest.mark.parametrize("failure", ["timeout", "os_error", "nonzero"])
+async def test_failed_worktree_checkout_requires_inspection_before_retry(
+    mux, tmp_path, git_probes, failure
+):
+    boundary, run = git_probes
+
+    def checkout(argv, **kwargs):
+        if argv[3:5] == ["worktree", "add"]:
+            if failure == "timeout":
+                raise subprocess.TimeoutExpired(argv, 30)
+            if failure == "os_error":
+                raise OSError("checkout failed")
+            return subprocess.CompletedProcess(argv, 128, "", "checkout failed")
+        return run(argv, **kwargs)
+
+    boundary.side_effect = checkout
+    with pytest.raises(ProtocolError) as error:
+        await MultiplexerSessionBackend(mux, "/tmp").create(
+            {"directory": str(tmp_path), "provider": "claude", "worktree": True}
+        )
+    assert error.value.status == 503
+    assert error.value.code == "backend_unavailable"
+    assert "inspect the terminal before retrying" in str(error.value)
+    mux.create_window.assert_not_awaited()
+
+
 @pytest.mark.parametrize(
     "title", [1, True, {"text": "title"}, ["title"], "ignored title"]
 )

@@ -15,6 +15,13 @@ from ccgram.worktrees import (
 )
 
 
+@pytest.mark.parametrize(
+    "name", ["feature\x00name", "feature\ud800name", "feature\udfffname"]
+)
+def test_branch_validation_rejects_invalid_subprocess_arguments(name):
+    assert validate_branch_name(name) is False
+
+
 def _git(cwd: Path, *args: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         ["git", *args],

@@ -427,7 +427,9 @@ class MultiplexerSessionBackend:
                 create_worktree, eligibility.repo_path, branch, worktree_path
             )
         except WorktreeError as exc:
-            raise ProtocolError(400, "invalid_request", str(exc)) from exc
+            raise ProtocolError(
+                503, "backend_unavailable", _CREATION_UNCONFIRMED
+            ) from exc
         return worktree_path
 
     async def _created_target(self, ok: bool, target_id: str) -> Target:
