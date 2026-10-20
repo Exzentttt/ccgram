@@ -111,3 +111,15 @@ unavailable there, so an agent message cannot accidentally become a shell comman
 APNs registration returns `422 unsupported_action`. `push.apns` is absent from
 capabilities. Telegram remains the notification channel. This implementation does
 not install or publish an iOS application.
+
+## Hook processing recovery
+
+Hook intake blocks approvals and messages until queued evidence is processed.
+If the queue overflows, the log reports `Protocol hook queue full`. If processing
+fails, it reports `Session protocol source unavailable`. Lost observations keep
+affected sessions blocked because the server cannot prove which request is current.
+Terminal controls remain available.
+
+Fix the hook flood or unavailable source, then restart ccgram to rebuild state
+from fresh observations. Refresh the mobile session and confirm the displayed
+request before sending a new action. Do not retry an action with an unknown outcome.

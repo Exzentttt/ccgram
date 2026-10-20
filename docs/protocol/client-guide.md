@@ -106,7 +106,7 @@ that ID and body. Reusing an ID for a different body or session is an error.
 | `action.updated` with `messageId` | Show delivered. Matching uses conversation, normalized whitespace, and a transcript timestamp within 60 seconds of sending. History also carries the correlated `actionId`. |
 | `unknown` | Stop retries and show “Delivery unknown. Check the terminal.” A crash or a partial composite input can cause this result. |
 | `409 binding_conflict` | Read the current snapshot in `error.details`, keep the draft, and require a new user intent with the new binding version. |
-| `409 request_open` | Confirm dismissal with the operator before making a new `message.send` with `dismissRequest: true`. |
+| `409 request_open` | Refresh requests and wait for queued hook processing. If a prompt remains, confirm dismissal before a new `message.send` with `dismissRequest: true`. |
 | `409 request_closed` | Refresh the requests. A replaced or closed request requires a new user intent. |
 | `429 rate_limited` | Wait `error.details.retryAfterMs`, then retry the same action. |
 
@@ -146,13 +146,18 @@ the old response immediately, even before the next screen refresh creates a new
 request. Finishing an earlier response or dismissal preserves that new evidence.
 An absent prompt retires its request and preserves evidence for a newer prompt
 that has not rendered yet. Explicit turn or session invalidation clears that evidence.
-An observation alone does not consume a hook; it must bind to a matching prompt.
+An observation does not consume itself. Replacement or explicit invalidation
+consumes pending evidence even if it has not bound to a matching prompt.
 Consumed or explicitly invalidated hooks stay blocked for their full matching
 window, including after a different hook binds. Duplicate events cannot reopen them.
 Consumed and expired observations are ignored before they can displace newer
 controls. A continuously active request keeps its bound evidence until it retires.
 A distinct hook supersedes pending evidence immediately, before screen
 reconciliation. Replays cannot restore the superseded request's controls.
+Hook intake blocks approvals and messages for the affected session until queued
+observations finish processing. An unmatched digest removes old controls and uses
+terminal fallback. Queue overflow or processing failure keeps affected approvals
+blocked; see [operator recovery](operations.md#hook-processing-recovery).
 If polling closes the original request during dismissal, the server also stops
 before forwarding the message. Escape was already sent, so the outcome is
 `unknown`; refresh the session and ask for a new user intent.

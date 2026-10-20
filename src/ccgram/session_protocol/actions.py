@@ -202,6 +202,11 @@ class ActionExecutor:
                 "backend_unavailable",
                 "Foreground process could not be verified",
             )
+        if action.kind in {
+            "message.send",
+            "request.respond",
+        } and self.service.requests.has_deferred(session_id):
+            raise ProtocolError(409, "request_open", "Hook evidence awaits processing")
         if action.kind == "request.respond":
             await self._validate_response(session_id, target, action)
         if action.kind == "session.resume" and (

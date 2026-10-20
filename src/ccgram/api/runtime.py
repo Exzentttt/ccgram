@@ -26,26 +26,40 @@ _MAX_PORT = 65535
 
 class ProtocolRuntime:
     def __init__(
-        self, store: ProtocolStore, service: LocalSessionService, lock: IO[bytes]
+        self,
+        store: ProtocolStore,
+        service: LocalSessionService,
+        lock: IO[bytes],
+        *,
+        prefix: str = "",
     ) -> None:
         self.store = store
         self.service = service
         self.lock = lock
+        self.prefix = prefix
         self.runner: web.AppRunner | None = None
         self.task: asyncio.Task | None = None
-        self.hooks: asyncio.Queue[HookEvent] = asyncio.Queue(256)
+        self.hooks: asyncio.Queue[tuple[HookEvent, tuple[str, ...]]] = asyncio.Queue(
+            256
+        )
 
     def observe_hook(self, event: HookEvent) -> None:
         # A remote observer never blocks the Telegram monitor or its receipts.
-        with contextlib.suppress(asyncio.QueueFull):
-            self.hooks.put_nowait(event)
+        sessions = self.service.defer_hook(event, self.prefix)
+        try:
+            self.hooks.put_nowait((event, sessions))
+        except asyncio.QueueFull:
+            # Lost evidence must keep affected approvals blocked until restart.
+            logger.error("Protocol hook queue full; affected approvals require restart")
 
     async def poll(self, prefix: str) -> None:
         while True:
             try:
                 await self.service.refresh()
                 while not self.hooks.empty():
-                    await self.service.observe_hook(self.hooks.get_nowait(), prefix)
+                    event, sessions = self.hooks.get_nowait()
+                    await self.service.observe_hook(event, prefix)
+                    self.service.resolve_hook(sessions)
             except ProtocolError, OSError:
                 logger.warning("Session protocol source unavailable", exc_info=True)
             await asyncio.sleep(1)
@@ -99,7 +113,7 @@ async def start_if_enabled(
     service = LocalSessionService(
         MultiplexerSessionBackend(multiplexer, command_dir), store
     )
-    runtime = ProtocolRuntime(store, service, lock)
+    runtime = ProtocolRuntime(store, service, lock, prefix=prefix)
     hosts = frozenset(
         h.strip().lower()
         for h in os.getenv(

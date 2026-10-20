@@ -111,14 +111,30 @@ class RequestStore:
         self._hooks: dict[str, PendingHook] = {}
         self._hook_prompts: dict[str, tuple[PendingHook, str, int]] = {}
         self._consumed_hooks: list[tuple[str, PendingHook]] = []
+        self._deferred: dict[str, int] = {}
 
     def get(self, session_id: str) -> OpenRequest | None:
         return self._open.get(session_id)
 
     def is_current(self, session_id: str, request: OpenRequest) -> bool:
-        return self.get(session_id) is request and (
-            self._hooks.get(session_id) == request.observed_hook
+        return (
+            not self.has_deferred(session_id)
+            and self.get(session_id) is request
+            and (self._hooks.get(session_id) == request.observed_hook)
         )
+
+    def defer(self, session_id: str) -> None:
+        self._deferred[session_id] = self._deferred.get(session_id, 0) + 1
+
+    def resolve(self, session_id: str) -> None:
+        count = self._deferred[session_id]
+        if count == 1:
+            self._deferred.pop(session_id)
+        else:
+            self._deferred[session_id] = count - 1
+
+    def has_deferred(self, session_id: str) -> bool:
+        return session_id in self._deferred
 
     def observe_hook(self, session_id: str, hook: PendingHook) -> None:
         if abs(time.time() - hook.timestamp) > _HOOK_MATCH_TTL or self._is_consumed(

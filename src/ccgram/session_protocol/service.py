@@ -369,16 +369,39 @@ class LocalSessionService:
         async with self._refresh_lock:
             await self._observe_hook(event, prefix)
 
-    async def _observe_hook(self, event: HookEvent, prefix: str) -> None:
+    def defer_hook(self, event: HookEvent, prefix: str) -> tuple[str, ...]:
+        if event.event_type not in {
+            "PermissionRequest",
+            "PreToolUse",
+            "Stop",
+            "SessionEnd",
+        } or (
+            event.event_type == "PreToolUse"
+            and event.data.get("tool_name") != "AskUserQuestion"
+        ):
+            return ()
+        sessions = tuple(sid for sid, _ in self._hook_targets(event, prefix))
+        for sid in sessions:
+            self.requests.defer(sid)
+        return sessions
+
+    def resolve_hook(self, sessions: tuple[str, ...]) -> None:
+        for sid in sessions:
+            self.requests.resolve(sid)
+
+    def _hook_targets(self, event: HookEvent, prefix: str) -> list[tuple[str, Target]]:
         target_id = event.window_key.removeprefix(prefix)
         if not event.window_key.startswith(prefix):
-            return
-        for sid, target in list(self._targets.items()):
-            if (
-                target.id.casefold() != target_id.casefold()
-                or target.conversation_id != event.session_id
-            ):
-                continue
+            return []
+        return [
+            (sid, target)
+            for sid, target in self._targets.items()
+            if target.id.casefold() == target_id.casefold()
+            and target.conversation_id == event.session_id
+        ]
+
+    async def _observe_hook(self, event: HookEvent, prefix: str) -> None:
+        for sid, target in self._hook_targets(event, prefix):
             if event.event_type in {"Stop", "SessionEnd"}:
                 self.requests.close(sid, "turn_ended")
                 continue
@@ -387,12 +410,13 @@ class LocalSessionService:
             tool_name = event.data.get("tool_name")
             if event.event_type == "PreToolUse" and tool_name != "AskUserQuestion":
                 continue
-            await self._match_hook(sid, target, event)
+            if not await self._match_hook(sid, target, event):
+                self.requests.close(sid, "vanished")
 
-    async def _match_hook(self, sid: str, target: Target, event: HookEvent) -> None:
+    async def _match_hook(self, sid: str, target: Target, event: HookEvent) -> bool:
         tool_name = event.data.get("tool_name")
         if not isinstance(tool_name, str):
-            return
+            return False
         for message in reversed(await self._messages(target)):
             for part in message.parts:
                 if (
@@ -422,4 +446,5 @@ class LocalSessionService:
                             event.timestamp,
                         ),
                     )
-                    return
+                    return True
+        return False
