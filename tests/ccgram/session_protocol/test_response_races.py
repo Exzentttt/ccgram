@@ -267,3 +267,68 @@ def test_request_retirement_preserves_only_new_unconsumed_hook(
     expected_source = "hook" if new_hook and retirement == "absent_prompt" else "screen"
     assert second.request.source == expected_source
     assert bool(second.option_keys) == (expected_source == "hook")
+
+
+@pytest.mark.parametrize("retirement", ["answered", "changed_prompt", "replaced"])
+def test_consumed_hook_cannot_replay_after_another_hook_binds(retirement):
+    requests = RequestStore(EventHub())
+    first_hook = PendingHook(
+        "conv", "permission", "Bash", {"command": "first"}, time.time()
+    )
+    first_prompt = Prompt("first\n1. Yes\n2. No", "permission")
+    requests.observe_hook("s", first_hook)
+    first = requests.reconcile("s", "conv", 1, first_prompt)
+    assert first is not None and first.request.source == "hook"
+    if retirement == "answered":
+        requests.close("s", "answered")
+    elif retirement == "changed_prompt":
+        requests.reconcile("s", "conv", 1, Prompt("other menu", "permission"))
+    requests.observe_hook(
+        "s",
+        PendingHook("conv", "permission", "Bash", {"command": "second"}, time.time()),
+    )
+    second = requests.reconcile(
+        "s", "conv", 1, Prompt("second\n1. Yes\n2. No", "permission")
+    )
+    assert second is not None and second.request.source == "hook"
+    requests.observe_hook("s", first_hook)
+    replayed = requests.reconcile("s", "conv", 1, first_prompt)
+    assert replayed is not None and replayed.request.source == "screen"
+    assert not replayed.option_keys
+
+
+def test_explicit_invalidation_consumes_unbound_pending_evidence():
+    requests = RequestStore(EventHub())
+    hook = PendingHook("conv", "permission", "Bash", {"command": "first"}, time.time())
+    requests.observe_hook("s", hook)
+    requests.close("s", "turn_ended")
+    requests.observe_hook("s", hook)
+    reopened = requests.reconcile(
+        "s", "conv", 1, Prompt("first\n1. Yes\n2. No", "permission")
+    )
+    assert reopened is not None and reopened.request.source == "screen"
+
+
+@pytest.mark.parametrize("elapsed", [1, 31])
+def test_fresh_hook_with_same_input_is_independent_of_consumed_hook(
+    monkeypatch, elapsed
+):
+    requests = RequestStore(EventHub())
+    now = time.time()
+    hook = PendingHook("conv", "permission", "Bash", {"command": "first"}, now)
+    prompt = Prompt("first\n1. Yes\n2. No", "permission")
+    requests.observe_hook("s", hook)
+    requests.reconcile("s", "conv", 1, prompt)
+    requests.close("s", "answered")
+    monkeypatch.setattr(
+        "ccgram.session_protocol.requests.time.time", lambda: now + elapsed
+    )
+    requests.observe_hook("s", hook)
+    old = requests.reconcile("s", "conv", 1, prompt)
+    assert old is not None and old.request.source == "screen"
+    fresh_hook = PendingHook(
+        "conv", "permission", "Bash", {"command": "first"}, now + elapsed
+    )
+    requests.observe_hook("s", fresh_hook)
+    fresh = requests.reconcile("s", "conv", 1, prompt)
+    assert fresh is not None and fresh.request.source == "hook"

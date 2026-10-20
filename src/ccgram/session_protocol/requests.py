@@ -110,6 +110,7 @@ class RequestStore:
         self._open: dict[str, OpenRequest] = {}
         self._hooks: dict[str, PendingHook] = {}
         self._hook_prompts: dict[str, tuple[PendingHook, str, int]] = {}
+        self._consumed_hooks: list[tuple[str, PendingHook]] = []
 
     def get(self, session_id: str) -> OpenRequest | None:
         return self._open.get(session_id)
@@ -122,20 +123,39 @@ class RequestStore:
     def observe_hook(self, session_id: str, hook: PendingHook) -> None:
         self._hooks[session_id] = hook
 
-    def close(self, session_id: str, reason: str) -> None:
+    def close(
+        self, session_id: str, reason: str, *, preserve_hook: PendingHook | None = None
+    ) -> None:
         if reason not in CLOSE_REASONS:
             raise ValueError(f"Unknown request close reason: {reason}")
         current = self._open.pop(session_id, None)
-        self._hooks.pop(session_id, None)
-        bound = self._hook_prompts.get(session_id)
+        pending = self._hooks.pop(session_id, None)
+        if pending is not None and pending != preserve_hook:
+            self._consume(session_id, pending)
+        bound = self._hook_prompts.pop(session_id, None)
         if bound:
-            self._hook_prompts[session_id] = (bound[0], "", 0)
+            self._consume(session_id, bound[0])
+        if preserve_hook is not None:
+            self._hooks[session_id] = preserve_hook
         if current:
             self.hub.publish(
                 "request.closed",
                 session_id,
                 {"requestId": current.request.id, "reason": reason},
             )
+
+    def _consume(self, session_id: str, hook: PendingHook) -> None:
+        if not self._is_consumed(session_id, hook):
+            self._consumed_hooks.append((session_id, hook))
+
+    def _is_consumed(self, session_id: str, hook: PendingHook) -> bool:
+        now = time.time()
+        self._consumed_hooks = [
+            (sid, consumed)
+            for sid, consumed in self._consumed_hooks
+            if abs(now - consumed.timestamp) <= _HOOK_MATCH_TTL
+        ]
+        return (session_id, hook) in self._consumed_hooks
 
     def reconcile(
         self, session_id: str, conversation_id: str, version: int, prompt: Prompt | None
@@ -144,14 +164,19 @@ class RequestStore:
         if prompt is None:
             if current:
                 pending = self._hooks.get(session_id)
-                self.close(session_id, "vanished")
-                if pending is not None and pending != current.hook:
-                    self.observe_hook(session_id, pending)
+                self.close(
+                    session_id,
+                    "vanished",
+                    preserve_hook=pending if pending != current.hook else None,
+                )
             return None
         hook = self._hooks.get(session_id)
+        if hook is not None and self._is_consumed(session_id, hook):
+            hook = None
         bound = self._hook_prompts.get(session_id)
         if bound and bound[0] == hook and bound[1:] != (prompt.fingerprint, version):
-            self._hook_prompts[session_id] = (bound[0], "", 0)
+            self._consume(session_id, bound[0])
+            self._hook_prompts.pop(session_id)
             hook = None
         structured = (
             hook is not None and bound == (hook, prompt.fingerprint, version)
@@ -165,6 +190,8 @@ class RequestStore:
         ):
             return current
         if current:
+            if current.hook is not None:
+                self._consume(session_id, current.hook)
             # Retain a matching observation when promoting screen -> hook.
             self._open.pop(session_id)
             self.hub.publish(
