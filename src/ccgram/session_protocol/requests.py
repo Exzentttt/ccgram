@@ -183,6 +183,10 @@ class RequestStore:
         self._latest_hooks[session_id] = hook
         return True
 
+    def discard_identity(self, session_id: str, hook: HookIdentity) -> None:
+        if self._latest_hooks.get(session_id) == hook:
+            self.close(session_id, "vanished")
+
     def close(
         self,
         session_id: str,

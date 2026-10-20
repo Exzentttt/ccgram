@@ -433,7 +433,7 @@ class LocalSessionService:
             if event.event_type == "PreToolUse" and tool_name != "AskUserQuestion":
                 continue
             if not await self._match_hook(sid, target, event):
-                self.requests.close(sid, "vanished")
+                self.requests.discard_identity(sid, identity)
 
     async def _match_hook(self, sid: str, target: Target, event: HookEvent) -> bool:
         tool_name = event.data.get("tool_name")

@@ -76,6 +76,8 @@ ordering, and replay before accepting either form. A distinct identity retires t
 previous request synchronously, before queueing or reading the transcript. Deferred
 tickets block approvals and messages until processing finishes. Expiry in the queue
 cannot restore the retired request.
+An unmatched transcript lookup retires only its own identity. A newer identity
+received during that read remains available for later matching.
 
 Refresh, current-session inspection, creation, and hook transcript resolution share
 one lock to serialize authoritative observations. An unavailable
