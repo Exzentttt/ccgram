@@ -59,6 +59,52 @@ async def test_worktree_branch_probe_timeout_is_structured(
     mux.create_window.assert_not_awaited()
 
 
+@pytest.mark.parametrize(
+    "workspace", [None, "", 42, "bad\x00id", "bad\ud800id", "bad\udfffid"]
+)
+@pytest.mark.parametrize("worktree", [False, True])
+async def test_invalid_workspace_is_rejected_before_creation(
+    mux, tmp_path, git_probes, workspace, worktree
+):
+    boundary, _ = git_probes
+    with pytest.raises(ProtocolError) as error:
+        await MultiplexerSessionBackend(mux, "/tmp").create(
+            {
+                "directory": str(tmp_path),
+                "provider": "claude",
+                "workspaceId": workspace,
+                "worktree": worktree,
+            }
+        )
+    assert error.value.status == 400
+    assert error.value.code == "invalid_request"
+    boundary.assert_not_called()
+    mux.create_window.assert_not_awaited()
+    mux.create_topic_target.assert_not_awaited()
+    mux.create_worktree_window.assert_not_awaited()
+
+
+@pytest.mark.parametrize("native", [False, True])
+@pytest.mark.parametrize("worktree", [False, True])
+async def test_valid_workspace_reaches_selected_creation_backend(
+    mux, tmp_path, git_probes, native, worktree
+):
+    mux.capabilities.native_topic_targets = native
+    mux.create_window.return_value = (True, "", "", "@1")
+    mux.create_topic_target.return_value = SimpleNamespace(target_id="@1")
+    target = await MultiplexerSessionBackend(mux, "/tmp").create(
+        {
+            "directory": str(tmp_path),
+            "provider": "claude",
+            "workspaceId": "workspace-1",
+            "worktree": worktree,
+        }
+    )
+    assert target.id == "@1"
+    boundary = mux.create_topic_target if native else mux.create_window
+    assert boundary.await_args.kwargs["workspace_id"] == "workspace-1"
+
+
 @pytest.mark.parametrize("failure", ["timeout", "os_error", "nonzero"])
 async def test_failed_worktree_checkout_requires_inspection_before_retry(
     mux, tmp_path, git_probes, failure

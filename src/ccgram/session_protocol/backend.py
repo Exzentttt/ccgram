@@ -33,6 +33,19 @@ _CREATION_UNCONFIRMED = (
 )
 
 
+def _validate_workspace_id(workspace_id: Any) -> None:
+    try:
+        encoded = workspace_id.encode("utf-8") if isinstance(workspace_id, str) else b""
+    except UnicodeError:
+        encoded = b""
+    if not encoded or b"\x00" in encoded:
+        raise ProtocolError(
+            400,
+            "invalid_request",
+            "workspaceId must be a nonempty UTF-8 string without NUL",
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class Target:
     id: str
@@ -358,6 +371,8 @@ class MultiplexerSessionBackend:
                 "unsupported_action",
                 "Remote creation supports the normal approval mode only",
             )
+        if "workspaceId" in data:
+            _validate_workspace_id(data["workspaceId"])
         provider = data["provider"]
         candidate = get_provider_for_window("", provider_name=provider)
         if candidate.capabilities.name != provider:
