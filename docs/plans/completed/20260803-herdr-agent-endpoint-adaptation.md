@@ -974,7 +974,7 @@ Do not migrate a legacy binding automatically. Archive it and bind a listed targ
 
 Keep raw session values out of labels, logs, fixtures, and public target IDs.
 
-Use `/exec start docs/plans/herdr-agent-endpoint-adaptation.md` in an isolated CCGram worktree.
+Use `/exec start docs/plans/completed/20260803-herdr-agent-endpoint-adaptation.md` in an isolated CCGram worktree.
 
 ## Re-review
 

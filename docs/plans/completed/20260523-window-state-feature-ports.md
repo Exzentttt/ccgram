@@ -10,11 +10,8 @@ high-fan-in, high-churn state hub.
 The plan is executable by Ralphex when passed explicitly:
 
 ```bash
-ralphex docs/architecture-plan/2026-05-23-window-state-feature-ports.md
+ralphex docs/plans/completed/20260523-window-state-feature-ports.md
 ```
-
-Ralphex auto-discovery defaults to `docs/plans/`, so copy or symlink this file
-there if you want discovery-driven execution.
 
 ## Context
 
@@ -322,7 +319,7 @@ Feature contracts:
 - Modify: `docs/architecture.md` if present and still current.
 - Modify: `docs/ai-agents/architecture-map.md` if it lists window-state boundaries.
 - Modify: `docs/ai-agents/codebase-index.md` if it lists state/query modules.
-- Modify: `docs/architecture-plan/2026-05-23-window-state-feature-ports.md`
+- Modify: `docs/plans/completed/20260523-window-state-feature-ports.md`
 
 - [x] Run `uv run ruff format --check src/ tests/`.
 - [x] Run `uv run ruff check src/ tests/`.
