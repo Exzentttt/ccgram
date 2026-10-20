@@ -144,6 +144,8 @@ If another observation replaces or closes the request during that screen read,
 the server rejects the response before sending input. New hook evidence invalidates
 the old response immediately, even before the next screen refresh creates a new
 request. Finishing an earlier response or dismissal preserves that new evidence.
+An absent prompt retires its request and preserves evidence for a newer prompt
+that has not rendered yet. Explicit turn or session invalidation clears that evidence.
 If polling closes the original request during dismissal, the server also stops
 before forwarding the message. Escape was already sent, so the outcome is
 `unknown`; refresh the session and ask for a new user intent.

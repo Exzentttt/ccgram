@@ -143,7 +143,10 @@ class RequestStore:
         current = self.get(session_id)
         if prompt is None:
             if current:
+                pending = self._hooks.get(session_id)
                 self.close(session_id, "vanished")
+                if pending is not None and pending != current.observed_hook:
+                    self.observe_hook(session_id, pending)
             return None
         hook = self._hooks.get(session_id)
         bound = self._hook_prompts.get(session_id)

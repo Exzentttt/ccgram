@@ -224,3 +224,36 @@ async def test_screen_dismissal_with_unchanged_unmatched_hook_forwards_text(
     result, status = await service.execute(session.id, intent)
     assert status == 200 and result.outcome == "sent"
     assert backend.sent == [("key", "Escape", False), ("text", "continue", True)]
+
+
+@pytest.mark.parametrize("new_hook", [False, True])
+@pytest.mark.parametrize("retirement", ["absent_prompt", "explicit_close"])
+def test_request_retirement_preserves_only_new_unconsumed_hook(new_hook, retirement):
+    requests = RequestStore(EventHub())
+    prompt = Prompt("git status\n1. Yes\n2. No", "permission")
+    first_hook = PendingHook(
+        "conv", "permission", "Bash", {"command": "git status"}, time.time()
+    )
+    requests.observe_hook("s", first_hook)
+    first = requests.reconcile("s", "conv", 1, prompt)
+    assert first is not None and first.request.source == "hook"
+    if new_hook:
+        requests.observe_hook(
+            "s",
+            PendingHook(
+                "conv",
+                "permission",
+                "Bash",
+                {"command": "git status", "newInput": True},
+                time.time(),
+            ),
+        )
+    if retirement == "absent_prompt":
+        assert requests.reconcile("s", "conv", 1, None) is None
+    else:
+        requests.close("s", "turn_ended")
+    second = requests.reconcile("s", "conv", 1, prompt)
+    assert second is not None and second.request.id != first.request.id
+    expected_source = "hook" if new_hook and retirement == "absent_prompt" else "screen"
+    assert second.request.source == expected_source
+    assert bool(second.option_keys) == (expected_source == "hook")
