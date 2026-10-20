@@ -309,15 +309,11 @@ class ActionExecutor:
                 return False
             if not await self._prompt_gone(target):
                 return False
-            current = self.service.requests.get(session_id)
-            if current is not None and not self.service.requests.is_current(
-                session_id, request
-            ):
+            if not self.service.requests.is_current(session_id, request):
                 raise ProtocolError(
-                    409, "request_open", "A new request opened during dismissal"
+                    409, "request_open", "Request changed during dismissal"
                 )
-            if current is request:
-                self.service.requests.close(session_id, "dismissed")
+            self.service.requests.close(session_id, "dismissed")
         text = self.service.uploads.message_text(
             action.data["text"], action.data.get("files", [])
         )

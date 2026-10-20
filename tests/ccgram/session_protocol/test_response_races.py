@@ -121,8 +121,9 @@ async def test_raw_pinned_shell_launch_bypasses_stale_vim_state(monkeypatch):
     [("request.respond", True), ("message.send", True), ("message.send", False)],
 )
 @pytest.mark.parametrize("reconciled", [False, True])
+@pytest.mark.parametrize("retired", [False, True])
 async def test_completion_preserves_a_request_opened_during_confirmation(
-    service, backend, kind, structured, reconciled
+    service, backend, kind, structured, reconciled, retired
 ):
     session = (await service.list_sessions())[0]
     backend.current_prompt = Prompt("first command\n1. Yes\n2. No", "permission")
@@ -159,6 +160,9 @@ async def test_completion_preserves_a_request_opened_during_confirmation(
     backend.clear_on_input = True
     pending = asyncio.create_task(service.execute(session.id, intent))
     await entered.wait()
+    if retired:
+        await service.refresh()
+        assert service.requests.get(session.id) is None
     backend.current_prompt = Prompt("second command\n1. Yes\n2. No", "permission")
     service.requests.observe_hook(
         session.id,
@@ -184,8 +188,9 @@ async def test_completion_preserves_a_request_opened_during_confirmation(
         assert backend.sent == [("key", "Escape", False)]
 
 
+@pytest.mark.parametrize("replaced", [False, True])
 async def test_screen_dismissal_with_unchanged_unmatched_hook_forwards_text(
-    service, backend
+    service, backend, replaced
 ):
     session = (await service.list_sessions())[0]
     backend.current_prompt = Prompt("unrecognized menu\n1. Yes\n2. No", "permission")
@@ -197,6 +202,18 @@ async def test_screen_dismissal_with_unchanged_unmatched_hook_forwards_text(
     )
     snapshot = await service.get_session(session.id)
     assert snapshot.open_requests[0].source == "screen"
+    if replaced:
+        original_id = snapshot.open_requests[0].id
+        service.requests.observe_hook(
+            session.id,
+            PendingHook(
+                "conv", "permission", "Bash", {"command": "git diff"}, time.time()
+            ),
+        )
+        snapshot = await service.get_session(session.id)
+        current = snapshot.open_requests[0]
+        assert current.id != original_id and current.source == "screen"
+        assert not current.options and current.response_schema is None
     backend.clear_on_input = True
     intent = Action(
         str(uuid4()),

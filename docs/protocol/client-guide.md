@@ -144,6 +144,9 @@ If another observation replaces or closes the request during that screen read,
 the server rejects the response before sending input. New hook evidence invalidates
 the old response immediately, even before the next screen refresh creates a new
 request. Finishing an earlier response or dismissal preserves that new evidence.
+If polling closes the original request during dismissal, the server also stops
+before forwarding the message. Escape was already sent, so the outcome is
+`unknown`; refresh the session and ask for a new user intent.
 Hook evidence belongs to one prompt fingerprint and binding. A changed prompt needs
 fresh evidence. Permission commands and question labels must match exactly.
 Ambiguous or decorated choices use terminal controls.
