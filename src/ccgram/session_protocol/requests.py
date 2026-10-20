@@ -121,6 +121,10 @@ class RequestStore:
         )
 
     def observe_hook(self, session_id: str, hook: PendingHook) -> None:
+        if abs(time.time() - hook.timestamp) > _HOOK_MATCH_TTL or self._is_consumed(
+            session_id, hook
+        ):
+            return
         self._hooks[session_id] = hook
 
     def close(
@@ -192,6 +196,7 @@ class RequestStore:
         if current:
             if current.hook is not None:
                 self._consume(session_id, current.hook)
+                self._hook_prompts.pop(session_id, None)
             # Retain a matching observation when promoting screen -> hook.
             self._open.pop(session_id)
             self.hub.publish(

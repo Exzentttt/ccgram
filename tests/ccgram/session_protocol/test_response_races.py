@@ -332,3 +332,58 @@ def test_fresh_hook_with_same_input_is_independent_of_consumed_hook(
     requests.observe_hook("s", fresh_hook)
     fresh = requests.reconcile("s", "conv", 1, prompt)
     assert fresh is not None and fresh.request.source == "hook"
+
+
+@pytest.mark.parametrize("elapsed", [1, 31])
+def test_replayed_hook_does_not_displace_newer_controls(monkeypatch, elapsed):
+    requests = RequestStore(EventHub())
+    now = time.time()
+    first_hook = PendingHook("conv", "permission", "Bash", {"command": "first"}, now)
+    requests.observe_hook("s", first_hook)
+    requests.reconcile("s", "conv", 1, Prompt("first\n1. Yes\n2. No", "permission"))
+    requests.close("s", "answered")
+    monkeypatch.setattr(
+        "ccgram.session_protocol.requests.time.time", lambda: now + elapsed
+    )
+    second_hook = PendingHook(
+        "conv", "permission", "Bash", {"command": "second"}, now + elapsed
+    )
+    second_prompt = Prompt("second\n1. Yes\n2. No", "permission")
+    requests.observe_hook("s", second_hook)
+    second = requests.reconcile("s", "conv", 1, second_prompt)
+    assert second is not None and second.request.source == "hook"
+    requests.observe_hook("s", first_hook)
+    assert requests.is_current("s", second)
+    assert requests.reconcile("s", "conv", 1, second_prompt) is second
+
+
+def test_retired_binding_never_reopens_after_tombstone_expiry(monkeypatch):
+    requests = RequestStore(EventHub())
+    now = time.time()
+    first_hook = PendingHook("conv", "permission", "Bash", {"command": "first"}, now)
+    prompt = Prompt("first\n1. Yes\n2. No", "permission")
+    requests.observe_hook("s", first_hook)
+    requests.reconcile("s", "conv", 1, prompt)
+    requests.observe_hook(
+        "s", PendingHook("conv", "permission", "Bash", {"command": "other"}, now)
+    )
+    requests.reconcile("s", "conv", 1, prompt)
+    requests.observe_hook("s", first_hook)
+    requests.reconcile("s", "conv", 1, prompt)
+    monkeypatch.setattr("ccgram.session_protocol.requests.time.time", lambda: now + 31)
+    reopened = requests.reconcile("s", "conv", 1, prompt)
+    assert reopened is not None and reopened.request.source == "screen"
+    assert not reopened.option_keys
+
+
+def test_continuously_active_hook_keeps_controls_after_matching_ttl(monkeypatch):
+    requests = RequestStore(EventHub())
+    now = time.time()
+    hook = PendingHook("conv", "permission", "Bash", {"command": "first"}, now)
+    prompt = Prompt("first\n1. Yes\n2. No", "permission")
+    requests.observe_hook("s", hook)
+    opened = requests.reconcile("s", "conv", 1, prompt)
+    assert opened is not None and opened.request.source == "hook"
+    monkeypatch.setattr("ccgram.session_protocol.requests.time.time", lambda: now + 31)
+    requests.observe_hook("s", hook)
+    assert requests.reconcile("s", "conv", 1, prompt) is opened
