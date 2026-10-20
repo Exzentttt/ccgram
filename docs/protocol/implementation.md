@@ -52,11 +52,15 @@ The implementation makes these clarifications to the proposed design:
   Full commits reserve an action before any input and preserve an unknown outcome
   after a crash. Device and action storage use the Python standard library.
 - `bindingVersion` remains a persisted increasing integer. The active pane,
-  foreground process, and transcript generation also participate in the binding.
+  foreground PID and arguments, source availability, and transcript generation
+  also participate in the binding. agterm uses its observed arguments when no PID
+  is available. Unknown foreground state exposes no actions.
 - Message revision counts repeated native records and result records. Counting
   only tool results misses Gemini's repeated message updates.
 - `historyGeneration` marks source replacement. Clients clear the old conversation
-  cache when it changes. A restart retains the generation.
+  cache when it changes. A restart retains the generation. Continuity checks hash
+  the full previously observed prefix in a worker thread. Upgrading the earlier
+  first-page fingerprint format invalidates the cache once.
 - A resume at the current sequence succeeds even with an empty ring. `welcome`
   precedes replay. Subscription queues are installed before reading replay.
 - Cursors use opaque conversation/generation/message-boundary tokens. The server
@@ -65,6 +69,15 @@ The implementation makes these clarifications to the proposed design:
 - Hook events retain a tool-input digest instead of raw input. Matching reads the
   authoritative input from the transcript. Hooks remain observations and return no
   permission decision.
+
+Refresh, current-session inspection, creation, and hook observation share one lock
+so an older observation cannot publish a regressed binding or request. An unavailable
+transcript or pane capture degrades only that session to unknown status with no
+actions. Its identity stays present, and healthy sessions continue to refresh.
+
+tmux message submission uses the existing vim recovery, command-mode handling, and
+delayed Enter while pinning every capture and key to the verified pane. Raw paste
+and terminal keys retain their direct input behavior.
 
 The current history builder reads the transcript before paging. Large conversations
 therefore cost a full parse when content changes or history is requested. Add an
@@ -84,6 +97,11 @@ The unit suite covers message identity, revisions, source replacement, paginatio
 and partial JSONL writes. Action tests cover crash reservations, retries, binding
 changes, request safety, and uncertain delivery. API tests cover uploads, pairing,
 revocation, Host/Origin guards, rate limits, replay, queue overflow, and schemas.
+Regression checks cover PID-less foreground identity, safe resume, pinned tmux
+input, exact question labels, stale hook reuse, and multi-select fallback. They
+also cover per-session source failures, binding races, and transcript rewrites
+beyond the first page. Schema checks validate nonempty history and live
+message frames from all four providers, including internal Codex role filtering.
 
 Golden payloads live in `protocol/v1/fixtures/`. `_manifest.json` maps each fixture
 to its shared JSON Schema. The server's builder output is compared with the golden

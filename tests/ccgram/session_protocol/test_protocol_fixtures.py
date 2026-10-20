@@ -74,11 +74,40 @@ def test_builder_output_matches_message_golden_fixture():
     assert wire(actual) == json.loads((ROOT / "fixtures" / "message.json").read_text())
 
 
-async def test_real_service_output_matches_schema(service):
+@pytest.mark.parametrize("provider", ["claude", "codex", "gemini", "pi"])
+async def test_real_service_output_matches_schema(service, backend, tmp_path, provider):
+    from dataclasses import replace
+
+    message = {"role": "assistant", "content": [{"type": "text", "text": "public"}]}
+    if provider == "codex":
+        entries = [
+            {"type": "response_item", "payload": {"type": "message", **message}},
+            {
+                "type": "response_item",
+                "payload": {"type": "message", **message, "role": "developer"},
+            },
+        ]
+    elif provider == "gemini":
+        entries = [{"type": "gemini", "id": "native", "content": "public"}]
+    else:
+        entries = [
+            {
+                "type": "assistant" if provider == "claude" else "message",
+                "uuid": "native",
+                "id": "native",
+                "message": message,
+            }
+        ]
+    path = tmp_path / "transcript.jsonl"
+    path.write_text("".join(json.dumps(e) + "\n" for e in entries), encoding="utf-8")
+    backend.target = replace(backend.target, provider=provider, transcript=path)
     session = (await service.list_sessions())[0]
     validate("Session", wire(session))
-    validate("History", wire(await service.history(session.id, None, 50)))
+    history = await service.history(session.id, None, 50)
+    assert len(history.messages) == 1 and history.messages[0].role == "agent"
+    validate("History", wire(history))
     _, events = service.hub.replay(service.hub.epoch, 0)
+    assert any(event.type == "message.upsert" for event in events)
     for event in events:
         validate("ServerFrame", event.body())
 

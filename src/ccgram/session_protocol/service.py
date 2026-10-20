@@ -12,7 +12,7 @@ from datetime import datetime
 from typing import Any, Protocol
 
 from ..providers.base import HookEvent
-from .backend import SessionBackend, Target
+from .backend import Prompt, SessionBackend, Target
 from .events import Event, EventHub
 from .messages import Message, build_messages, read_entries
 from .models import (
@@ -85,12 +85,8 @@ class LocalSessionService:
             targets = await self.backend.targets()
             live = set()
             for target in targets:
-                target = self._source_version(target)
-                session_id, version = self.store.bind(
-                    target.id, target.binding, target.aliases
-                )
-                live.add(session_id)
-                await self._observe(session_id, version, target)
+                _, snapshot = await self._update(target)
+                live.add(snapshot.id)
             for session_id in self._snapshots.keys() - live:
                 self.requests.close(session_id, "vanished")
                 self.hub.publish(
@@ -101,8 +97,23 @@ class LocalSessionService:
                 self._transcript_stamps.pop(session_id, None)
                 self._revisions.pop(session_id, None)
 
+    async def _update(self, target: Target) -> tuple[Target, SessionSnapshot]:
+        try:
+            target = await self._source_version(target)
+            prompt = await self.backend.prompt(target)
+            sid, version = self.store.bind(target.id, target.binding, target.aliases)
+            return target, await self._observe(sid, version, target, prompt)
+        except (ProtocolError, OSError) as exc:
+            target = replace(
+                target,
+                available=False,
+                status=Status("unknown", str(exc), "screen", utc_now()),
+            )
+            sid, version = self.store.bind(target.id, target.binding, target.aliases)
+            return target, await self._observe(sid, version, target, None)
+
     async def _observe(
-        self, session_id: str, version: int, target: Target
+        self, session_id: str, version: int, target: Target, prompt: Prompt | None
     ) -> SessionSnapshot:
         old = self._snapshots.get(session_id)
         if old and old.binding_version != version:
@@ -110,7 +121,6 @@ class LocalSessionService:
             self._revisions.pop(session_id, None)
             self._transcript_stamps.pop(session_id, None)
         self._targets[session_id] = target
-        prompt = await self.backend.prompt(target)
         opened = self.requests.reconcile(
             session_id, target.conversation_id, version, prompt
         )
@@ -131,7 +141,8 @@ class LocalSessionService:
         capabilities = tuple(
             k
             for k in SUPPORTED_ACTIONS
-            if (k != "message.send" or target.provider not in {"shell", "unknown"})
+            if target.foreground_verified
+            and (k != "message.send" or target.provider not in {"shell", "unknown"})
             and (
                 k != "request.respond"
                 or (opened is not None and bool(opened.option_keys))
@@ -163,14 +174,15 @@ class LocalSessionService:
                 session_id,
                 snapshot,
             )
-        await self._publish_messages(session_id, target)
+        if target.available:
+            await self._publish_messages(session_id, target)
         return self._snapshots[session_id]
 
-    def _source_version(self, target: Target) -> Target:
+    async def _source_version(self, target: Target) -> Target:
         if target.transcript is None:
             return target
         try:
-            generation = self.store.transcript_generation(
+            generation = await self.store.transcript_generation(
                 f"{target.id.casefold()}:{target.conversation_id}", target.transcript
             )
         except OSError as exc:
@@ -262,13 +274,11 @@ class LocalSessionService:
     async def current(self, session_id: str) -> tuple[Target, SessionSnapshot]:
         if session_id not in self._targets:
             await self.refresh()
-        target = self._targets.get(session_id)
-        if target is None:
-            raise ProtocolError(404, "not_found", "Session not found")
-        current = self._source_version(await self.backend.inspect(target.id))
-        _, version = self.store.bind(current.id, current.binding, current.aliases)
-        snapshot = await self._observe(session_id, version, current)
-        return current, snapshot
+        async with self._refresh_lock:
+            target = self._targets.get(session_id)
+            if target is None:
+                raise ProtocolError(404, "not_found", "Session not found")
+            return await self._update(await self.backend.inspect(target.id))
 
     async def history(
         self,
@@ -343,9 +353,9 @@ class LocalSessionService:
         return await self.executor.execute(session_id, action)
 
     async def create_session(self, data: dict[str, Any]) -> SessionSnapshot:
-        target = self._source_version(await self.backend.create(data))
-        sid, version = self.store.bind(target.id, target.binding, target.aliases)
-        return await self._observe(sid, version, target)
+        async with self._refresh_lock:
+            _, snapshot = await self._update(await self.backend.create(data))
+            return snapshot
 
     async def terminal(self, session_id: str, pane: str = "p0") -> dict[str, Any]:
         target, _ = await self.current(session_id)
@@ -356,6 +366,10 @@ class LocalSessionService:
         return await self.backend.commands(target)
 
     async def observe_hook(self, event: HookEvent, prefix: str) -> None:
+        async with self._refresh_lock:
+            await self._observe_hook(event, prefix)
+
+    async def _observe_hook(self, event: HookEvent, prefix: str) -> None:
         target_id = event.window_key.removeprefix(prefix)
         if not event.window_key.startswith(prefix):
             return

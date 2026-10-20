@@ -14,6 +14,7 @@ from ..command_catalog import CommandCatalog
 from ..multiplexer.base import Multiplexer, WindowRef
 from ..providers import get_provider_for_window, resolve_launch_command
 from ..providers.process_detection import classify_provider_from_argv
+from ..providers.shell_infra import KNOWN_SHELLS, match_prompt
 from ..window_state_ports import identity_state
 from ..worktrees import (
     check_worktree_eligibility,
@@ -47,6 +48,12 @@ class Target:
     resume_provider: str = ""
     transcript_provider: str = ""
     history_generation: int = 0
+    foreground_argv: tuple[str, ...] = ()
+    available: bool = True
+
+    @property
+    def foreground_verified(self) -> bool:
+        return self.available and bool(self.foreground_argv)
 
     @property
     def binding(self) -> str:
@@ -58,6 +65,8 @@ class Target:
                 self.pane_id,
                 self.process_id,
                 self.history_generation,
+                self.foreground_argv,
+                self.available,
             ],
             separators=(",", ":"),
         )
@@ -136,6 +145,9 @@ class MultiplexerSessionBackend:
             identity.provider_name
             if identity
             and provider_name == "shell"
+            and fg is not None
+            and len(fg.argv) == 1
+            and fg.argv[0].rsplit("/", 1)[-1].lstrip("-") in KNOWN_SHELLS
             and identity.provider_name not in {"shell", "unknown"}
             else ""
         )
@@ -157,6 +169,18 @@ class MultiplexerSessionBackend:
             transcript = None
         panes = await self.mux.list_panes(window.window_id)
         active = next((p for p in panes if p.active), None)
+        if resume_provider:
+            screen = (
+                await self.mux.capture_pane_by_id(
+                    active.pane_id, window_id=window.window_id
+                )
+                if active
+                else await self.mux.capture_pane(window.window_id)
+            )
+            lines = (screen or "").rstrip().splitlines()
+            marker = match_prompt(lines[-1]) if lines else None
+            if marker is None or marker.trailing_text.strip():
+                resume_provider = ""
         native = await self.mux.agent_status(window.window_id)
         now = utc_now()
         status = Status("unknown", "", "screen", now)
@@ -173,7 +197,12 @@ class MultiplexerSessionBackend:
         elif provider_name != "unknown":
             screen = await self.mux.capture_pane(window.window_id)
             if screen:
-                parsed = provider.parse_terminal_status(screen)
+                title = (
+                    await self.mux.get_pane_title(window.window_id)
+                    if provider.capabilities.uses_pane_title
+                    else ""
+                )
+                parsed = provider.parse_terminal_status(screen, pane_title=title)
                 status = Status(
                     "working" if parsed and not parsed.is_interactive else "idle",
                     parsed.display_label if parsed else "",
@@ -198,6 +227,7 @@ class MultiplexerSessionBackend:
             self.host,
             resume_provider,
             history_provider,
+            foreground_argv=tuple(fg.argv) if fg else (),
         )
 
     async def prompt(self, target: Target) -> Prompt | None:
@@ -272,10 +302,13 @@ class MultiplexerSessionBackend:
         ]
 
     async def resume(self, target: Target, conversation_id: str) -> bool:
+        fresh = await self.inspect(target.id)
         if (
-            target.provider != "shell"
-            or not target.resume_provider
-            or conversation_id != target.conversation_id
+            fresh.provider != "shell"
+            or not fresh.resume_provider
+            or conversation_id != fresh.conversation_id
+            or (fresh.process_id, fresh.pane_id, fresh.foreground_argv)
+            != (target.process_id, target.pane_id, target.foreground_argv)
         ):
             raise ProtocolError(
                 422,
@@ -314,39 +347,12 @@ class MultiplexerSessionBackend:
         if candidate.capabilities.name != provider:
             raise ProtocolError(400, "invalid_request", "Unknown provider")
         command = resolve_launch_command(provider, approval_mode="normal")
-        worktree = data.get("worktree")
-        branch = ""
         worktree_path = directory
-        if worktree:
-            eligibility = await asyncio.to_thread(check_worktree_eligibility, directory)
-            if not eligibility.eligible or eligibility.repo_path is None:
-                raise ProtocolError(
-                    400, "invalid_request", "Directory is not eligible for a worktree"
-                )
-            branch = data.get("branch") or await asyncio.to_thread(
-                suggest_branch_name, data.get("title"), eligibility.repo_path
-            )
-            if not isinstance(branch, str) or not await asyncio.to_thread(
-                validate_branch_name, branch
-            ):
-                raise ProtocolError(400, "invalid_request", "Invalid worktree branch")
-            worktree_path = worktree_path_for(
-                eligibility.repo_path, slug_for_path(branch)
-            )
-            if self.mux.capabilities.native_worktrees:
-                ok, _, _, target_id = await self.mux.create_worktree_window(
-                    str(eligibility.repo_path),
-                    str(worktree_path),
-                    branch,
-                    launch_command=command,
-                )
-                return await self._created_target(ok, target_id)
-            try:
-                await asyncio.to_thread(
-                    create_worktree, eligibility.repo_path, branch, worktree_path
-                )
-            except WorktreeError as exc:
-                raise ProtocolError(400, "invalid_request", str(exc)) from exc
+        if data.get("worktree"):
+            created = await self._create_worktree(directory, data, command)
+            if isinstance(created, Target):
+                return created
+            worktree_path = created
         if self.mux.capabilities.native_topic_targets:
             created = await self.mux.create_topic_target(
                 str(worktree_path),
@@ -360,6 +366,44 @@ class MultiplexerSessionBackend:
             workspace_id=data.get("workspaceId"),
         )
         return await self._created_target(ok, target_id)
+
+    async def _create_worktree(
+        self, directory: Path, data: dict[str, Any], command: str
+    ) -> Path | Target:
+        if self.mux.capabilities.native_worktrees and data.get("workspaceId"):
+            raise ProtocolError(
+                422,
+                "unsupported_action",
+                "Native worktrees cannot select an existing workspace",
+            )
+        eligibility = await asyncio.to_thread(check_worktree_eligibility, directory)
+        if not eligibility.eligible or eligibility.repo_path is None:
+            raise ProtocolError(
+                400, "invalid_request", "Directory is not eligible for a worktree"
+            )
+        branch = data.get("branch") or await asyncio.to_thread(
+            suggest_branch_name, data.get("title"), eligibility.repo_path
+        )
+        if not isinstance(branch, str) or not await asyncio.to_thread(
+            validate_branch_name, branch
+        ):
+            raise ProtocolError(400, "invalid_request", "Invalid worktree branch")
+        worktree_path = worktree_path_for(eligibility.repo_path, slug_for_path(branch))
+        if self.mux.capabilities.native_worktrees:
+            ok, _, _, target_id = await self.mux.create_worktree_window(
+                str(eligibility.repo_path),
+                str(worktree_path),
+                branch,
+                launch_command=command,
+            )
+            return await self._created_target(ok, target_id)
+        try:
+            await asyncio.to_thread(
+                create_worktree, eligibility.repo_path, branch, worktree_path
+            )
+        except WorktreeError as exc:
+            raise ProtocolError(400, "invalid_request", str(exc)) from exc
+        return worktree_path
 
     async def _created_target(self, ok: bool, target_id: str) -> Target:
         if not ok or not target_id:

@@ -112,6 +112,9 @@ that ID and body. Reusing an ID for a different body or session is an error.
 A known action ID returns its original result even when its session is now gone.
 Binding checks include the foreground process and active pane. Input stays pinned
 to that pane. A focus change cannot redirect the remaining keys to a sibling.
+agterm supplies foreground arguments without a PID. Those arguments participate
+in its binding. A restart with identical arguments in the same pane cannot be
+distinguished through that backend. Unknown foreground observations expose no actions.
 A process can still exit between verification and input. The multiplexer has no
 atomic compare-and-send operation.
 
@@ -119,11 +122,16 @@ atomic compare-and-send operation.
 that the prompt is gone before sending text. `terminal.paste` sends literal text
 without Enter. Use `terminal.key` with `Enter` to submit terminal input.
 
-Session resume is offered only for a verified shell with a tracked previous agent
-conversation. The conversation ID must name that previous conversation. A running
-agent must first return to its shell. Session creation is a separate HTTP operation
+Session resume requires a bare shell, an idle ccgram prompt marker, and a tracked
+previous agent conversation. It excludes scripts, commands, and shells waiting for
+input. Unmarked shells use terminal controls. The server checks the shell and marker
+again before injecting the launch command. The conversation ID must name that
+previous conversation. A running agent must first return to its shell.
+Session creation is a separate HTTP operation
 and has no action ID: do not automatically retry an ambiguous creation failure.
 Check the session list and terminal first.
+Native worktree creation cannot select an existing workspace. Combining `worktree`
+with `workspaceId` on that backend returns `422` before creating anything.
 
 ## Requests
 
@@ -131,6 +139,9 @@ A `screen` request has no structured response controls. Show the terminal and ke
 bar. A `hook` request can expose supported once-only options after its tool input
 digest matches the transcript and its prompt matches the screen. The executor reads
 the screen again before answering and verifies that the prompt closed afterward.
+Hook evidence belongs to one prompt fingerprint and binding. A changed prompt needs
+fresh evidence. Permission commands and question labels must match exactly.
+Ambiguous or decorated choices use terminal controls.
 
 The current responder supports numbered single-choice menus, including a single
 `AskUserQuestion` question whose choices match the observed menu. Its

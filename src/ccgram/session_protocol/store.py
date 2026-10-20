@@ -1,4 +1,6 @@
-"""Small durable state, never transcript content.
+"""Durable metadata without a transcript database.
+
+Persisted action errors can include snapshots containing request tool input.
 
 SQLite FULL commits reserve action IDs before I/O. An unfinished reservation is
 permanently unknown: replay must never turn a crash into a second key sequence.
@@ -6,6 +8,7 @@ permanently unknown: replay must never turn a crash into a second key sequence.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import os
@@ -278,42 +281,19 @@ class ProtocolStore:
             )
         return row[0], True
 
-    def transcript_generation(self, key: str, path: Path) -> int:
+    async def transcript_generation(self, key: str, path: Path) -> int:
         row = self.db.execute(
             "SELECT inode, size, prefix_size, prefix_hash, generation FROM transcripts WHERE key=?",
             (key,),
         ).fetchone()
-        with path.open("rb") as source:
-            stat = os.fstat(source.fileno())
-            prefix = source.read(4096)
-        generation = row[4] if row else 0
-        if row and (
-            row[0] != stat.st_ino
-            or stat.st_size < row[1]
-            or _digest(prefix[: row[2]].hex()) != row[3]
-        ):
-            generation += 1
-        if row and tuple(row) == (
-            stat.st_ino,
-            stat.st_size,
-            len(prefix),
-            _digest(prefix.hex()),
-            generation,
-        ):
-            return generation
-        with self.db:
-            self.db.execute(
-                "INSERT OR REPLACE INTO transcripts VALUES (?, ?, ?, ?, ?, ?)",
-                (
-                    key,
-                    stat.st_ino,
-                    stat.st_size,
-                    len(prefix),
-                    _digest(prefix.hex()),
-                    generation,
-                ),
-            )
-        return generation
+        record = await asyncio.to_thread(_transcript_record, path, row)
+        if row != record:
+            with self.db:
+                self.db.execute(
+                    "INSERT OR REPLACE INTO transcripts VALUES (?, ?, ?, ?, ?, ?)",
+                    (key, *record),
+                )
+        return record[4]
 
     def retarget(self, previous: str, current: str) -> None:
         """Apply a recovery mapping already attested by the existing resolver."""
@@ -326,3 +306,34 @@ class ProtocolStore:
                     "UPDATE sessions SET target=? WHERE target=?",
                     (current.casefold(), previous.casefold()),
                 )
+
+
+def _transcript_record(
+    path: Path, row: tuple[int, int, int, str, int] | None
+) -> tuple[int, int, int, str, int]:
+    with path.open("rb") as source:
+        stat = os.fstat(source.fileno())
+        # Verify the entire previously observed prefix: truncation and
+        # regrowth between polls can preserve both the inode and first page.
+        previous = hashlib.sha256()
+        current = hashlib.sha256()
+        remaining = row[2] if row else 0
+        size = 0
+        while block := source.read(65536):
+            current.update(block)
+            size += len(block)
+            if remaining:
+                previous.update(block[:remaining])
+                remaining = max(0, remaining - len(block))
+    generation = row[4] if row else 0
+    if row and (
+        row[0] != stat.st_ino or size < row[1] or previous.hexdigest() != row[3]
+    ):
+        generation += 1
+    return (
+        stat.st_ino,
+        size,
+        size,
+        current.hexdigest(),
+        generation,
+    )

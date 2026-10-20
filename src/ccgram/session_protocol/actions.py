@@ -196,7 +196,7 @@ class ActionExecutor:
             raise ProtocolError(
                 409, "binding_conflict", "Session binding changed", snapshot
             )
-        if target.process_id <= 0:
+        if not target.foreground_verified:
             raise ProtocolError(
                 503,
                 "backend_unavailable",

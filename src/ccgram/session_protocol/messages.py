@@ -160,7 +160,7 @@ def _codex(entry: SourceEntry) -> _Record | None:
     if not isinstance(kind, str):
         return None
     timestamp = raw.get("timestamp")
-    if kind == "message":
+    if kind == "message" and data.get("role") in {"user", "assistant", "system"}:
         parts, results = _content(data.get("content"))
         role = (
             "agent"
@@ -198,6 +198,25 @@ def _codex(entry: SourceEntry) -> _Record | None:
     return None
 
 
+def _gemini_output(call: dict[str, Any]) -> Any:
+    output = call.get("resultDisplay") or call.get("result")
+    if not isinstance(output, list):
+        return output
+    responses = []
+    for item in output:
+        response = item.get("functionResponse") if isinstance(item, dict) else None
+        response = response.get("response") if isinstance(response, dict) else None
+        if isinstance(response, dict):
+            value = next(
+                (response[k] for k in ("output", "error", "result") if response.get(k)),
+                "",
+            )
+            responses.append(_text(value))
+        elif isinstance(item, dict) and item.get("text"):
+            responses.append(str(item["text"]))
+    return "\n".join(responses)
+
+
 def _gemini(entry: SourceEntry) -> _Record | None:
     data = entry.data
     kind = data.get("type")
@@ -228,7 +247,7 @@ def _gemini(entry: SourceEntry) -> _Record | None:
                 call.get("args", {}),
             )
         )
-        output = call.get("resultDisplay") or call.get("result")
+        output = _gemini_output(call)
         if output is not None:
             results.append((call_id, output, call.get("status") == "error"))
     return _Record(

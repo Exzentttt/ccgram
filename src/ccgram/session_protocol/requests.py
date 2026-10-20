@@ -18,10 +18,6 @@ _MIN_MENU_OPTIONS = 2
 _NUMBERED = re.compile(r"^\s*[❯>●]?\s*([1-8])[.)]\s+(.+?)\s*$")
 
 
-def _compact(text: str) -> str:
-    return "".join(text.split())
-
-
 def _choices(text: str) -> tuple[tuple[str, str], ...]:
     choices = []
     for line in text.splitlines():
@@ -51,20 +47,19 @@ class OpenRequest:
     fingerprint: str
     option_keys: dict[str, str]
     answer_keys: dict[str, str]
+    hook: PendingHook | None = None
 
 
 def _question_label(hook: PendingHook, label: str) -> str | None:
     question = hook.tool_input["questions"][0]
-    return next(
-        (
-            o["label"]
-            for o in question.get("options", [])
-            if isinstance(o, dict)
-            and isinstance(o.get("label"), str)
-            and label.startswith(o["label"])
-        ),
-        None,
-    )
+    labels = [
+        o["label"]
+        for o in question.get("options", [])
+        if isinstance(o, dict) and isinstance(o.get("label"), str)
+    ]
+    if len(labels) != len(set(labels)):
+        return None
+    return label if label in labels else None
 
 
 def _response_options(
@@ -91,6 +86,8 @@ def _response_options(
             if hook.kind == "question":
                 matched = _question_label(hook, label)
                 if matched:
+                    if matched in answers:
+                        return [], {}, {}, None
                     answers[matched] = key
                     options.append(RequestOption(key, label, "allow_once"))
                     keys[key] = key
@@ -110,6 +107,7 @@ class RequestStore:
         self.hub = hub
         self._open: dict[str, OpenRequest] = {}
         self._hooks: dict[str, PendingHook] = {}
+        self._hook_prompts: dict[str, tuple[PendingHook, str, int]] = {}
 
     def get(self, session_id: str) -> OpenRequest | None:
         return self._open.get(session_id)
@@ -122,6 +120,9 @@ class RequestStore:
             raise ValueError(f"Unknown request close reason: {reason}")
         current = self._open.pop(session_id, None)
         self._hooks.pop(session_id, None)
+        bound = self._hook_prompts.get(session_id)
+        if bound:
+            self._hook_prompts[session_id] = (bound[0], "", 0)
         if current:
             self.hub.publish(
                 "request.closed",
@@ -138,12 +139,17 @@ class RequestStore:
                 self.close(session_id, "vanished")
             return None
         hook = self._hooks.get(session_id)
-        structured = self._match(hook, conversation_id, prompt)
+        bound = self._hook_prompts.get(session_id)
+        if bound and bound[0] == hook and bound[1:] != (prompt.fingerprint, version):
+            hook = None
+        structured = (
+            hook is not None and bound == (hook, prompt.fingerprint, version)
+        ) or self._match(hook, conversation_id, prompt)
         if (
             current
             and current.binding_version == version
             and current.fingerprint == prompt.fingerprint
-            and (current.request.source == "hook" or not structured)
+            and current.hook == (hook if structured else None)
         ):
             return current
         if current:
@@ -174,7 +180,16 @@ class RequestStore:
             response_schema,
             utc_now(),
         )
-        opened = OpenRequest(request, version, prompt.fingerprint, keys, answers)
+        if structured and hook:
+            self._hook_prompts[session_id] = (hook, prompt.fingerprint, version)
+        opened = OpenRequest(
+            request,
+            version,
+            prompt.fingerprint,
+            keys,
+            answers,
+            hook if structured else None,
+        )
         self._open[session_id] = opened
         self.hub.publish("request.opened", session_id, request)
         return opened
@@ -195,7 +210,21 @@ class RequestStore:
             return (
                 isinstance(question, dict)
                 and bool(question.get("question"))
-                and _compact(str(question["question"])) in _compact(prompt.text)
+                and question.get("multiSelect", False) is False
+                and not any(
+                    marker in prompt.text.casefold()
+                    for marker in (
+                        "select all",
+                        "multi-select",
+                        "multiselect",
+                        "[ ]",
+                        "[x]",
+                        "☐",
+                        "☑",
+                    )
+                )
+                and str(question["question"]).strip()
+                in {line.strip() for line in prompt.text.splitlines()}
             )
         value = next(
             (
@@ -205,6 +234,11 @@ class RequestStore:
             ),
             None,
         )
-        return bool(
-            value and _compact(value) in _compact(prompt.text) and _choices(prompt.text)
+        lines = {line.strip() for line in prompt.text.splitlines()}
+        lines.update(
+            line.removeprefix(hook.tool_name + ":").strip() for line in tuple(lines)
         )
+        lines.update(
+            line.removeprefix(hook.tool_name + " ").strip() for line in tuple(lines)
+        )
+        return bool(value and value.strip() in lines and _choices(prompt.text))

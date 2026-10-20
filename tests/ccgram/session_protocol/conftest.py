@@ -27,6 +27,7 @@ class FakeBackend:
             "normal",
             Status("idle", "", "native", "2026-10-20T10:00:00Z"),
             host="test-host",
+            foreground_argv=("claude",),
         )
         self.current_prompt: Prompt | None = None
         self.sent: list[tuple[str, str, bool]] = []

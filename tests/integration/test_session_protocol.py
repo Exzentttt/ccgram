@@ -51,7 +51,7 @@ while True:
     if char in "\r\n":
         if text == "quit":
             termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, original)
-            os.execv("/bin/sh", ["sh"])
+            os.execve("/bin/sh", ["sh"], {**os.environ, "PS1": "⌘0⌘"})
         if text == "ask":
             entry({"uuid":"call-entry", "type":"assistant", "message":{"content":[{"type":"tool_use","id":"call","name":"Bash","input":{"command":"uv run pytest"}}]}})
             waiting = True
@@ -91,6 +91,7 @@ async def post_action(client, service, session_id, kind, data):
 
 @pytest.fixture
 async def terminal_api(tmp_path, monkeypatch):
+    monkeypatch.setattr("ccgram.config.config.prompt_mode", "wrap")
     script = tmp_path / "claude"
     script.write_text(_TUI, encoding="utf-8")
     transcript = tmp_path / "conversation.jsonl"

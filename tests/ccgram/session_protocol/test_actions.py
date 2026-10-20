@@ -54,7 +54,7 @@ async def test_timeout_or_partial_send_is_unknown_and_never_retried(service, bac
 
 
 async def test_unverified_foreground_never_receives_keys(service, backend):
-    backend.target = replace(backend.target, process_id=0)
+    backend.target = replace(backend.target, process_id=0, foreground_argv=())
     session = (await service.list_sessions())[0]
     result, status = await service.execute(session.id, action())
     assert result.outcome == "rejected" and status == 503
