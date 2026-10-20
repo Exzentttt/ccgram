@@ -31,8 +31,9 @@ def test_hook_cannot_return_after_an_intervening_prompt(monkeypatch):
 
 
 @pytest.mark.parametrize("replacement", ["different", "closed", "same_screen"])
+@pytest.mark.parametrize("reconciled", [False, True])
 async def test_response_rejects_replacement_during_pending_capture(
-    service, backend, replacement
+    service, backend, replacement, reconciled
 ):
     session = (await service.list_sessions())[0]
     first_prompt = Prompt("first command\n1. Yes\n2. No", "permission")
@@ -84,7 +85,8 @@ async def test_response_rejects_replacement_during_pending_capture(
             time.time(),
         ),
     )
-    await service.refresh()
+    if reconciled:
+        await service.refresh()
     release.set()
     result, status = await pending
     assert status == 409 and result.outcome == "rejected"
@@ -114,18 +116,23 @@ async def test_raw_pinned_shell_launch_bypasses_stale_vim_state(monkeypatch):
         reset_vim_state()
 
 
-@pytest.mark.parametrize("kind", ["request.respond", "message.send"])
+@pytest.mark.parametrize(
+    "kind,structured",
+    [("request.respond", True), ("message.send", True), ("message.send", False)],
+)
+@pytest.mark.parametrize("reconciled", [False, True])
 async def test_completion_preserves_a_request_opened_during_confirmation(
-    service, backend, kind
+    service, backend, kind, structured, reconciled
 ):
     session = (await service.list_sessions())[0]
     backend.current_prompt = Prompt("first command\n1. Yes\n2. No", "permission")
-    service.requests.observe_hook(
-        session.id,
-        PendingHook(
-            "conv", "permission", "Bash", {"command": "first command"}, time.time()
-        ),
-    )
+    if structured:
+        service.requests.observe_hook(
+            session.id,
+            PendingHook(
+                "conv", "permission", "Bash", {"command": "first command"}, time.time()
+            ),
+        )
     snapshot = await service.get_session(session.id)
     data = (
         {"requestId": snapshot.open_requests[0].id, "optionId": "1"}
@@ -159,15 +166,44 @@ async def test_completion_preserves_a_request_opened_during_confirmation(
             "conv", "permission", "Bash", {"command": "second command"}, time.time()
         ),
     )
+    if reconciled:
+        await service.refresh()
+    release.set()
+    result, _ = await pending
     await service.refresh()
     second = service.requests.get(session.id)
     assert second is not None and second.request.id != snapshot.open_requests[0].id
-    release.set()
-    result, _ = await pending
-    assert service.requests.get(session.id) is second
+    assert second.request.source == "hook"
+    assert second.request.tool is not None
+    assert second.request.tool["input"] == {"command": "second command"}
     if kind == "request.respond":
         assert result.outcome == "sent"
         assert backend.sent == [("text", "1", False)]
     else:
         assert result.outcome == "unknown"
         assert backend.sent == [("key", "Escape", False)]
+
+
+async def test_screen_dismissal_with_unchanged_unmatched_hook_forwards_text(
+    service, backend
+):
+    session = (await service.list_sessions())[0]
+    backend.current_prompt = Prompt("unrecognized menu\n1. Yes\n2. No", "permission")
+    service.requests.observe_hook(
+        session.id,
+        PendingHook(
+            "conv", "permission", "Bash", {"command": "git status"}, time.time()
+        ),
+    )
+    snapshot = await service.get_session(session.id)
+    assert snapshot.open_requests[0].source == "screen"
+    backend.clear_on_input = True
+    intent = Action(
+        str(uuid4()),
+        snapshot.binding_version,
+        "message.send",
+        {"text": "continue", "dismissRequest": True},
+    )
+    result, status = await service.execute(session.id, intent)
+    assert status == 200 and result.outcome == "sent"
+    assert backend.sent == [("key", "Escape", False), ("text", "continue", True)]

@@ -48,6 +48,8 @@ class OpenRequest:
     option_keys: dict[str, str]
     answer_keys: dict[str, str]
     hook: PendingHook | None = None
+    # Unmatched evidence also invalidates an in-flight dismissal when replaced.
+    observed_hook: PendingHook | None = None
 
 
 def _question_label(hook: PendingHook, label: str) -> str | None:
@@ -112,6 +114,11 @@ class RequestStore:
     def get(self, session_id: str) -> OpenRequest | None:
         return self._open.get(session_id)
 
+    def is_current(self, session_id: str, request: OpenRequest) -> bool:
+        return self.get(session_id) is request and (
+            self._hooks.get(session_id) == request.observed_hook
+        )
+
     def observe_hook(self, session_id: str, hook: PendingHook) -> None:
         self._hooks[session_id] = hook
 
@@ -151,6 +158,7 @@ class RequestStore:
             and current.binding_version == version
             and current.fingerprint == prompt.fingerprint
             and current.hook == (hook if structured else None)
+            and current.observed_hook == self._hooks.get(session_id)
         ):
             return current
         if current:
@@ -190,6 +198,7 @@ class RequestStore:
             keys,
             answers,
             hook if structured else None,
+            self._hooks.get(session_id),
         )
         self._open[session_id] = opened
         self.hub.publish("request.opened", session_id, request)

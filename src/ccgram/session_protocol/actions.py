@@ -261,7 +261,7 @@ class ActionExecutor:
                 422, "unsupported_action", "Use the terminal for this response"
             )
         prompt = await self.service.backend.prompt(target)
-        if self.service.requests.get(session_id) is not current:
+        if not self.service.requests.is_current(session_id, current):
             raise ProtocolError(
                 409, "request_closed", "Request changed during validation"
             )
@@ -310,7 +310,9 @@ class ActionExecutor:
             if not await self._prompt_gone(target):
                 return False
             current = self.service.requests.get(session_id)
-            if current is not None and current is not request:
+            if current is not None and not self.service.requests.is_current(
+                session_id, request
+            ):
                 raise ProtocolError(
                     409, "request_open", "A new request opened during dismissal"
                 )
@@ -323,7 +325,11 @@ class ActionExecutor:
 
     async def _respond(self, session_id: str, target: Target, action: Action) -> bool:
         current = self.service.requests.get(session_id)
-        if current is None or current.request.id != action.data["requestId"]:
+        if (
+            current is None
+            or current.request.id != action.data["requestId"]
+            or not self.service.requests.is_current(session_id, current)
+        ):
             raise ProtocolError(
                 409, "request_closed", "Request changed before dispatch"
             )
@@ -336,7 +342,7 @@ class ActionExecutor:
             return False
         if not await self._prompt_gone(target):
             return False
-        if self.service.requests.get(session_id) is current:
+        if self.service.requests.is_current(session_id, current):
             self.service.requests.close(session_id, "answered")
         return True
 

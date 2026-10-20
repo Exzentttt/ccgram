@@ -141,7 +141,9 @@ bar. A `hook` request can expose supported once-only options after its tool inpu
 digest matches the transcript and its prompt matches the screen. The executor reads
 the screen again before answering and verifies that the prompt closed afterward.
 If another observation replaces or closes the request during that screen read,
-the server rejects the response before sending input.
+the server rejects the response before sending input. New hook evidence invalidates
+the old response immediately, even before the next screen refresh creates a new
+request. Finishing an earlier response or dismissal preserves that new evidence.
 Hook evidence belongs to one prompt fingerprint and binding. A changed prompt needs
 fresh evidence. Permission commands and question labels must match exactly.
 Ambiguous or decorated choices use terminal controls.
