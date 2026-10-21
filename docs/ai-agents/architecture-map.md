@@ -8,15 +8,16 @@ Inbound user message (Telegram → multiplexer):
 
 1. PTB dispatcher routes through handlers wired in `handlers/registry.py`.
 2. `handlers/text/text_handler.py` validates context and resolves topic binding.
-3. `session.py` maps `(user_id, thread_id)` → `window_id`.
-4. The multiplexer proxy sends keys to the mapped target. For Herdr, `multiplexer/herdr.py` reads `agent.list` immediately before dispatch, requires one matching opaque `herdr-session-v1-…` target, and uses that record's locator only for that action.
+3. `thread_router.py` resolves the user's chat/topic binding to a native target ID.
+4. `session_protocol/telegram.py:TelegramSessionAdapter` sends the action through the shared `ActionExecutor`, which owns durable action reservation, binding/prompt checks, and the per-target input lock.
+5. `MultiplexerSessionBackend` uses the multiplexer seam. For Herdr, `multiplexer/herdr.py` reads `agent.list` immediately before dispatch, requires one matching opaque `herdr-session-v1-…` target, and uses that record's locator only for that action.
 
 Shell provider (NL → command → shell):
 
 1. `handlers/text/text_handler.py` detects shell-provider window, routes to `handlers/shell/shell_commands.py`.
 2. `shell_commands.py` calls `llm/` to generate a suggested command.
 3. Approval keyboard rendered; user confirms or cancels.
-4. On approval, command sent via `tmux_manager.py`.
+4. On approval, the Telegram adapter submits the command through the shared executor. Paste and submission hold one target lock. Prompt setup also holds that lock for its full sequence.
 5. `handlers/shell/shell_capture.py` polls pane output and relays via in-place edits.
 
 Voice message (voice → transcription → agent):
@@ -25,15 +26,22 @@ Voice message (voice → transcription → agent):
 2. Confirm/discard keyboard shown.
 3. On confirm, `handlers/voice/voice_callbacks.py` checks provider:
    - Shell: routes transcribed text through `handlers/shell/shell_commands.py` (LLM → approval).
-   - Other: sends directly to the tmux window.
+   - Other: calls `send_telegram_to_window` with the Telegram adapter, using the shared executor and backend.
+
+Mobile client (HTTP/WebSocket → shared core):
+
+1. `api/server.py` validates Host/Origin, device credentials, and request schemas.
+2. Queries and actions use the same session service and executor as Telegram.
+3. WebSocket clients receive snapshots, canonical messages, requests, and bounded replay through the shared event hub.
+4. `bootstrap.py` starts the core even when the optional HTTP listener is disabled. See [protocol implementation](../protocol/implementation.md) for module boundaries and [operations](../protocol/operations.md) for the backend-wide process lock.
 
 Outbound agent output (provider transcript/event → Telegram):
 
 1. `session_monitor.py` gets a fresh live-window listing and converges any uniquely attested identity aliases before reading hooks or loading the session-map delta.
-2. It dispatches hook events only after convergence, then parses the reconciled session map and transcript updates while creating dependency-light receipts from `delivery_contract.py`.
-3. The shared session core normalizes transcripts in `session_protocol/messages.py`; providers and `terminal_parser.py` detect terminal status.
+2. It dispatches hook events only after convergence, then reads the reconciled session map and transcript updates through `transcript_reader.py`, retaining dependency-light receipts from `delivery_contract.py`.
+3. `session_protocol/messages.py` normalizes provider records once. The shared event hub delivers canonical batches to the Telegram consumer, and `bootstrap.py` renders them through `render_transcript_batch`. Providers and `terminal_parser.py` detect terminal status.
 4. `handlers/messaging_pipeline/message_queue.py` enforces ordering, merge rules, rate limits and settles the shared receipt contract. Worker takes a `TelegramClient`.
-5. `handlers/messaging_pipeline/message_sender.py` delivers via the Protocol.
+5. `handlers/messaging_pipeline/message_sender.py` delivers via `TelegramClient`. Only settled receipts advance Telegram's durable transcript checkpoint.
 
 Screenshots (`/screenshot`, 📷 status-bar button):
 

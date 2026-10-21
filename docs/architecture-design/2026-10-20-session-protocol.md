@@ -2,7 +2,7 @@
 
 | Field     | Value                                                                                |
 | --------- | ------------------------------------------------------------------------------------ |
-| Status    | Proposed                                                                             |
+| Status    | Shared core and `ccgram/1` implemented; later client and runtime phases remain planned |
 | Date      | 2026-10-20                                                                           |
 | Related   | [iOS app design](2026-10-20-ios-app.md)                                              |
 | Scope     | Core changes in ccgram, and the wire protocol `ccgram/1` for remote clients          |
@@ -11,8 +11,11 @@
 **Reading guide.** This document uses stable IDs. Requirements are `CORE-Rnn` and
 `PROTO-Rnn`. Decisions are `D-nn`. Core changes are `C-nn`. Phases are `P0` to `P4`.
 Plans, reviews, and agents must cite these IDs. The [iOS app design](2026-10-20-ios-app.md)
-refers to this document for all protocol types. This document is the only source for
-the protocol.
+uses these IDs for design requirements. The current wire contract is
+[`protocol/v1/`](../../protocol/v1/README.md), with client behavior in the
+[protocol client guide](../protocol/client-guide.md). This document records the
+design baseline and planned phases. Where it differs from the implementation,
+the schemas and [implementation guide](../protocol/implementation.md) take precedence.
 
 **Style.** The text uses ASD-STE100 rules (strict mode, without a check against the official dictionary). The
 words "must", "can", and "will" have their usual meaning. The text uses no other modal verbs.
@@ -42,6 +45,9 @@ outside this implementation.
 15. [Prior art](#15-prior-art)
 
 ## 1. Summary
+
+This section describes the proposal's starting point. The shared core and full
+Telegram cutover are implemented. The native iOS app remains planned.
 
 ccgram controls AI coding agents that run in terminal sessions (tmux, Herdr, agterm).
 Today, Telegram is the only client. Telegram handlers own a part of the session logic.
@@ -863,6 +869,10 @@ Until P3, the Telegram adapter is the notification channel.
 - A change to the schema needs a change to the fixtures in the same commit.
 
 ## 13. Phases
+
+The table records the original rollout plan. The shared core and wire adapter
+are implemented, including Telegram's full cutover to the same core. P2–P4 remain
+planned. The original exit criteria below are not a release checklist.
 
 | Phase | Scope                                                                                     | Exit criteria                                                                                     |
 | ----- | ----------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------- |
