@@ -436,7 +436,9 @@ class SessionMonitor:
                     session_id=session_id,
                     barrier_age_seconds=round(now - intent.created_at, 1),
                 )
-                if not self.state.complete_skip(session_id):
+                if self.state.complete_skip(session_id):
+                    self._transcript_reader._tool_delivery_fences.pop(session_id, None)
+                else:
                     self.state.cancel_skip(session_id)
             self._discard_session_delivery_state(session_id)
         # One batched write for any stamps and retirements this pass made.
@@ -485,6 +487,8 @@ class SessionMonitor:
                 self._clear_skip_retry(session_id)
                 continue
             if self.state.complete_skip(session_id):
+                # The skip retires the result receipts this fence was waiting for.
+                self._transcript_reader._tool_delivery_fences.pop(session_id, None)
                 self.state.save_if_dirty()
                 self._delivery_receipts.pop(session_id, None)
             else:
@@ -520,9 +524,9 @@ class SessionMonitor:
         delivery_contract.settled_prefix / settled_run_offset (including
         the shared-batch-checkpoint tie rule: persistence lags delivery by
         at most one in-flight batch); this coordinator groups receipts by
-        session, keeps the pending-tools and pending-skip fences, and persists
-        one batched commit per cycle. The settled run
-        is consumed even when the tie rule defers its commit: replay then
+        session, keeps the pending-tool, tool-delivery, and pending-skip
+        fences, and persists one batched commit per cycle. The settled run is
+        consumed even when the tie rule defers its commit: replay then
         re-delivers those messages, which at-least-once permits.
         """
         delivered_offsets: dict[str, int] = {}
@@ -535,6 +539,29 @@ class SessionMonitor:
                 or session_id in self._pending_tools
             ):
                 continue
+            tool_fence = self._transcript_reader._tool_delivery_fences.get(session_id)
+            if tool_fence is not None:
+                release_checkpoint = tool_fence.release_checkpoint
+                fenced_receipts = [
+                    receipt
+                    for receipt in receipts
+                    if receipt.checkpoint is not None
+                    and receipt.checkpoint >= tool_fence.call_checkpoint
+                    and (
+                        release_checkpoint is None
+                        or receipt.checkpoint <= release_checkpoint
+                    )
+                ]
+                if (
+                    release_checkpoint is None
+                    or not any(
+                        receipt.checkpoint == release_checkpoint
+                        for receipt in fenced_receipts
+                    )
+                    or not all(receipt.commit_ready for receipt in fenced_receipts)
+                ):
+                    continue
+                self._transcript_reader._tool_delivery_fences.pop(session_id, None)
             prefix = settled_prefix(receipts)
             if not prefix:
                 continue

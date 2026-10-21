@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import suppress
+from dataclasses import dataclass
 import hashlib
 import json
 from pathlib import Path
@@ -67,6 +68,12 @@ class _StableRead(NamedTuple):
 class _GenerationCheck(NamedTuple):
     changed: bool
     consumed_intact: bool
+
+
+@dataclass(slots=True)
+class _ToolDeliveryFence:
+    call_checkpoint: int
+    release_checkpoint: int | None = None
 
 
 _MARKER_BYTES = 128
@@ -346,6 +353,7 @@ class TranscriptReader:
         self._idle_tracker = idle_tracker
         self._on_session_retired = on_session_retired
         self._pending_tools: dict[str, dict[str, Any]] = {}
+        self._tool_delivery_fences: dict[str, _ToolDeliveryFence] = {}
         self._protocol_parser_states: dict[str, tuple[str, TranscriptParserState]] = {}
         self._pending_batches: list[TranscriptBatch] = []
         self._file_mtimes: dict[str, float] = {}
@@ -641,6 +649,7 @@ class TranscriptReader:
         self._state.remove_session(session_id)
         self._file_mtimes.pop(session_id, None)
         self._pending_tools.pop(session_id, None)
+        self._tool_delivery_fences.pop(session_id, None)
         self._protocol_parser_states.pop(session_id, None)
         self._pending_batches = [
             batch for batch in self._pending_batches if batch.session_id != session_id
@@ -700,6 +709,10 @@ class TranscriptReader:
                 )
             if old_session_id in self._pending_tools:
                 self._pending_tools[session_id] = self._pending_tools.pop(
+                    old_session_id
+                )
+            if old_session_id in self._tool_delivery_fences:
+                self._tool_delivery_fences[session_id] = self._tool_delivery_fences.pop(
                     old_session_id
                 )
             if old_session_id in self._protocol_parser_states:
@@ -886,6 +899,8 @@ class TranscriptReader:
             startup_boundary = None
         if generation_changed or reset_during_read:
             self._protocol_parser_states.pop(session_id, None)
+            self._pending_tools.pop(session_id, None)
+            self._tool_delivery_fences.pop(session_id, None)
 
         # Deliver pre-start unread history, but count activity only when a
         # complete entry advances beyond the startup file-size boundary.
@@ -945,6 +960,16 @@ class TranscriptReader:
             self._pending_tools[session_id] = dict(state.pending_tools)
         else:
             self._pending_tools.pop(session_id, None)
+        fence = self._tool_delivery_fences.get(session_id)
+        if state.pending_tools:
+            if fence is None:
+                self._tool_delivery_fences[session_id] = _ToolDeliveryFence(
+                    byte_checkpoint
+                )
+            else:
+                fence.release_checkpoint = None
+        elif fence is not None and fence.release_checkpoint is None and new_entries:
+            fence.release_checkpoint = byte_checkpoint
         batch = TranscriptBatch(
             session_id=session_id,
             provider_name=provider_name,
@@ -954,7 +979,7 @@ class TranscriptReader:
             tool_summaries=tuple(sorted(state.tool_summaries.items())),
             tool_diffs=tuple(sorted(state.tool_diffs.items())),
         )
-        if records:
+        if records or new_entries:
             self._pending_batches.append(batch)
         new_messages.extend(render_transcript_batch(batch))
 

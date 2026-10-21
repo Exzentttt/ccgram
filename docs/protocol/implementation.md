@@ -63,13 +63,19 @@ Telegram delivery uses a separate byte cursor because its receipt checkpoint mus
 survive queue failures and restart. This is a delivery policy, not another provider
 parser. The shared event hub dispatches normalized delivery batches to durable
 in-process consumers. Telegram renders them under delivery receipts. Only settled
-receipts advance its checkpoint, with unresolved-tool and skip fences preserved.
+receipts advance its checkpoint. Consumed input with no visible records still
+produces a checkpoint-only batch. A tool-call fence stays in place until delivery
+through its result checkpoint settles. Later unrelated output does not hold that
+fence. A completed backlog skip retires tool fences for discarded receipts.
+Skip fences retain their source boundary.
 Mobile replay subscriptions keep their bounded queues and never hold Telegram's
 checkpoint. Telegram does not replay the mobile history ring at startup.
 
 All Telegram input goes through the shared executor/backend. Handlers retain
 ownership checks and presentation, then call the in-process adapter. The executor
 owns reservation, binding checks, prompt checks, and the per-target input lock.
+A handler that authorizes shell input against a resolved snapshot passes that
+binding version through the adapter. A changed foreground or pane rejects input.
 Shell submission is one atomic paste-and-submit operation. Explicit sibling-pane
 controls retain pane ownership checks. The multiplexer does not expose a sibling
 foreground PID. Those controls therefore do not claim the active pane's PID guarantee.

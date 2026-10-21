@@ -509,12 +509,19 @@ def test_codex_identical_response_text_in_a_separate_turn_is_kept():
         SourceEntry(
             20,
             {
+                "type": "event_msg",
+                "payload": {"type": "task_complete", "last_agent_message": "same"},
+            },
+        ),
+        SourceEntry(
+            30,
+            {
                 "type": "response_item",
                 "payload": {"type": "message", "role": "user", "content": []},
             },
         ),
         SourceEntry(
-            30,
+            40,
             {
                 "type": "response_item",
                 "payload": {

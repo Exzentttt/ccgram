@@ -249,7 +249,7 @@ async def _send_verified_shell_input(
     )
 
     try:
-        target, _ = await adapter.resolve(window_id)
+        target, snapshot = await adapter.resolve(window_id)
     except ProtocolError as exc:
         return False, exc.message
     if target.provider != "shell" or not target.foreground_verified:
@@ -265,6 +265,7 @@ async def _send_verified_shell_input(
             text,
             submit=True,
             terminal_input=True,
+            expected_binding_version=snapshot.binding_version,
         )
         return success, message
     except ProtocolError as exc:

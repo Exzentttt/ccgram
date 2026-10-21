@@ -64,11 +64,19 @@ class TelegramSessionAdapter:
         action_id: str | None = None,
         pane_id: str | None = None,
         expected_prompt: str | None = None,
+        expected_binding_version: int | None = None,
         internal: bool = False,
     ) -> tuple[bool, str]:
         try:
             _, snapshot = await self.service.for_target(window_id)
-            action = Action(_action_id(action_id), snapshot.binding_version, kind, data)
+            action = Action(
+                _action_id(action_id),
+                snapshot.binding_version
+                if expected_binding_version is None
+                else expected_binding_version,
+                kind,
+                data,
+            )
             if internal:
                 result, _ = await self.service.execute_internal(
                     snapshot.id,
@@ -99,6 +107,7 @@ class TelegramSessionAdapter:
         terminal_input: bool = False,
         action_id: str | None = None,
         expected_prompt: str | None = None,
+        expected_binding_version: int | None = None,
     ) -> tuple[bool, str]:
         if terminal_input and submit:
             return await self._execute(
@@ -108,6 +117,7 @@ class TelegramSessionAdapter:
                 action_id=action_id,
                 pane_id=pane_id,
                 expected_prompt=expected_prompt,
+                expected_binding_version=expected_binding_version,
                 internal=True,
             )
         return await self._execute(
@@ -117,6 +127,7 @@ class TelegramSessionAdapter:
             action_id=action_id,
             pane_id=pane_id,
             expected_prompt=expected_prompt,
+            expected_binding_version=expected_binding_version,
         )
 
     async def send_followup(

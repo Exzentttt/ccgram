@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import contextlib
 from collections.abc import Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -18,6 +18,7 @@ from ccgram.handlers.topics.new_command import new_command
 from ccgram.handlers.user_state import PENDING_THREAD_ID, PENDING_THREAD_TEXT
 from ccgram.handlers.topics.window_callbacks import (
     _forward_pending_text,
+    _send_verified_shell_input,
     handle_window_callback,
 )
 from ccgram.session_protocol.backend import Target
@@ -518,9 +519,40 @@ class TestForwardPendingText:
                 adapter=adapter,
                 is_existing_window=False,
             )
-
         mock_shell.assert_awaited_once()
         args = mock_shell.call_args.args
         assert args[1:] == (1, 42, "@5", "list files")
         assert args[0] is bot
         assert mock_shell.call_args.kwargs["adapter"] is adapter
+
+
+@pytest.mark.parametrize(
+    "binding_change",
+    [
+        {"provider": "claude", "foreground_argv": ("claude",)},
+        {"process_id": 99},
+        {"pane_id": "%6"},
+    ],
+    ids=["provider", "process", "active-pane"],
+)
+async def test_verified_shell_input_rejects_binding_change_after_verification(
+    tmp_path: Path, binding_change: dict[str, object]
+) -> None:
+    adapter, backend, target, store = _protocol_adapter(tmp_path, "shell")
+
+    def inject_then_change_binding(*args):
+        backend.inspect = AsyncMock(return_value=replace(target, **binding_change))
+        return object()
+
+    with patch(
+        "ccgram.handlers.telegram_origin.remember_telegram_injection",
+        side_effect=inject_then_change_binding,
+    ):
+        success, message = await _send_verified_shell_input(
+            100, "@5", 42, "ls -la", -100999, adapter
+        )
+
+    assert not success
+    assert message == "Session binding changed"
+    backend.send_text.assert_not_awaited()
+    store.close()
