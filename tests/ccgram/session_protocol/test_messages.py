@@ -377,3 +377,248 @@ def test_codex_event_stream_and_task_complete_share_a_replaceable_message():
     assert messages[0].parts[0].text == "working and done"
     assert messages[0].complete is True
     assert messages[0].phase == "final_answer"
+
+
+@pytest.mark.parametrize(
+    ("entries", "expected_records"),
+    [
+        pytest.param(
+            [
+                {
+                    "type": "response_item",
+                    "payload": {
+                        "id": "response-1",
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "done"}],
+                    },
+                },
+                {
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "task_complete",
+                        "last_agent_message": "done",
+                    },
+                },
+            ],
+            2,
+            id="response-item-then-task-complete",
+        ),
+        pytest.param(
+            [
+                {
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "task_complete",
+                        "last_agent_message": "done",
+                    },
+                },
+                {
+                    "type": "response_item",
+                    "payload": {
+                        "id": "response-1",
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "done"}],
+                    },
+                },
+            ],
+            1,
+            id="task-complete-then-response-item",
+        ),
+        pytest.param(
+            [
+                {
+                    "type": "response_item",
+                    "payload": {
+                        "id": "response-1",
+                        "type": "message",
+                        "role": "assistant",
+                        "phase": "final_answer",
+                        "content": [{"type": "output_text", "text": "done"}],
+                    },
+                },
+                {
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "task_complete",
+                        "last_agent_message": "done",
+                    },
+                },
+            ],
+            1,
+            id="response-item-already-has-final-phase",
+        ),
+    ],
+)
+def test_codex_task_complete_mirror_preserves_final_answer_metadata(
+    entries, expected_records
+):
+    source_entries = [
+        SourceEntry(index * 100, entry) for index, entry in enumerate(entries)
+    ]
+    records, _ = parse_records(source_entries, "codex")
+    messages = build_messages(source_entries, "conv", "codex")
+
+    assert len(records) == expected_records
+    assert len(messages) == 1
+    assert messages[0].parts[0].text == "done"
+    assert messages[0].phase == "final_answer"
+
+
+def test_codex_task_complete_still_completes_streamed_message():
+    entries = [
+        SourceEntry(
+            10,
+            {
+                "type": "event_msg",
+                "payload": {"type": "agent_message", "message": "draft"},
+            },
+        ),
+        SourceEntry(
+            20,
+            {
+                "type": "event_msg",
+                "payload": {"type": "task_complete", "last_agent_message": "final"},
+            },
+        ),
+    ]
+
+    messages = build_messages(entries, "conv", "codex")
+
+    assert len(messages) == 1
+    assert messages[0].revision == 2
+    assert messages[0].parts[0].text == "final"
+    assert messages[0].complete is True
+
+
+def test_codex_identical_response_text_in_a_separate_turn_is_kept():
+    entries = [
+        SourceEntry(
+            10,
+            {
+                "type": "response_item",
+                "payload": {
+                    "id": "first",
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "same"}],
+                },
+            },
+        ),
+        SourceEntry(
+            20,
+            {
+                "type": "response_item",
+                "payload": {"type": "message", "role": "user", "content": []},
+            },
+        ),
+        SourceEntry(
+            30,
+            {
+                "type": "response_item",
+                "payload": {
+                    "id": "second",
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "same"}],
+                },
+            },
+        ),
+    ]
+
+    messages = build_messages(entries, "conv", "codex")
+
+    assert [(message.id, message.parts[0].text) for message in messages] == [
+        ("conv/first", "same"),
+        ("conv/second", "same"),
+    ]
+
+
+def test_codex_same_text_with_distinct_native_ids_in_one_turn_keeps_final_phase():
+    entries = [
+        SourceEntry(
+            10,
+            {
+                "type": "response_item",
+                "payload": {
+                    "id": "commentary-1",
+                    "type": "message",
+                    "role": "assistant",
+                    "phase": "commentary",
+                    "content": [{"type": "output_text", "text": "Done"}],
+                },
+            },
+        ),
+        SourceEntry(
+            20,
+            {
+                "type": "response_item",
+                "payload": {
+                    "id": "final-1",
+                    "type": "message",
+                    "role": "assistant",
+                    "phase": "final_answer",
+                    "content": [{"type": "output_text", "text": "Done"}],
+                },
+            },
+        ),
+    ]
+
+    messages = build_messages(entries, "conv", "codex")
+    live_records, _ = parse_records(entries, "codex", deduplicate_updates=True)
+
+    assert [
+        (message.id, message.parts[0].text, message.phase) for message in messages
+    ] == [
+        ("conv/commentary-1", "Done", "commentary"),
+        ("conv/final-1", "Done", "final_answer"),
+    ]
+    assert [record.key for _, record in live_records] == [
+        "commentary-1",
+        "final-1",
+    ]
+
+
+def test_codex_consumes_only_one_response_mirror_after_task_complete():
+    entries = [
+        SourceEntry(
+            0,
+            {
+                "type": "event_msg",
+                "payload": {"type": "task_complete", "last_agent_message": "Done"},
+            },
+        ),
+        SourceEntry(
+            10,
+            {
+                "type": "response_item",
+                "payload": {
+                    "id": "mirror",
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "Done"}],
+                },
+            },
+        ),
+        SourceEntry(
+            20,
+            {
+                "type": "response_item",
+                "payload": {
+                    "id": "next-message",
+                    "type": "message",
+                    "role": "assistant",
+                    "phase": "final_answer",
+                    "content": [{"type": "output_text", "text": "Done"}],
+                },
+            },
+        ),
+    ]
+
+    records, _ = parse_records(entries, "codex", deduplicate_updates=True)
+
+    assert [(record.key, record.phase) for _, record in records] == [
+        ("o0", "final_answer"),
+        ("next-message", "final_answer"),
+    ]

@@ -146,6 +146,36 @@ class TestCanonicalTranscriptParsing:
         assert [part.text for part in messages[0].parts] == ["before", None, "after"]
         assert messages[0].time == "2024-12-03T14:00:02.000Z"
 
+    @pytest.mark.parametrize(
+        ("content", "expected_texts"),
+        [
+            pytest.param([], ["Provider error"], id="empty-content"),
+            pytest.param(
+                [{"type": "text", "text": "partial output"}],
+                ["partial output", "Provider error"],
+                id="partial-content",
+            ),
+        ],
+    )
+    def test_assistant_error_is_preserved_with_empty_or_partial_content(
+        self, content: list[dict], expected_texts: list[str]
+    ) -> None:
+        entry = {
+            "type": "message",
+            "id": "error-message",
+            "message": {
+                "role": "assistant",
+                "content": content,
+                "stopReason": "error",
+                "errorMessage": "Provider error",
+            },
+        }
+
+        messages = build_messages([SourceEntry(0, entry)], "pi-test", "pi")
+
+        assert [part.text for part in messages[0].parts] == expected_texts
+        assert messages[0].parts[-1].level == "error"
+
 
 class TestDiscoverTranscript:
     def _write_session(self, path: Path, session_id: str, cwd: str) -> Path:

@@ -100,7 +100,7 @@ class TelegramSessionAdapter:
         action_id: str | None = None,
         expected_prompt: str | None = None,
     ) -> tuple[bool, str]:
-        if terminal_input:
+        if terminal_input and submit:
             return await self._execute(
                 window_id,
                 "terminal.submit",

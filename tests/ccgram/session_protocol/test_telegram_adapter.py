@@ -99,6 +99,23 @@ async def test_shell_text_requires_explicit_terminal_intent(service, backend):
     assert backend.sent == [("text", "printf '%s' '$HOME'", True)]
 
 
+async def test_numeric_terminal_choice_with_submit_false_is_paste_only(
+    service, backend
+):
+    adapter = adapter_for({"session_service": service})
+
+    success, message = await adapter.send_text(
+        backend.target.id,
+        "1",
+        terminal_input=True,
+        submit=False,
+        action_id="telegram-callback:numeric-choice",
+    )
+
+    assert success and message == "Sent"
+    assert backend.sent == [("text", "1", False)]
+
+
 async def test_normal_text_is_rejected_for_shell_without_terminal_intent(
     service, backend
 ):

@@ -562,10 +562,12 @@ async def _create_resume_window(  # noqa: C901, PLR0912, PLR0915
         if context is None:
             _mark_provisioning_uncertain(claim_id)
             return False, "Session service is unavailable", "", ""
-        created = await adapter_for(context.bot_data).create(
-            {"provider": provider.capabilities.name, "directory": cwd},
-            approval_mode=approval_mode,
-            resume_id=session_id,
+        created, creation_was_cancelled = await _await_creation_result(
+            adapter_for(context.bot_data).create(
+                {"provider": provider.capabilities.name, "directory": cwd},
+                approval_mode=approval_mode,
+                resume_id=session_id,
+            )
         )
         creation = (
             True,

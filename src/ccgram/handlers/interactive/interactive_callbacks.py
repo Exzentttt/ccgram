@@ -262,7 +262,12 @@ async def handle_interactive_callback(
                 action_id=action_id,
                 expected_prompt=expected_prompt,
             )
-            if sent and refresh_ui:
+            if not sent:
+                await query.answer(
+                    message_text or "Unable to send key. Try again.", show_alert=True
+                )
+                return
+            if refresh_ui:
                 await asyncio.sleep(0.5)
                 await handle_interactive_ui(
                     client,
@@ -272,7 +277,7 @@ async def handle_interactive_callback(
                     pane_id=pane_id,
                     chat_id=chat_id,
                 )
-            elif sent and not refresh_ui:
+            else:
                 await clear_interactive_msg(user_id, client, thread_id, chat_id=chat_id)
             await query.answer(INTERACTIVE_KEY_LABELS.get(cb_prefix, message_text))
     except ProtocolError as exc:

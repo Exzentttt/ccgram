@@ -119,6 +119,8 @@ class TestHandleShellMessage:
     async def test_bang_prefix_sends_raw_command(self) -> None:
         bot = AsyncMock(spec=Bot)
         message = AsyncMock(spec=Message)
+        message.chat.id = -100
+        message.message_id = 4242
 
         with (
             patch(f"{_MOD}.enqueue_status_update", new_callable=AsyncMock),
@@ -144,7 +146,7 @@ class TestHandleShellMessage:
                 "ls -la",
                 submit=True,
                 terminal_input=True,
-                action_id=ANY,
+                action_id="telegram-message:-100:4242",
             )
             mock_mark.assert_called_once()
             args = mock_mark.call_args.args
@@ -1236,6 +1238,38 @@ class TestRunningReaction:
 
         mock_react.assert_not_awaited()
         mock_mark.assert_called_once_with("@0", "ls", 1, 42, 0)
+
+    async def test_no_message_commands_get_fresh_action_ids_per_event(self) -> None:
+        bot = AsyncMock(spec=Bot)
+        with (
+            patch(f"{_MOD}.enqueue_status_update", new_callable=AsyncMock),
+            patch(f"{_MOD}.lifecycle_strategy.clear_probe_failures"),
+            patch(f"{_MOD}._ensure_prompt_marker", new_callable=AsyncMock),
+            patch(f"{_MOD}._send_typing", new_callable=AsyncMock),
+            patch(f"{_MOD}._cancel_stuck_input", new_callable=AsyncMock),
+            patch.object(
+                _TEST_ADAPTER,
+                "send_text",
+                new_callable=AsyncMock,
+                return_value=(True, "Sent"),
+            ) as send_text,
+            patch("ccgram.handlers.shell.shell_capture.mark_telegram_command"),
+        ):
+            for thread_id in (42, 43, 42):
+                await handle_shell_message(
+                    bot,
+                    1,
+                    thread_id,
+                    "@0",
+                    "!ls",
+                    message=None,
+                    chat_id=-100,
+                )
+
+        action_ids = [call.kwargs["action_id"] for call in send_text.await_args_list]
+        assert len(action_ids) == 3
+        assert len(set(action_ids)) == 3
+        assert all(":0" not in action_id for action_id in action_ids)
 
     async def test_run_callback_passes_stored_message_id(self) -> None:
         query = AsyncMock(spec=CallbackQuery)

@@ -152,6 +152,7 @@ def render_protocol_records(
                 content_type = "text"
                 tool_id = raw_part.get("tool_call_id")
                 tool_name = raw_part.get("name")
+                plan_text: str | None = None
                 if part_type == "thinking":
                     content_type = "thinking"
                     if isinstance(text, str) and text:
@@ -164,6 +165,15 @@ def render_protocol_records(
                         text = format_tool_line(
                             display_name, title if isinstance(title, str) else ""
                         )
+                        tool_input = raw_part.get("input")
+                        plan = (
+                            tool_input.get("plan")
+                            if tool_name == "ExitPlanMode"
+                            and isinstance(tool_input, dict)
+                            else None
+                        )
+                        if isinstance(plan, str) and plan.strip():
+                            plan_text = format_expandable_quote(plan.strip())
                         tool_name = display_name
                 elif part_type == "notice":
                     text = raw_part.get("text")
@@ -182,6 +192,18 @@ def render_protocol_records(
                         content_type = "local_command"
                 if not isinstance(text, str) or not text:
                     continue
+                if plan_text:
+                    rendered.append(
+                        NewMessage(
+                            session_id=session_id,
+                            text=plan_text,
+                            is_complete=record.complete,
+                            content_type="text",
+                            phase=record.phase,
+                            role=role,
+                            provider_name=provider_name,
+                        )
+                    )
                 rendered.append(
                     NewMessage(
                         session_id=session_id,
@@ -919,6 +941,10 @@ class TranscriptReader:
             deduplicate_updates=True,
         )
         self._protocol_parser_states[session_id] = (provider_name, state)
+        if state.pending_tools:
+            self._pending_tools[session_id] = dict(state.pending_tools)
+        else:
+            self._pending_tools.pop(session_id, None)
         batch = TranscriptBatch(
             session_id=session_id,
             provider_name=provider_name,

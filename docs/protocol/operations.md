@@ -95,7 +95,10 @@ short retry window.
 
 One ccgram session core per multiplexer backend is allowed for each OS user. A process
 lock under `~/.cache/ccgram/locks/` enforces this even across different ccgram
-configuration directories. This is stricter than a lock for each socket.
+configuration directories and tmux session names. Separate tmux sessions can
+share linked windows, so a lock for each session cannot prevent overlapping
+writers. For work and personal groups, use the
+[single-core group setup](../guides.md#multi-instance-setup).
 
 ## Remote input and approval modes
 

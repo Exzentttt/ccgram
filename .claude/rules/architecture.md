@@ -259,13 +259,18 @@ Top-level (constants, leaves, top-level commands):
 
 ## Mobile session protocol
 
-`session_protocol/` is the transport-neutral mobile core; `api/` is its optional
-HTTP/WebSocket adapter. Neither package imports Telegram handlers or Telegram types.
+`session_protocol/` is the shared session core. Telegram uses its in-process
+adapter; `api/` is the optional HTTP/WebSocket adapter. The core starts even when
+the HTTP listener is disabled. Neither package imports Telegram handlers or
+Telegram types.
 `protocol/v1/` owns shared schemas and golden fixtures. `docs/protocol/` owns operator,
 client, and implementation documentation. `worktrees.py` owns shared git helpers.
 
-Keep mobile action deduplication durable before any terminal input. Keep foreground,
+Keep action deduplication durable before any terminal input. Keep foreground,
 active-pane, conversation, and source-generation checks in the binding. A screen-only
 request must never acquire structured approval controls. Do not make remote observers
-hold Telegram delivery receipts or watermarks. Telegram parser/renderer and direct
-input migrations are explicitly incomplete; see `docs/protocol/implementation.md`.
+hold Telegram delivery receipts or watermarks. `session_protocol/messages.py` owns
+canonical transcript normalization; Telegram renders those records and retains its
+durable delivery checkpoints. All handler mutations and live history go through
+the shared service. The former provider parser APIs, transcript parser, and
+direct-send exception baseline are removed. See `docs/protocol/implementation.md`.

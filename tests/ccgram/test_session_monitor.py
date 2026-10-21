@@ -647,6 +647,99 @@ class TestSettledPrefixWatermarkCommit:
         assert self._offset(monitor, "s1") == 0
         assert len(monitor._delivery_receipts["s1"]) == 1
 
+    async def test_parsed_tool_fences_checkpoint_and_rebuilds_after_restart(
+        self, tmp_path
+    ) -> None:
+        session_file = tmp_path / "claude-session.jsonl"
+        tool_call = {
+            "type": "assistant",
+            "uuid": "call-message",
+            "message": {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "tool-1",
+                        "name": "Read",
+                        "input": {"file_path": "README.md"},
+                    }
+                ],
+            },
+        }
+        session_file.write_text(json.dumps(tool_call) + "\n")
+        state_file = tmp_path / "monitor-state.json"
+
+        first = SessionMonitor(
+            projects_path=tmp_path / "projects", state_file=state_file
+        )
+        first.state.update_session(
+            TrackedSession(session_id="s1", file_path=str(session_file))
+        )
+        first.state.save_if_dirty()
+        first.set_message_callback(AsyncMock())
+        with patch(
+            "ccgram.transcript_reader._resolve_provider_for_file",
+            return_value=ClaudeProvider(),
+        ):
+            await first._process_session_file("s1", session_file, [])
+        first_pending = first._register_delivery_receipts(
+            first._transcript_reader.drain_batches()
+        )
+        for batch, consumer_name, receipt in first_pending:
+            await first._dispatch_message_with_receipt(batch, receipt, consumer_name)
+        first.commit_delivered_watermarks()
+
+        assert first.state.tracked_sessions["s1"].last_byte_offset == 0
+        assert first._pending_tools["s1"] == {"tool-1": "Read"}
+
+        with session_file.open("a") as transcript:
+            transcript.write(
+                json.dumps(
+                    {
+                        "type": "user",
+                        "uuid": "result-message",
+                        "message": {
+                            "role": "toolResult",
+                            "toolCallId": "tool-1",
+                            "content": "read complete",
+                        },
+                    }
+                )
+                + "\n"
+            )
+        restarted = SessionMonitor(
+            projects_path=tmp_path / "projects", state_file=state_file
+        )
+        restarted_delivery = AsyncMock()
+        restarted.set_message_callback(restarted_delivery)
+        with patch(
+            "ccgram.transcript_reader._resolve_provider_for_file",
+            return_value=ClaudeProvider(),
+        ):
+            await restarted._process_session_file("s1", session_file, [])
+        pending = restarted._register_delivery_receipts(
+            restarted._transcript_reader.drain_batches()
+        )
+        for batch, consumer_name, receipt in pending:
+            await restarted._dispatch_message_with_receipt(
+                batch, receipt, consumer_name
+            )
+        restarted.commit_delivered_watermarks()
+
+        assert restarted._pending_tools == {}
+        assert (
+            restarted.state.tracked_sessions["s1"].last_byte_offset
+            == session_file.stat().st_size
+        )
+        tool_results = [
+            call.args[0]
+            for call in restarted_delivery.await_args_list
+            if call.args[0].content_type == "tool_result"
+        ]
+        assert len(tool_results) == 1
+        assert tool_results[0].tool_name == "Read"
+        assert "read complete" in tool_results[0].text
+
     @staticmethod
     def _begin_skip(monitor: SessionMonitor, snapshot_offset: int = 500) -> None:
         monitor.state.begin_skip(

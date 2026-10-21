@@ -47,5 +47,7 @@ pagination. Do not feed Telegram-formatted text into this builder. A changed
 `historyGeneration` invalidates cached conversation messages and queued input.
 
 `EventHub` replay is independent of Telegram watermarks. Its remote subscriptions
-have bounded queues and force resync on overflow. API actions always go through
-`ActionExecutor`; legacy handler direct-send sites are an explicit tested baseline.
+have bounded queues and force resync on overflow. Telegram and API actions always
+go through the shared `ActionExecutor`. Telegram uses its in-process adapter; handlers must not call multiplexer mutation methods.
+There is no direct-send exception baseline. Telegram renders canonical transcript
+batches and owns durable receipts independently of mobile replay.

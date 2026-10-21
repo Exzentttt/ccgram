@@ -16,6 +16,7 @@ import asyncio
 import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
+from uuid import uuid4
 
 import structlog
 
@@ -71,6 +72,12 @@ _BANG_HINT_TEXT = (
 
 # Telegram chat-action expires after ~5s; refresh slightly faster.
 _TYPING_REFRESH_INTERVAL = 4.0
+
+
+def _message_action_id(chat_id: int, message_id: int) -> str:
+    if message_id:
+        return f"telegram-message:{chat_id}:{message_id}"
+    return f"telegram-event:{uuid4()}"
 
 
 async def _send_typing(client: TelegramClient, chat_id: int, thread_id: int) -> None:
@@ -236,6 +243,7 @@ async def handle_shell_message(
     await _send_typing(client, chat_id, thread_id)
 
     msg_id = message.message_id if message is not None else 0
+    action_id = _message_action_id(chat_id, msg_id)
 
     # ⚡ Persistent ack so the user sees the bot is working before
     # tmux/LLM round-trip completes; replaced by ✅/❌ once exit is known.
@@ -255,7 +263,7 @@ async def handle_shell_message(
             message_id=msg_id,
             chat_id=chat_id,
             adapter=adapter,
-            action_id=f"telegram-message:{chat_id}:{msg_id}",
+            action_id=action_id,
         )
         return
 
@@ -282,7 +290,7 @@ async def handle_shell_message(
             message_id=msg_id,
             chat_id=chat_id,
             adapter=adapter,
-            action_id=f"telegram-message:{chat_id}:{msg_id}",
+            action_id=action_id,
         )
         return
 

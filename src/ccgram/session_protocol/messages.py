@@ -214,6 +214,8 @@ class _CodexState:
     stream_text: str | None = None
     last_key: str | None = None
     last_text: str | None = None
+    last_phase: str | None = None
+    task_complete_mirror_text: str | None = None
 
 
 @dataclass(slots=True)
@@ -227,6 +229,7 @@ class TranscriptParserState:
     tool_names: dict[str, str] = field(default_factory=dict)
     tool_summaries: dict[str, str] = field(default_factory=dict)
     tool_diffs: dict[str, dict[str, Any]] = field(default_factory=dict)
+    pending_tools: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -299,7 +302,7 @@ def _codex_other_item(
 
 def _codex_message(
     data: dict[str, Any], key: str, timestamp: Any, state: _CodexState
-) -> TranscriptRecord:
+) -> TranscriptRecord | None:
     parts, results = _content(data.get("content"))
     role = "agent" if data.get("role") == "assistant" else str(data.get("role"))
     if role != "agent":
@@ -307,8 +310,14 @@ def _codex_message(
         state.stream_text = None
         state.last_key = None
         state.last_text = None
+        state.last_phase = None
+        state.task_complete_mirror_text = None
     text = "\n".join(str(part["text"]) for part in parts if part.get("type") == "text")
     if role == "agent" and text:
+        if text == state.task_complete_mirror_text:
+            state.task_complete_mirror_text = None
+            return None
+        state.task_complete_mirror_text = None
         if state.stream_key:
             key = state.stream_key
         state.stream_key = None
@@ -316,6 +325,8 @@ def _codex_message(
         state.last_key = key
         state.last_text = text
     phase = data.get("phase")
+    if role == "agent" and text:
+        state.last_phase = phase if isinstance(phase, str) and phase else None
     return TranscriptRecord(
         key,
         role,
@@ -344,6 +355,7 @@ def _codex_event(entry: SourceEntry, state: _CodexState) -> TranscriptRecord | N
         state.stream_text = text
         state.last_key = key
         state.last_text = text
+        state.last_phase = None
         return TranscriptRecord(
             key,
             "agent",
@@ -357,11 +369,22 @@ def _codex_event(entry: SourceEntry, state: _CodexState) -> TranscriptRecord | N
             state.stream_key = None
             state.stream_text = None
             return None
+        if (
+            not state.stream_key
+            and text == state.last_text
+            and state.last_phase == "final_answer"
+        ):
+            state.stream_key = None
+            state.stream_text = None
+            state.task_complete_mirror_text = text
+            return None
         key = state.stream_key or state.last_key or f"o{entry.offset}"
         state.stream_key = None
         state.stream_text = None
         state.last_key = key
         state.last_text = text
+        state.last_phase = "final_answer"
+        state.task_complete_mirror_text = text
         return TranscriptRecord(
             key,
             "agent",
@@ -468,6 +491,14 @@ def _chat(entry: SourceEntry, provider: str) -> TranscriptRecord | None:
     if role not in {"user", "assistant", "system"}:
         return None
     parts, results = _content(msg.get("content"))
+    if provider == "pi" and role == "assistant" and msg.get("stopReason") == "error":
+        error_message = msg.get("errorMessage")
+        error_text = (
+            error_message.strip()
+            if isinstance(error_message, str) and error_message.strip()
+            else "Provider error"
+        )
+        parts.append({"type": "notice", "level": "error", "text": error_text})
     return TranscriptRecord(
         key,
         "agent" if role == "assistant" else role,
@@ -606,6 +637,57 @@ def _antigravity(entry: SourceEntry) -> TranscriptRecord | None:
     )
 
 
+def _track_tool_state(record: TranscriptRecord, state: TranscriptParserState) -> None:
+    for part in record.parts:
+        call_id = part.get("tool_call_id")
+        name = part.get("name")
+        summary = part.get("title")
+        if isinstance(call_id, str) and call_id and isinstance(name, str):
+            state.tool_names[call_id] = name
+            if isinstance(summary, str):
+                state.tool_summaries[call_id] = summary
+            diff = part.get("diff")
+            if isinstance(diff, dict):
+                state.tool_diffs[call_id] = diff
+            state.pending_tools[call_id] = name
+    for call_id, _, _ in record.results:
+        if call_id:
+            state.pending_tools.pop(call_id, None)
+
+
+def _coalesce_codex_completion_mirror(
+    records: list[tuple[SourceEntry, TranscriptRecord]],
+    entry: SourceEntry,
+    record: TranscriptRecord,
+    previous: _CodexState,
+) -> bool:
+    """Merge metadata-only completion mirrors without emitting duplicate text."""
+    if (
+        previous.stream_key is not None
+        or previous.last_phase == "final_answer"
+        or record.phase != "final_answer"
+        or record.key != previous.last_key
+        or _record_text(record) != previous.last_text
+    ):
+        return False
+    if records:
+        _, prior_record = records[-1]
+        if (
+            prior_record.complete
+            and prior_record.key == record.key
+            and _record_text(prior_record) == _record_text(record)
+        ):
+            records[-1] = (entry, record)
+            return True
+    return True
+
+
+def _record_text(record: TranscriptRecord) -> str:
+    return "\n".join(
+        str(part["text"]) for part in record.parts if part.get("type") == "text"
+    )
+
+
 def parse_records(
     entries: list[SourceEntry],
     provider: str,
@@ -622,6 +704,7 @@ def parse_records(
     parser_state = state or TranscriptParserState()
     records: list[tuple[SourceEntry, TranscriptRecord]] = []
     for entry in entries:
+        previous_codex = replace(parser_state.codex) if provider == "codex" else None
         record = (
             _codex_event(entry, parser_state.codex)
             if provider == "codex" and entry.data.get("type") == "event_msg"
@@ -641,18 +724,16 @@ def parse_records(
             record = _deduplicate_gemini_record(record, entry, parser_state)
             if record is None:
                 continue
-        if record.parts:
-            for part in record.parts:
-                call_id = part.get("tool_call_id")
-                name = part.get("name")
-                summary = part.get("title")
-                if isinstance(call_id, str) and call_id and isinstance(name, str):
-                    parser_state.tool_names[call_id] = name
-                    if isinstance(summary, str):
-                        parser_state.tool_summaries[call_id] = summary
-                    diff = part.get("diff")
-                    if isinstance(diff, dict):
-                        parser_state.tool_diffs[call_id] = diff
+        if (
+            deduplicate_updates
+            and provider == "codex"
+            and previous_codex is not None
+            and _coalesce_codex_completion_mirror(
+                records, entry, record, previous_codex
+            )
+        ):
+            continue
+        _track_tool_state(record, parser_state)
         records.append((entry, record))
     return tuple(records), parser_state
 
