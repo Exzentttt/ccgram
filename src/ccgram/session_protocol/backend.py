@@ -7,13 +7,13 @@ import hashlib
 import json
 import socket
 from subprocess import TimeoutExpired
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
 from ..command_catalog import CommandCatalog
 from ..multiplexer.base import Multiplexer, WindowRef
-from ..providers import get_provider_for_window, resolve_launch_command
+from ..providers import get_provider_for_window, has_yolo_mode, resolve_launch_command
 from ..providers.process_detection import classify_provider_from_argv
 from ..providers.shell_infra import KNOWN_SHELLS, match_prompt
 from ..window_state_ports import identity_state
@@ -66,6 +66,9 @@ class Target:
     resume_provider: str = ""
     transcript_provider: str = ""
     history_generation: int = 0
+    transcript_content: bytes | None = None
+    transcript_stamp: tuple[int, int, int, int] | None = None
+    selected_pane_command: str | None = None
     foreground_argv: tuple[str, ...] = ()
     available: bool = True
 
@@ -100,17 +103,33 @@ class Prompt:
         return hashlib.sha256(self.text.encode()).hexdigest()
 
 
+@dataclass(frozen=True, slots=True)
+class CreationOptions:
+    """Trusted launch options supplied by in-process Telegram workflows."""
+
+    approval_mode: Literal["normal", "yolo"] = "normal"
+    resume_id: str | None = None
+    continue_session: bool = False
+
+
 class SessionBackend(Protocol):
     async def targets(self) -> list[Target]: ...
     async def inspect(self, target_id: str) -> Target: ...
     async def prompt(self, target: Target) -> Prompt | None: ...
     async def terminal(self, target: Target, pane: str) -> dict[str, Any]: ...
-    async def send_text(self, target: Target, text: str, *, enter: bool) -> bool: ...
+    async def send_text(
+        self, target: Target, text: str, *, enter: bool, raw: bool | None = None
+    ) -> bool: ...
     async def send_key(self, target: Target, key: str) -> bool: ...
+    async def send_followup(self, target: Target, text: str) -> bool: ...
+    async def select_pane(self, target: Target, pane_id: str) -> Target: ...
+    async def split(self, target: Target) -> str | None: ...
     async def close(self, target: Target) -> bool: ...
     async def rename(self, target: Target, title: str) -> bool: ...
     async def commands(self, target: Target) -> list[dict[str, str]]: ...
-    async def create(self, data: dict[str, Any]) -> Target: ...
+    async def create(
+        self, data: dict[str, Any], *, trusted_options: CreationOptions | None = None
+    ) -> Target: ...
     async def resume(self, target: Target, conversation_id: str) -> bool: ...
 
 
@@ -183,7 +202,7 @@ class MultiplexerSessionBackend:
             else ""
         )
         transcript = identity.transcript_path if conversation_id and identity else None
-        if history_provider not in {"claude", "codex", "gemini", "pi"}:
+        if history_provider not in {"claude", "codex", "gemini", "pi", "antigravity"}:
             transcript = None
         panes = await self.mux.list_panes(window.window_id)
         active = next((p for p in panes if p.active), None)
@@ -262,6 +281,7 @@ class MultiplexerSessionBackend:
         title = (
             await self.mux.get_pane_title(target.id)
             if provider.capabilities.uses_pane_title
+            and target.selected_pane_command is None
             else ""
         )
         status = provider.parse_terminal_status(text, pane_title=title)
@@ -289,7 +309,16 @@ class MultiplexerSessionBackend:
             "hash": hashlib.sha256(text.encode()).hexdigest(),
         }
 
-    async def send_text(self, target: Target, text: str, *, enter: bool) -> bool:
+    async def send_text(
+        self,
+        target: Target,
+        text: str,
+        *,
+        enter: bool,
+        raw: bool | None = None,
+    ) -> bool:
+        await self._verify_selected_pane(target)
+        raw_input = target.provider in {"shell", "unknown"} if raw is None else raw
         if target.pane_id:
             return await self.mux.send_to_pane(
                 target.pane_id,
@@ -297,22 +326,74 @@ class MultiplexerSessionBackend:
                 enter=enter,
                 literal=True,
                 window_id=target.id,
-                raw=target.provider in {"shell", "unknown"},
+                raw=raw_input,
             )
         return await self.mux.send(
             target.id,
             text,
             enter=enter,
             literal=True,
-            raw=target.provider in {"shell", "unknown"},
+            raw=raw_input,
         )
 
     async def send_key(self, target: Target, key: str) -> bool:
+        await self._verify_selected_pane(target)
         if target.pane_id:
             return await self.mux.send_to_pane(
                 target.pane_id, key, enter=False, literal=False, window_id=target.id
             )
         return await self.mux.send(target.id, key, enter=False, literal=False, raw=True)
+
+    async def send_followup(self, target: Target, text: str) -> bool:
+        if target.provider != "pi":
+            raise ProtocolError(
+                422,
+                "unsupported_action",
+                "Follow-up input is supported for Pi sessions",
+            )
+        if not await self.send_text(target, text, enter=False):
+            return False
+        await asyncio.sleep(0.5)
+        return await self.send_key(target, "M-Enter")
+
+    async def select_pane(self, target: Target, pane_id: str) -> Target:
+        panes = await self.mux.list_panes(target.id)
+        pane = next(
+            (candidate for candidate in panes if candidate.pane_id == pane_id), None
+        )
+        if pane is None:
+            raise ProtocolError(
+                409, "binding_conflict", "Selected pane no longer exists"
+            )
+        return replace(
+            target,
+            pane_id=pane.pane_id,
+            pane_title=pane.command,
+            rows=pane.height,
+            cols=pane.width,
+            selected_pane_command=pane.command,
+        )
+
+    async def _verify_selected_pane(self, target: Target) -> None:
+        if target.selected_pane_command is None:
+            return
+        panes = await self.mux.list_panes(target.id)
+        pane = next(
+            (candidate for candidate in panes if candidate.pane_id == target.pane_id),
+            None,
+        )
+        if pane is None or pane.command != target.selected_pane_command:
+            raise ProtocolError(409, "binding_conflict", "Selected pane changed")
+
+    async def split(self, target: Target) -> str | None:
+        fresh = await self.inspect(target.id)
+        if (fresh.process_id, fresh.pane_id, fresh.foreground_argv) != (
+            target.process_id,
+            target.pane_id,
+            target.foreground_argv,
+        ):
+            raise ProtocolError(409, "binding_conflict", "Session binding changed")
+        return await self.mux.split_window(target.id)
 
     async def close(self, target: Target) -> bool:
         return await self.mux.kill_window(target.id)
@@ -357,15 +438,20 @@ class MultiplexerSessionBackend:
             target, f"{command} {arguments}".strip(), enter=True
         )
 
-    async def create(self, data: dict[str, Any]) -> Target:
-        directory = Path(data["directory"]).expanduser()
+    async def create(
+        self, data: dict[str, Any], *, trusted_options: CreationOptions | None = None
+    ) -> Target:
+        directory_value = data.get("directory", data.get("cwd"))
+        if not isinstance(directory_value, str):
+            raise ProtocolError(400, "invalid_request", "directory must be a path")
+        directory = Path(directory_value).expanduser()
         if not directory.is_absolute() or not directory.is_dir():
             raise ProtocolError(
                 400,
                 "invalid_request",
                 "directory must be an existing absolute directory",
             )
-        if data.get("mode", "normal") != "normal":
+        if trusted_options is None and data.get("mode", "normal") != "normal":
             raise ProtocolError(
                 422,
                 "unsupported_action",
@@ -377,31 +463,97 @@ class MultiplexerSessionBackend:
         candidate = get_provider_for_window("", provider_name=provider)
         if candidate.capabilities.name != provider:
             raise ProtocolError(400, "invalid_request", "Unknown provider")
-        command = resolve_launch_command(provider, approval_mode="normal")
+        approval_mode, command, agent_args = self._launch_options(
+            provider, candidate, data, trusted_options
+        )
         try:
             worktree_path = directory
             if data.get("worktree"):
                 created = await self._create_worktree(directory, data, command)
                 if isinstance(created, Target):
-                    return created
+                    if approval_mode == "yolo":
+                        identity_state.set_window_approval_mode(
+                            created.id, approval_mode
+                        )
+                    return await self.inspect(created.id)
                 worktree_path = created
-            if self.mux.capabilities.native_topic_targets:
-                created = await self.mux.create_topic_target(
-                    str(worktree_path),
-                    launch_command=command,
-                    workspace_id=data.get("workspaceId"),
-                )
-                return await self._created_target(True, created.target_id)
-            ok, _, _, target_id = await self.mux.create_window(
-                str(worktree_path),
-                launch_command=command,
-                workspace_id=data.get("workspaceId"),
+            return await self._create_target(
+                worktree_path,
+                command,
+                agent_args,
+                approval_mode,
+                data.get("workspaceId"),
             )
-            return await self._created_target(ok, target_id)
         except (OSError, RuntimeError, TimeoutExpired) as exc:
             raise ProtocolError(
                 503, "backend_unavailable", _CREATION_UNCONFIRMED
             ) from exc
+
+    @staticmethod
+    def _launch_options(
+        provider: str,
+        candidate: Any,
+        data: dict[str, Any],
+        options: CreationOptions | None,
+    ) -> tuple[str, str, str]:
+        approval_mode = options.approval_mode if options else "normal"
+        if approval_mode not in {"normal", "yolo"}:
+            raise ProtocolError(400, "invalid_request", "Invalid approval mode")
+        if approval_mode == "yolo" and not has_yolo_mode(provider):
+            raise ProtocolError(
+                422, "unsupported_action", "Provider does not support YOLO mode"
+            )
+        resume_id = options.resume_id if options else None
+        continue_session = options.continue_session if options else False
+        if resume_id and continue_session:
+            raise ProtocolError(
+                400, "invalid_request", "Choose resume_id or continue_session"
+            )
+        if (resume_id or continue_session) and data.get("worktree"):
+            raise ProtocolError(
+                422, "unsupported_action", "Cannot resume into a new worktree"
+            )
+        if resume_id and not candidate.capabilities.supports_resume:
+            raise ProtocolError(
+                422, "unsupported_action", "Provider does not support resume"
+            )
+        if continue_session and not candidate.capabilities.supports_continue:
+            raise ProtocolError(
+                422, "unsupported_action", "Provider does not support continue"
+            )
+        command = resolve_launch_command(provider, approval_mode=approval_mode)
+        arguments = candidate.make_launch_args(
+            resume_id=resume_id, use_continue=continue_session
+        )
+        return approval_mode, command, arguments
+
+    async def _create_target(
+        self,
+        worktree_path: Path,
+        command: str,
+        agent_args: str,
+        approval_mode: str,
+        workspace_id: str | None,
+    ) -> Target:
+        if self.mux.capabilities.native_topic_targets:
+            created = await self.mux.create_topic_target(
+                str(worktree_path),
+                launch_command=command,
+                workspace_id=workspace_id,
+                agent_args=agent_args,
+            )
+            target_id = created.target_id
+            success = bool(target_id)
+        else:
+            success, _, _, target_id = await self.mux.create_window(
+                str(worktree_path),
+                launch_command=command,
+                workspace_id=workspace_id,
+                agent_args=agent_args,
+            )
+        if success and approval_mode == "yolo":
+            identity_state.set_window_approval_mode(target_id, approval_mode)
+        return await self._created_target(success, target_id)
 
     async def _create_worktree(
         self, directory: Path, data: dict[str, Any], command: str

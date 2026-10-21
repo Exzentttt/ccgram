@@ -1,7 +1,8 @@
 # Run the mobile API
 
 The API runs inside the existing ccgram process. Telegram configuration is still
-required. An unset `CCGRAM_API_PORT` leaves the API disabled.
+required. An unset `CCGRAM_API_PORT` disables the HTTP listener. The shared session
+core still runs for Telegram.
 
 ## Start locally
 
@@ -88,11 +89,11 @@ restarting or restoring ccgram. Removing or restoring an older database discards
 newer deduplication records and can make old action IDs executable again.
 
 The database and uploads use mode `0600`. Newly created private directories use
-`0700`. Back up the database and uploads together when no API process is writing.
+`0700`. Back up the database and uploads together when ccgram is stopped.
 Action outcomes have no automatic expiry, so the deduplication guarantee has no
 short retry window.
 
-One API instance per multiplexer backend is allowed for each OS user. A process
+One ccgram session core per multiplexer backend is allowed for each OS user. A process
 lock under `~/.cache/ccgram/locks/` enforces this even across different ccgram
 configuration directories. This is stricter than a lock for each socket.
 

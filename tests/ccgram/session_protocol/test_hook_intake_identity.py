@@ -8,10 +8,10 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from ccgram.api.runtime import ProtocolRuntime
 from ccgram.providers.base import HookEvent
 from ccgram.session_protocol.backend import Prompt
 from ccgram.session_protocol.requests import PendingHook
+from ccgram.session_protocol.runtime import ProtocolRuntime
 
 
 @pytest.mark.parametrize("queued", [False, True])
@@ -103,7 +103,7 @@ async def test_replacement_expiring_in_queue_never_restores_old_approval(
             "ccgram.session_protocol.requests.time.time", lambda: now + 32
         )
         monkeypatch.setattr(
-            "ccgram.api.runtime.asyncio.sleep",
+            "ccgram.session_protocol.runtime.asyncio.sleep",
             AsyncMock(side_effect=asyncio.CancelledError),
         )
         with pytest.raises(asyncio.CancelledError):

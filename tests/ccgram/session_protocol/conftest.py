@@ -54,7 +54,9 @@ class FakeBackend:
             raise ProtocolError(404, "not_found", "pane")
         return {"pane": pane, "rows": 24, "cols": 80, "ansi": "hello", "hash": "h1"}
 
-    async def send_text(self, target: Target, text: str, *, enter: bool) -> bool:
+    async def send_text(
+        self, target: Target, text: str, *, enter: bool, raw: bool | None = None
+    ) -> bool:
         self.sent.append(("text", text, enter))
         if self.clear_on_input:
             self.current_prompt = None

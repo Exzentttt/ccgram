@@ -11,9 +11,10 @@ from ccgram.multiplexer.base import ForegroundInfo, Multiplexer, PaneInfo, Windo
 from ccgram.multiplexer.tmux import TmuxManager
 from ccgram.multiplexer.herdr import HerdrError
 from ccgram.multiplexer.vim_state import notify_vim_insert_seen, reset_vim_state
-from ccgram.session_protocol.backend import MultiplexerSessionBackend
+from ccgram.session_protocol.backend import CreationOptions, MultiplexerSessionBackend
 from ccgram.session_protocol.models import Action, ProtocolError
 from ccgram.session_protocol.service import LocalSessionService
+from ccgram.session_protocol.telegram import adapter_for
 from ccgram.window_state_ports import identity_state
 from ccgram.window_state_ports.identity_state import IdentityProjection, get_identity
 from ccgram.window_state_store import WindowState, WindowStateStore
@@ -103,6 +104,57 @@ async def test_valid_workspace_reaches_selected_creation_backend(
     assert target.id == "@1"
     boundary = mux.create_topic_target if native else mux.create_window
     assert boundary.await_args.kwargs["workspace_id"] == "workspace-1"
+
+
+async def test_trusted_creation_options_keep_yolo_and_provider_resume_args(
+    mux, tmp_path, monkeypatch
+):
+    mux.create_window.return_value = (True, "", "", "@1")
+    record_approval = MagicMock()
+    monkeypatch.setattr(identity_state, "set_window_approval_mode", record_approval)
+    resume_id = "00000000-0000-4000-8000-000000000001"
+
+    await MultiplexerSessionBackend(mux, "/tmp").create(
+        {"directory": str(tmp_path), "provider": "claude"},
+        trusted_options=CreationOptions(approval_mode="yolo", resume_id=resume_id),
+    )
+
+    kwargs = mux.create_window.await_args.kwargs
+    assert "--dangerously-skip-permissions" in kwargs["launch_command"]
+    assert kwargs["agent_args"] == f"--resume {resume_id}"
+    record_approval.assert_called_once_with("@1", "yolo")
+
+
+async def test_telegram_creation_returns_native_target_and_opaque_session(
+    mux, store, tmp_path
+):
+    mux.list_windows_for_reconciliation.return_value = [
+        WindowRef("@9", "created", "/tmp")
+    ]
+    mux.create_window.return_value = (True, "", "", "@9")
+    service = LocalSessionService(MultiplexerSessionBackend(mux, "/tmp"), store)
+    adapter = adapter_for({"session_service": service})
+
+    created = await adapter.create({"directory": str(tmp_path), "provider": "claude"})
+
+    assert created.target_id == "@9"
+    assert created.session.id != created.target_id
+    assert created.session.id.startswith("s_")
+    assert created.title == created.session.title == "created"
+
+
+async def test_untrusted_remote_creation_still_rejects_yolo_mode(mux, tmp_path):
+    with pytest.raises(ProtocolError) as error:
+        await MultiplexerSessionBackend(mux, "/tmp").create(
+            {
+                "directory": str(tmp_path),
+                "provider": "claude",
+                "mode": "yolo",
+            }
+        )
+
+    assert error.value.code == "unsupported_action"
+    mux.create_window.assert_not_awaited()
 
 
 @pytest.mark.parametrize("failure", ["timeout", "os_error", "nonzero"])
@@ -298,6 +350,129 @@ async def test_verified_pidless_foreground_can_act_and_argv_change_invalidates_b
     mux.send_to_pane.assert_not_awaited()
 
 
+async def test_terminal_input_bypasses_agent_message_submission_workarounds(mux, store):
+    service = LocalSessionService(MultiplexerSessionBackend(mux, "/tmp"), store)
+    session = (await service.list_sessions())[0]
+
+    pasted, _ = await service.execute(
+        session.id,
+        Action(str(uuid4()), session.binding_version, "terminal.paste", {"text": "y"}),
+    )
+    submitted, _ = await service.execute_internal(
+        session.id,
+        Action(str(uuid4()), session.binding_version, "terminal.submit", {"text": "y"}),
+    )
+    messaged, _ = await service.execute(
+        session.id,
+        Action(
+            str(uuid4()), session.binding_version, "message.send", {"text": "hello"}
+        ),
+    )
+
+    assert [pasted.outcome, submitted.outcome, messaged.outcome] == [
+        "sent",
+        "sent",
+        "sent",
+    ]
+    assert [call.kwargs["raw"] for call in mux.send_to_pane.await_args_list] == [
+        True,
+        True,
+        False,
+    ]
+
+
+async def test_pi_followup_text_failure_does_not_send_alt_enter(mux, store):
+    mux.foreground.return_value = ForegroundInfo(23, 23, ["pi"], "/tmp")
+    mux.send_to_pane.return_value = False
+    service = LocalSessionService(MultiplexerSessionBackend(mux, "/tmp"), store)
+    session = (await service.list_sessions())[0]
+
+    result, status = await service.execute_internal(
+        session.id,
+        Action(
+            str(uuid4()),
+            session.binding_version,
+            "message.followup",
+            {"text": "continue"},
+        ),
+    )
+
+    assert status == 200 and result.outcome == "unknown"
+    mux.send_to_pane.assert_awaited_once_with(
+        "%1",
+        "continue",
+        enter=False,
+        literal=True,
+        window_id="@1",
+        raw=False,
+    )
+
+
+async def test_pi_followup_key_failure_is_reported_after_text(mux, store, monkeypatch):
+    mux.foreground.return_value = ForegroundInfo(23, 23, ["pi"], "/tmp")
+    mux.send_to_pane.side_effect = [True, False]
+    sleep = AsyncMock()
+    monkeypatch.setattr("ccgram.session_protocol.backend.asyncio.sleep", sleep)
+    service = LocalSessionService(MultiplexerSessionBackend(mux, "/tmp"), store)
+    session = (await service.list_sessions())[0]
+
+    result, status = await service.execute_internal(
+        session.id,
+        Action(
+            str(uuid4()),
+            session.binding_version,
+            "message.followup",
+            {"text": "continue"},
+        ),
+    )
+
+    assert status == 200 and result.outcome == "unknown"
+    sleep.assert_awaited_once_with(0.5)
+    assert mux.send_to_pane.await_args_list == [
+        call(
+            "%1",
+            "continue",
+            enter=False,
+            literal=True,
+            window_id="@1",
+            raw=False,
+        ),
+        call("%1", "M-Enter", enter=False, literal=False, window_id="@1"),
+    ]
+
+
+async def test_explicit_pane_is_revalidated_before_terminal_input(mux):
+    sibling = PaneInfo("%2", 1, False, "claude", "/tmp", 80, 24)
+    mux.list_panes.return_value = [
+        PaneInfo("%1", 0, True, "claude", "/tmp", 80, 24),
+        sibling,
+    ]
+    backend = MultiplexerSessionBackend(mux, "/tmp")
+    target = await backend.inspect("@1")
+    selected = await backend.select_pane(target, "%2")
+
+    assert await backend.send_text(selected, "y", enter=True)
+    mux.send_to_pane.assert_awaited_once_with(
+        "%2",
+        "y",
+        enter=True,
+        literal=True,
+        window_id="@1",
+        raw=False,
+    )
+
+    mux.list_panes.return_value = [
+        PaneInfo("%1", 0, True, "claude", "/tmp", 80, 24),
+        PaneInfo("%2", 1, False, "bash", "/tmp", 80, 24),
+    ]
+    mux.send_to_pane.reset_mock()
+    with pytest.raises(ProtocolError) as error:
+        await backend.send_text(selected, "danger", enter=True)
+
+    assert error.value.code == "binding_conflict"
+    mux.send_to_pane.assert_not_awaited()
+
+
 @pytest.mark.parametrize("foreground", [None, ForegroundInfo(23, 23, [], "/tmp")])
 async def test_unknown_foreground_does_not_advertise_actions(mux, store, foreground):
     mux.foreground.return_value = foreground
@@ -343,6 +518,34 @@ async def test_gemini_working_title_is_used_for_snapshot(mux):
     mux.get_pane_title.return_value = "Working: ✦"
     target = await MultiplexerSessionBackend(mux, "/tmp").inspect("@1")
     assert target.status.state == "working"
+
+
+async def test_selected_pane_prompt_ignores_active_pane_title(mux):
+    mux.foreground.return_value = ForegroundInfo(23, 23, ["gemini"], "/tmp")
+    mux.list_panes.return_value = [
+        PaneInfo("%1", 0, True, "gemini", "/tmp", 80, 24),
+        PaneInfo("%2", 1, False, "gemini", "/tmp", 80, 24),
+    ]
+    mux.get_pane_title.return_value = "Working: ✦"
+    mux.capture_pane_by_id.return_value = (
+        "Action Required\n"
+        "? Shell echo hello\n"
+        "Allow execution of: 'echo hello'?\n"
+        "1. Allow once\n"
+        "2. No, suggest changes (esc"
+    )
+    backend = MultiplexerSessionBackend(mux, "/tmp")
+    target = await backend.inspect("@1")
+    selected = await backend.select_pane(target, "%2")
+    mux.get_pane_title.reset_mock()
+
+    prompt = await backend.prompt(selected)
+    assert prompt is not None
+    mux.get_pane_title.assert_not_awaited()
+
+    active_prompt = await backend.prompt(target)
+    assert active_prompt is None
+    mux.get_pane_title.assert_awaited_once_with("@1")
 
 
 async def test_native_worktree_rejects_selected_workspace(mux, tmp_path):
@@ -428,3 +631,31 @@ async def test_tmux_safe_message_stays_on_pinned_pane(monkeypatch, text, expecte
         assert call(0.5) in sleeps.await_args_list
     finally:
         reset_vim_state()
+
+
+async def test_antigravity_bound_history_survives_shared_core_cutover(
+    mux, store, tmp_path, monkeypatch
+):
+    path = tmp_path / "transcript.jsonl"
+    path.write_text(
+        '{"id":"u1","type":"USER","content":"question"}\n'
+        '{"id":"a1","type":"ASSISTANT","content":"answer"}\n'
+    )
+    mux.foreground.return_value = ForegroundInfo(0, 0, ["agy"], "/tmp")
+    monkeypatch.setattr(
+        identity_state,
+        "get_identity",
+        lambda _: IdentityProjection(
+            "@1", "antigravity", "conv", "/tmp", path, "project", "normal"
+        ),
+    )
+    service = LocalSessionService(MultiplexerSessionBackend(mux, "/tmp"), store)
+    session = (await service.list_sessions())[0]
+    page = await service.history(session.id, None, 20)
+    assert session.provider == "antigravity"
+    assert session.conversation is not None
+    assert session.conversation.id == "conv"
+    assert [(message.role, message.parts[0].text) for message in page.messages] == [
+        ("user", "question"),
+        ("agent", "answer"),
+    ]

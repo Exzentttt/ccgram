@@ -16,6 +16,7 @@ import secrets
 import sqlite3
 import time
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -208,7 +209,15 @@ class ProtocolStore:
                 "Action ID was already used for a different action",
             )
         body = json.loads(row[1])
-        return ActionResult(body["actionId"], body["outcome"], body["error"]), row[2]
+        return (
+            ActionResult(
+                body["actionId"],
+                body["outcome"],
+                body["error"],
+                body.get("data"),
+            ),
+            row[2],
+        )
 
     def reserve(self, action_id: str, fingerprint: str) -> None:
         result = ActionResult(action_id, "unknown")
@@ -282,18 +291,22 @@ class ProtocolStore:
         return row[0], True
 
     async def transcript_generation(self, key: str, path: Path) -> int:
+        return (await self.transcript_snapshot(key, path)).generation
+
+    async def transcript_snapshot(self, key: str, path: Path) -> TranscriptSnapshot:
         row = self.db.execute(
             "SELECT inode, size, prefix_size, prefix_hash, generation FROM transcripts WHERE key=?",
             (key,),
         ).fetchone()
-        record = await asyncio.to_thread(_transcript_record, path, row)
+        snapshot = await asyncio.to_thread(_transcript_record, path, row)
+        record = snapshot.record
         if row != record:
             with self.db:
                 self.db.execute(
                     "INSERT OR REPLACE INTO transcripts VALUES (?, ?, ?, ?, ?, ?)",
                     (key, *record),
                 )
-        return record[4]
+        return snapshot
 
     def retarget(self, previous: str, current: str) -> None:
         """Apply a recovery mapping already attested by the existing resolver."""
@@ -308,32 +321,50 @@ class ProtocolStore:
                 )
 
 
+@dataclass(frozen=True, slots=True)
+class TranscriptSnapshot:
+    content: bytes
+    stamp: tuple[int, int, int, int]
+    record: tuple[int, int, int, str, int]
+
+    @property
+    def generation(self) -> int:
+        return self.record[4]
+
+
+def _source_stamp(stat: os.stat_result) -> tuple[int, int, int, int]:
+    return stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns
+
+
 def _transcript_record(
     path: Path, row: tuple[int, int, int, str, int] | None
-) -> tuple[int, int, int, str, int]:
-    with path.open("rb") as source:
-        stat = os.fstat(source.fileno())
-        # Verify the entire previously observed prefix: truncation and
-        # regrowth between polls can preserve both the inode and first page.
-        previous = hashlib.sha256()
-        current = hashlib.sha256()
-        remaining = row[2] if row else 0
-        size = 0
-        while block := source.read(65536):
-            current.update(block)
-            size += len(block)
-            if remaining:
-                previous.update(block[:remaining])
-                remaining = max(0, remaining - len(block))
-    generation = row[4] if row else 0
-    if row and (
-        row[0] != stat.st_ino or size < row[1] or previous.hexdigest() != row[3]
-    ):
-        generation += 1
-    return (
-        stat.st_ino,
-        size,
-        size,
-        current.hexdigest(),
-        generation,
-    )
+) -> TranscriptSnapshot:
+    for _ in range(3):
+        with path.open("rb") as source:
+            before = os.fstat(source.fileno())
+            content = source.read()
+            after = os.fstat(source.fileno())
+        current = path.stat()
+        if (
+            _source_stamp(before) != _source_stamp(after)
+            or _source_stamp(after) != _source_stamp(current)
+            or before.st_dev != current.st_dev
+            or len(content) != current.st_size
+        ):
+            continue
+        generation = row[4] if row else 0
+        if row and (
+            row[0] != current.st_ino
+            or len(content) < row[1]
+            or hashlib.sha256(content[: row[2]]).hexdigest() != row[3]
+        ):
+            generation += 1
+        record = (
+            current.st_ino,
+            len(content),
+            len(content),
+            hashlib.sha256(content).hexdigest(),
+            generation,
+        )
+        return TranscriptSnapshot(content, _source_stamp(current), record)
+    raise OSError("Transcript changed repeatedly while reading")

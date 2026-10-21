@@ -25,6 +25,16 @@
           "type": "null"
         }
       ]
+    },
+    "data": {
+      "anyOf": [
+        {
+          "type": "object"
+        },
+        {
+          "type": "null"
+        }
+      ]
     }
   },
   "required": [

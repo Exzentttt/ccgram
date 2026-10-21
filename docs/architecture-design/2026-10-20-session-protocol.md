@@ -17,10 +17,10 @@ the protocol.
 **Style.** The text uses ASD-STE100 rules (strict mode, without a check against the official dictionary). The
 words "must", "can", and "will" have their usual meaning. The text uses no other modal verbs.
 
-**Implementation:** The mobile backend, schemas, and tests are in place. See
+**Implementation:** The shared Telegram/mobile core, wire schemas, and tests are in place. See
 [protocol documentation](../protocol/README.md) for the current contract and
 [implementation boundary](../protocol/implementation.md) for corrections to this
-proposal and the remaining P0 Telegram refactors. APNs and headless mode remain
+proposal, including durable delivery checkpoints and trusted local actions. APNs and headless mode remain
 outside this implementation.
 
 ## Contents
@@ -214,7 +214,7 @@ directly and does not use the wire protocol.
 | `api/` (new)                                   | aiohttp routes for `ccgram/1`, device auth, pairing (section 9, 10).                               |
 | `push/` (new, P3)                              | APNs sender and presence rules (section 11).                                                       |
 | `providers/*` (changed)                        | Give structured parts and an entry key, not formatted text (C-01).                                 |
-| `transcript_parser.py` (changed)               | Return parts and entry keys. Telegram formatting moves out.                                        |
+| `transcript_reader.py` (changed)               | Read delivery cursors and render canonical parts for Telegram.                                        |
 | `handlers/` (changed)                          | Render parts for Telegram. Call `ActionExecutor` for all sends. Read requests from `RequestStore`. |
 | `session_monitor.py`, `bootstrap.py` (changed) | Publish to `EventHub`. Wire Telegram as a durable consumer.                                        |
 
@@ -649,12 +649,13 @@ sequenceDiagram
     alt seq 4101 in buffer and same epoch
         API-->>App: welcome resumed true
         API-->>App: missed durable frames 4101 to 4182
+        App->>API: subscribe all
     else gap or new epoch
         API-->>App: welcome resumed false
+        App->>API: subscribe all
         App->>API: GET /v1/sessions
         App->>API: GET history of open session
     end
-    App->>API: subscribe all
     API-->>App: live frames
 ```
 

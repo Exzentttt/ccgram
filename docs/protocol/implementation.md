@@ -1,14 +1,18 @@
 # Implementation and verification
 
-The mobile backend is an adapter around existing terminal sessions. It has no
-agent SDK or wrapper runtime.
+Telegram and the mobile API use one in-process session core around existing
+terminal sessions. Neither client launches an agent SDK or wrapper runtime.
+Telegram calls the core directly. HTTP and WebSocket expose its wire contract.
 
 | Module | Responsibility |
 | --- | --- |
 | `session_protocol/models.py` | Dataclasses, wire serialization, and protocol errors. |
 | `session_protocol/backend.py` | Consumer-owned backend Protocol and its Multiplexer adapter. |
 | `session_protocol/service.py` | Session discovery, snapshots, history, live replacements, and delivery correlations. |
-| `session_protocol/messages.py` | One provider-neutral message builder for history and events. |
+| `session_protocol/messages.py` | Canonical provider normalization, structured records, and the history/live message builder. |
+| `transcript_reader.py` | Delivery cursor reads and Telegram rendering of canonical records. |
+| `session_protocol/telegram.py` | In-process Telegram adapter and application-owned service access. |
+| `session_protocol/runtime.py` | Always-on core, process lock, recovery, hook queue, and polling lifecycle. |
 | `session_protocol/actions.py` | Schema boundary checks, persistent deduplication, binding checks, and input execution. |
 | `session_protocol/input_lock.py` | Task-reentrant per-target locks shared with Telegram text and interactive input. |
 | `session_protocol/requests.py` | Open requests, hook evidence, supported options, and close events. |
@@ -16,9 +20,16 @@ agent SDK or wrapper runtime.
 | `session_protocol/store.py` | SQLite identity, device, action, source-generation, and delivery metadata. |
 | `session_protocol/uploads.py` | Private uploaded files and opaque references. |
 | `api/server.py` | Host/Origin checks, bearer auth, rate limits, HTTP routes, and WebSocket lifecycle. |
-| `api/runtime.py` | Optional listener, process lock, hook queue, and polling lifecycle. |
+| `api/runtime.py` | Optional HTTP listener and its cleanup. |
 
-`bootstrap.py` owns creation and teardown. The listener starts only when enabled.
+`bootstrap.py` owns creation and teardown. It creates the core even when
+`CCGRAM_API_PORT` is unset and injects the service into the Telegram application.
+Only the HTTP listener depends on that setting.
+
+Protocol session IDs and native target IDs are separate. Telegram creation returns
+`CreatedSession.target_id` for topic claims and multiplexer lookups, alongside
+`CreatedSession.session.id` for protocol operations. A topic must never bind the
+opaque protocol ID as its native window ID.
 The API and core have no imports from Telegram or its handlers. The worktree helpers
 now live in `worktrees.py`, where both session creation and the Telegram directory
 flow can use them without a handler dependency.
@@ -27,25 +38,53 @@ flow can use them without a handler dependency.
 
 History uses only the transcript binding already established by ccgram. It does
 not guess a conversation from the latest transcript in the same directory. Claude,
-Codex, Gemini, and Pi have structured history. Other or unbound transcripts use the
+Codex, Gemini, Pi, and Antigravity have structured history. Other or unbound transcripts use the
 terminal view.
 Persisted terminal identities resolve case-insensitively. Backend calls retain the
 backend-reported spelling. Gemini uses `displayContent` when its primary content
 has no displayable parts, while preserving primary tool results.
 
-The mobile builder reads native transcript records alongside the existing Telegram
-parser. The provider renderers, Telegram message queue, watermark logic, and delivery
-receipts remain the existing implementation. Mobile polling uses no Telegram
-watermark or acknowledgement. A slow remote client can therefore affect only its
-own bounded queue.
+The previous `transcript_parser.py`, provider parse methods, and direct window-send
+wrappers are removed. Provider records have one interpretation: `parse_records` produces structured
+records used by both `build_messages` and Telegram delivery. Telegram rendering
+keeps formatting, tool batching, topics, chunking, edits, and queue retries in the
+adapter. Codex streaming completion and phase survive normalization. Tool results
+can complete calls observed in an earlier delivery batch.
 
-The shared lock covers Telegram text dismissal plus sending, shared Telegram
-message injection, and interactive callbacks. Existing toolbar, recovery, launch,
-and other direct-input paths remain explicit migration exceptions. The architecture
-fitness test records that baseline and rejects newly introduced direct handler send
-sites. Three P0 refactors remain: route all Telegram input through `ActionExecutor`,
-render Telegram from structured parts, and move its receipts into `EventHub`. They are not prerequisites for enabling
-this separate mobile backend, and this change does not claim the full P0 exit gate.
+History and live mobile events read a verified immutable transcript observation.
+Generation tracking and parsing use the same bytes. The reader checks file identity
+and metadata before and after the read and retries a changing source. A final
+source check after publication prevents action preflight from accepting a source
+that changed during observation. An unstable source becomes unavailable and exposes
+no input actions. Snapshot bytes are released rather than retained in the session
+cache.
+
+Telegram delivery uses a separate byte cursor because its receipt checkpoint must
+survive queue failures and restart. This is a delivery policy, not another provider
+parser. The shared event hub dispatches normalized delivery batches to durable
+in-process consumers. Telegram renders them under delivery receipts. Only settled
+receipts advance its checkpoint, with unresolved-tool and skip fences preserved.
+Mobile replay subscriptions keep their bounded queues and never hold Telegram's
+checkpoint. Telegram does not replay the mobile history ring at startup.
+
+All Telegram input goes through the shared executor/backend. Handlers retain
+ownership checks and presentation, then call the in-process adapter. The executor
+owns reservation, binding checks, prompt checks, and the per-target input lock.
+Shell submission is one atomic paste-and-submit operation. Explicit sibling-pane
+controls retain pane ownership checks. The multiplexer does not expose a sibling
+foreground PID. Those controls therefore do not claim the active pane's PID guarantee.
+Explicit sibling-pane controls are available on tmux. Herdr and agterm use their
+active target because they expose no pane inventory through this seam.
+Local creation options preserve Telegram's configured launch/resume behavior.
+Remote creation remains restricted to normal approval mode.
+
+Live Telegram history, including byte-range unread history, delegates to the same
+service observation. Session discovery and archive summaries can read a named
+transcript through the canonical reader. They do not select a live source.
+
+The handler boundary test rejects direct multiplexer input and lifecycle mutations.
+There is no exception baseline or fallback to the former Telegram send helpers.
+APNs, the native iOS UI, and a Telegram-free process remain later work.
 
 ## Contract corrections
 
@@ -54,12 +93,16 @@ The implementation makes these clarifications to the proposed design:
 - Persistent state uses `protocol.sqlite3`, separate from delayed `state.json` saves.
   Full commits reserve an action before any input and preserve an unknown outcome
   after a crash. Device and action storage use the Python standard library.
+  `ActionResult.data` carries optional result metadata, including the created pane
+  for an in-process split retry. `error` is reserved for failures.
 - `bindingVersion` remains a persisted increasing integer. The active pane,
   foreground PID and arguments, source availability, and transcript generation
   also participate in the binding. agterm uses its observed arguments when no PID
   is available. Unknown foreground state exposes no actions.
-- Message revision counts repeated native records and result records. Counting
-  only tool results misses Gemini's repeated message updates.
+- Message revision counts repeated native records and result records. Adding an
+  action correlation also increases the revision, so a client replaces an entry
+  published before send acknowledgement. The association and revision survive
+  restart.
 - `historyGeneration` marks source replacement. Clients clear the old conversation
   cache when it changes. A restart retains the generation. Continuity checks hash
   the full previously observed prefix in a worker thread. Upgrading the earlier
@@ -116,8 +159,12 @@ Regression checks cover PID-less foreground identity, safe resume, pinned tmux
 input, exact question labels, stale hook reuse, and multi-select fallback. They
 also cover per-session source failures, binding races, and transcript rewrites
 beyond the first page. Schema checks validate nonempty history and live
-message frames from all four providers, including internal Codex role filtering.
-Additional regressions cover Gemini display fallback, creation errors and failed
+message frames from Claude, Codex, Gemini, and Pi, including internal Codex role
+filtering. A backend regression checks Antigravity bound history through the core.
+Additional regressions cover concurrent source replacement and equal-length
+rewrites during history, live refresh, and action preflight. Continuously changing
+sources fail closed. They also cover callback lock timeout acknowledgement.
+Other regressions cover Gemini display fallback, creation errors and failed
 post-launch inspection, persisted ID casing, delivery before acknowledgement, and
 terminal resizes without content changes.
 

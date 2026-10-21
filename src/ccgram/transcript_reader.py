@@ -24,6 +24,7 @@ import aiofiles
 import structlog
 
 from .monitor_events import NewMessage, SessionInfo
+from .expandable_quote import format_expandable_quote
 from .window_state_ports import identity_state
 from .monitor_state import MonitorState, TrackedSession
 from .providers import (
@@ -32,6 +33,15 @@ from .providers import (
     registry,
 )
 from .utils import log_throttle_reset, log_throttled, read_cwd_from_jsonl
+from .session_protocol.messages import (
+    SourceEntry,
+    TranscriptBatch,
+    TranscriptRecord,
+    TranscriptParserState,
+    parse_records,
+    read_entries,
+)
+from .tool_format import format_tool_line
 
 if TYPE_CHECKING:
     from .idle_tracker import IdleTracker
@@ -39,6 +49,7 @@ if TYPE_CHECKING:
 logger = structlog.get_logger()
 
 _PathResolveError = (OSError, ValueError)
+_TOOL_RESULT_QUOTE_THRESHOLD = 3
 
 
 class _StartupBoundary(NamedTuple):
@@ -48,7 +59,7 @@ class _StartupBoundary(NamedTuple):
 
 
 class _StableRead(NamedTuple):
-    entries: list[dict]
+    entries: list[SourceEntry]
     stat: Any
     reset_generation: bool
 
@@ -59,6 +70,182 @@ class _GenerationCheck(NamedTuple):
 
 
 _MARKER_BYTES = 128
+
+
+def _transcript_output_text(value: Any) -> str:
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, dict):
+        for key in ("output", "result", "text", "error"):
+            nested = value.get(key)
+            if isinstance(nested, str):
+                return nested.strip()
+        return json.dumps(value, ensure_ascii=False)
+    if value is None:
+        return ""
+    if isinstance(value, list):
+        return "\n".join(
+            str(item.get("text", "")) for item in value if isinstance(item, dict)
+        )
+    return str(value)
+
+
+def _render_tool_result(
+    provider_name: str,
+    tool_name: str | None,
+    summary: str | None,
+    output: Any,
+    failed: bool,
+    diff: dict[str, Any] | None,
+) -> str:
+    text = _transcript_output_text(output)
+    if failed:
+        error = text.splitlines()[0] if text else "Error"
+        prefix = format_tool_line(tool_name or "", summary or "")
+        quote = f"\n{format_expandable_quote(text)}" if "\n" in text else ""
+        return f"{prefix}\n  ⎿  ⚠️ {error}{quote}"
+    if provider_name == "claude" and tool_name == "Edit" and diff:
+        diff_text = diff.get("text")
+        if isinstance(diff_text, str) and diff_text:
+            prefix = format_tool_line(tool_name, summary or "")
+            return (
+                f"{prefix}\n  ⎿  +{diff.get('added', 0)} −{diff.get('removed', 0)}\n"
+                f"{format_expandable_quote(diff_text)}"
+            )
+    if not text:
+        return "Done"
+    lines = text.count("\n") + 1
+    quote = format_expandable_quote(text)
+    if provider_name == "claude":
+        prefix = format_tool_line(tool_name or "", summary or "")
+        return f"{prefix}\n  ⎿  {lines} lines\n{quote}"
+    raw_name = tool_name or ""
+    if provider_name == "codex" and raw_name in {"exec_command", "shell"}:
+        return f"  ⎿  {lines} lines\n{quote}"
+    if provider_name == "pi" and raw_name == "bash":
+        unit = "line" if lines == 1 else "lines"
+        return f"  ⎿  {lines} {unit}\n{quote}"
+    if lines > _TOOL_RESULT_QUOTE_THRESHOLD:
+        return f"  ⎿  {lines} lines\n{quote}"
+    return text
+
+
+def render_protocol_records(
+    session_id: str,
+    provider_name: str,
+    records: tuple[tuple[SourceEntry, TranscriptRecord], ...],
+    state: TranscriptParserState,
+) -> list[NewMessage]:
+    """Render canonical protocol records into Telegram monitor events."""
+    rendered: list[NewMessage] = []
+    tool_aliases = {
+        "apply_patch": "Edit",
+        "request_user_input": "AskUserQuestion",
+    }
+    for _, record in records:
+        role = "assistant" if record.role == "agent" else record.role
+
+        def render_parts(parts: tuple[dict[str, Any], ...]) -> None:
+            for raw_part in parts:
+                part_type = raw_part.get("type")
+                text = raw_part.get("text")
+                content_type = "text"
+                tool_id = raw_part.get("tool_call_id")
+                tool_name = raw_part.get("name")
+                if part_type == "thinking":
+                    content_type = "thinking"
+                    if isinstance(text, str) and text:
+                        text = format_expandable_quote(text)
+                elif part_type == "tool":
+                    content_type = "tool_use"
+                    if isinstance(tool_name, str):
+                        display_name = tool_aliases.get(tool_name, tool_name)
+                        title = raw_part.get("title")
+                        text = format_tool_line(
+                            display_name, title if isinstance(title, str) else ""
+                        )
+                        tool_name = display_name
+                elif part_type == "notice":
+                    text = raw_part.get("text")
+                    if raw_part.get("source") == "local_command":
+                        command = raw_part.get("command")
+                        if isinstance(command, str) and command:
+                            text = (
+                                f"❯ `{command}`\n```\n{text}\n```"
+                                if isinstance(text, str) and "\n" in text
+                                else f"❯ `{command}`\n`{text}`"
+                            )
+                        elif isinstance(text, str) and "\n" in text:
+                            text = f"```\n{text}\n```"
+                        else:
+                            text = f"`{text}`"
+                        content_type = "local_command"
+                if not isinstance(text, str) or not text:
+                    continue
+                rendered.append(
+                    NewMessage(
+                        session_id=session_id,
+                        text=text,
+                        is_complete=record.complete,
+                        content_type=content_type,
+                        phase=record.phase,
+                        tool_use_id=tool_id if isinstance(tool_id, str) else None,
+                        role=role,
+                        tool_name=tool_name if isinstance(tool_name, str) else None,
+                        provider_name=provider_name,
+                    )
+                )
+
+        def render_results() -> None:
+            for tool_id, output, failed in record.results:
+                raw_name = state.tool_names.get(tool_id)
+                output_text = _render_tool_result(
+                    provider_name,
+                    raw_name,
+                    state.tool_summaries.get(tool_id),
+                    output,
+                    failed,
+                    state.tool_diffs.get(tool_id),
+                )
+                rendered.append(
+                    NewMessage(
+                        session_id=session_id,
+                        text=output_text,
+                        is_complete=record.complete,
+                        content_type="tool_result",
+                        phase=record.phase,
+                        tool_use_id=tool_id or None,
+                        role="assistant",
+                        tool_name=tool_aliases.get(raw_name or "", raw_name),
+                        provider_name=provider_name,
+                    )
+                )
+
+        if provider_name == "gemini":
+            render_parts(
+                tuple(part for part in record.parts if part.get("type") == "tool")
+            )
+            render_results()
+            render_parts(
+                tuple(part for part in record.parts if part.get("type") != "tool")
+            )
+        else:
+            render_parts(record.parts)
+            render_results()
+    return rendered
+
+
+def render_transcript_batch(batch: TranscriptBatch) -> tuple[NewMessage, ...]:
+    state = TranscriptParserState(
+        tool_names=dict(batch.tool_names),
+        tool_summaries=dict(batch.tool_summaries),
+        tool_diffs=dict(batch.tool_diffs),
+    )
+    return tuple(
+        render_protocol_records(
+            batch.session_id, batch.provider_name, batch.records, state
+        )
+    )
 
 
 def _prefix_digest(file_path: Path, size: int) -> bytes:
@@ -137,6 +324,8 @@ class TranscriptReader:
         self._idle_tracker = idle_tracker
         self._on_session_retired = on_session_retired
         self._pending_tools: dict[str, dict[str, Any]] = {}
+        self._protocol_parser_states: dict[str, tuple[str, TranscriptParserState]] = {}
+        self._pending_batches: list[TranscriptBatch] = []
         self._file_mtimes: dict[str, float] = {}
         self._file_ctimes: dict[str, int] = self._snapshot_file_ctimes()
         self._file_sizes = self._snapshot_file_sizes()
@@ -430,6 +619,10 @@ class TranscriptReader:
         self._state.remove_session(session_id)
         self._file_mtimes.pop(session_id, None)
         self._pending_tools.pop(session_id, None)
+        self._protocol_parser_states.pop(session_id, None)
+        self._pending_batches = [
+            batch for batch in self._pending_batches if batch.session_id != session_id
+        ]
         self._file_generations.pop(session_id, None)
         self._file_ctimes.pop(session_id, None)
         self._file_sizes.pop(session_id, None)
@@ -487,6 +680,10 @@ class TranscriptReader:
                 self._pending_tools[session_id] = self._pending_tools.pop(
                     old_session_id
                 )
+            if old_session_id in self._protocol_parser_states:
+                self._protocol_parser_states[session_id] = (
+                    self._protocol_parser_states.pop(old_session_id)
+                )
             if old_session_id in self._file_markers:
                 self._file_markers[session_id] = self._file_markers.pop(old_session_id)
             if old_session_id in self._startup_file_boundaries:
@@ -526,10 +723,6 @@ class TranscriptReader:
         except OSError:
             file_size, current_mtime, st = 0, 0.0, None
         initial_offset = file_size
-        if not provider.capabilities.supports_incremental_read:
-            _, initial_offset = await asyncio.to_thread(
-                provider.read_transcript_file, str(file_path), 0
-            )
         tracked = TrackedSession(
             session_id=session_id,
             file_path=str(file_path),
@@ -669,6 +862,8 @@ class TranscriptReader:
             return
         if reset_during_read:
             startup_boundary = None
+        if generation_changed or reset_during_read:
+            self._protocol_parser_states.pop(session_id, None)
 
         # Deliver pre-start unread history, but count activity only when a
         # complete entry advances beyond the startup file-size boundary.
@@ -688,56 +883,60 @@ class TranscriptReader:
             current_map,
             window_id,
             new_messages,
+            byte_checkpoint=self._parse_pos(tracked),
         )
         self._state.update_session(tracked)
 
     def _append_provider_messages(
         self,
         session_id: str,
-        new_entries: list[dict],
+        new_entries: list[SourceEntry],
         provider: Any,
-        current_map: dict[str, dict[str, Any]] | None,
+        _current_map: dict[str, dict[str, Any]] | None,
         window_id: str,
         new_messages: list[NewMessage],
+        *,
+        byte_checkpoint: int = 0,
     ) -> None:
         if window_id and not identity_state.accepts_provider_observation(
             window_id, provider.capabilities.name
         ):
             return
         if provider.capabilities.supports_task_tracking and window_id:
-            provider.apply_task_entries(window_id, session_id, new_entries)
-        session_cwd = next(
-            (
-                details.get("cwd")
-                for details in (current_map or {}).values()
-                if details.get("session_id") == session_id
-            ),
-            None,
-        )
-        agent_messages, remaining = provider.parse_transcript_entries(
-            new_entries,
-            pending_tools=self._pending_tools.get(session_id, {}),
-            cwd=session_cwd,
-        )
-        if remaining:
-            self._pending_tools[session_id] = remaining
-        else:
-            self._pending_tools.pop(session_id, None)
-        new_messages.extend(
-            NewMessage(
-                session_id=session_id,
-                text=entry.text,
-                is_complete=entry.is_complete,
-                content_type=entry.content_type,
-                phase=entry.phase,
-                tool_use_id=entry.tool_use_id,
-                role=entry.role,
-                tool_name=entry.tool_name,
-                provider_name=provider.capabilities.name,
+            provider.apply_task_entries(
+                window_id, session_id, [entry.data for entry in new_entries]
             )
-            for entry in agent_messages
-            if entry.text
+        provider_name = provider.capabilities.name
+        previous = self._protocol_parser_states.get(session_id)
+        if previous is None or previous[0] != provider_name:
+            state = TranscriptParserState()
+        else:
+            state = previous[1]
+        records, state = parse_records(
+            new_entries,
+            provider_name,
+            state,
+            deduplicate_updates=True,
         )
+        self._protocol_parser_states[session_id] = (provider_name, state)
+        batch = TranscriptBatch(
+            session_id=session_id,
+            provider_name=provider_name,
+            records=records,
+            byte_checkpoint=byte_checkpoint,
+            tool_names=tuple(sorted(state.tool_names.items())),
+            tool_summaries=tuple(sorted(state.tool_summaries.items())),
+            tool_diffs=tuple(sorted(state.tool_diffs.items())),
+        )
+        if records:
+            self._pending_batches.append(batch)
+        new_messages.extend(render_transcript_batch(batch))
+
+    def drain_batches(self) -> tuple[TranscriptBatch, ...]:
+        """Return normalized transcript batches accumulated since the last poll."""
+        batches = tuple(self._pending_batches)
+        self._pending_batches.clear()
+        return batches
 
     async def _read_new_lines(
         self,
@@ -745,7 +944,7 @@ class TranscriptReader:
         file_path: Path,
         window_id: str = "",
         provider: Any = None,
-    ) -> list[dict]:
+    ) -> list[SourceEntry]:
         """Read new lines from a session file using byte offset.
 
         ``provider`` may be passed by callers that already resolved it
@@ -754,12 +953,15 @@ class TranscriptReader:
         if provider is None:
             provider = _resolve_provider_for_file(window_id, file_path)
 
+        if provider.capabilities.name == "shell":
+            session.parsed_offset = file_path.stat().st_size
+            return []
         if not provider.capabilities.supports_incremental_read:
             return await self._read_whole_file(session, file_path, provider)
 
-        new_entries: list[dict] = []
+        new_entries: list[SourceEntry] = []
         try:
-            async with aiofiles.open(file_path, "r", encoding="utf-8") as f:
+            async with aiofiles.open(file_path, "rb") as f:
                 await f.seek(0, 2)
                 file_size = await f.tell()
 
@@ -786,7 +988,7 @@ class TranscriptReader:
 
                 if pos > 0:
                     first_byte = await f.read(1)
-                    if first_byte and first_byte != "{":
+                    if first_byte and first_byte != b"{":
                         logger.warning(
                             "Corrupted offset for session %s (byte %d is %r, not '{'). "
                             "Advancing to next line.",
@@ -800,11 +1002,18 @@ class TranscriptReader:
                         await f.seek(pos)
 
                 safe_offset = pos
-                async for line in f:
-                    data = provider.parse_transcript_line(line)
-                    if data:
-                        new_entries.append(data)
-                        safe_offset = await f.tell()
+                remaining = await f.read()
+                relative_offset = 0
+                for line in remaining.splitlines(keepends=True):
+                    if not line.endswith(b"\n"):
+                        break
+                    try:
+                        data = json.loads(line)
+                    except ValueError, UnicodeDecodeError:
+                        data = None
+                    if isinstance(data, dict):
+                        new_entries.append(SourceEntry(pos + relative_offset, data))
+                        safe_offset = pos + relative_offset + len(line)
                     elif line.strip():
                         log_throttled(
                             logger,
@@ -814,7 +1023,8 @@ class TranscriptReader:
                         )
                         break
                     else:
-                        safe_offset = await f.tell()
+                        safe_offset = pos + relative_offset + len(line)
+                    relative_offset += len(line)
 
                 # Parsed position advances in memory only; the persisted
                 # last_byte_offset (delivered watermark) is committed by the
@@ -831,16 +1041,14 @@ class TranscriptReader:
         session: TrackedSession,
         file_path: Path,
         provider: Any,
-    ) -> list[dict]:
-        """Read a whole-file transcript (e.g. Gemini JSON) via the provider."""
+    ) -> list[SourceEntry]:
+        """Read a whole-document transcript through the canonical source reader."""
         try:
-            new_entries, new_offset = await asyncio.to_thread(
-                provider.read_transcript_file,
-                str(file_path),
-                self._parse_pos(session),
+            entries = await asyncio.to_thread(
+                read_entries, file_path, provider.capabilities.name
             )
-            session.parsed_offset = new_offset
-            return new_entries
+            session.parsed_offset = file_path.stat().st_size
+            return entries
         except OSError:
             logger.exception("Error reading transcript file %s", file_path)
             raise

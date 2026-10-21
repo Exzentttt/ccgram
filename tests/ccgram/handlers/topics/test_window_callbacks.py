@@ -44,6 +44,7 @@ def _make_query_update_context(
     context = MagicMock(spec=ContextTypes.DEFAULT_TYPE)
     context.user_data = user_data if user_data is not None else {}
     context.bot = AsyncMock()
+    context.bot_data = {}
     return query, update, context
 
 
@@ -145,6 +146,9 @@ class TestBindWindowCallback:
         with (
             _bind_env(_unbound_window("proj")),
             patch(
+                f"{_MODULE}adapter_for", return_value=MagicMock()
+            ) as mock_adapter_for,
+            patch(
                 f"{_MODULE}send_telegram_to_window",
                 new_callable=AsyncMock,
                 return_value=(True, "ok"),
@@ -152,7 +156,10 @@ class TestBindWindowCallback:
         ):
             await handle_window_callback(query, 100, f"{CB_WIN_BIND}0", update, context)
 
-        mock_send.assert_called_once_with(100, "@5", 42, "hello agent", -100999)
+        adapter = mock_adapter_for.return_value
+        mock_send.assert_called_once_with(
+            100, "@5", 42, "hello agent", -100999, adapter=adapter
+        )
         assert PENDING_THREAD_TEXT not in context.user_data
 
     @pytest.mark.parametrize(
@@ -327,6 +334,9 @@ class TestBindProviderDetection:
                 new_callable=AsyncMock,
             ),
             patch(
+                f"{_MODULE}adapter_for", return_value=MagicMock()
+            ) as mock_adapter_for,
+            patch(
                 f"{_MODULE}_forward_pending_text", new_callable=AsyncMock
             ) as mock_forward,
         ):
@@ -337,6 +347,7 @@ class TestBindProviderDetection:
         assert forward_args[1:] == (100, 42, "@5", "ls -la", "shell")
         assert forward_args[0].bot is context.bot
         assert mock_forward.call_args.kwargs == {
+            "adapter": mock_adapter_for.return_value,
             "is_existing_window": True,
             "chat_id": -100999,
         }
@@ -345,6 +356,7 @@ class TestBindProviderDetection:
 class TestForwardPendingText:
     async def test_existing_shell_window_sends_raw(self) -> None:
         bot = AsyncMock(spec=Bot)
+        adapter = MagicMock()
         with (
             patch(f"{_MODULE}session_manager"),
             patch(
@@ -358,23 +370,41 @@ class TestForwardPendingText:
             ) as mock_send,
         ):
             await _forward_pending_text(
-                bot, 1, 42, "@5", "list files", "shell", is_existing_window=True
+                bot,
+                1,
+                42,
+                "@5",
+                "list files",
+                "shell",
+                adapter=adapter,
+                is_existing_window=True,
             )
 
         mock_shell.assert_not_awaited()
-        mock_send.assert_called_once_with(1, "@5", 42, "list files", None)
+        mock_send.assert_called_once_with(
+            1, "@5", 42, "list files", None, adapter=adapter
+        )
 
     async def test_new_shell_window_routes_through_handler(self) -> None:
         bot = AsyncMock(spec=Bot)
+        adapter = MagicMock()
         with patch(
             "ccgram.handlers.shell.shell_commands.handle_shell_message",
             new_callable=AsyncMock,
         ) as mock_shell:
             await _forward_pending_text(
-                bot, 1, 42, "@5", "list files", "shell", is_existing_window=False
+                bot,
+                1,
+                42,
+                "@5",
+                "list files",
+                "shell",
+                adapter=adapter,
+                is_existing_window=False,
             )
 
         mock_shell.assert_awaited_once()
         args = mock_shell.call_args.args
         assert args[1:] == (1, 42, "@5", "list files")
         assert args[0] is bot
+        assert mock_shell.call_args.kwargs["adapter"] is adapter

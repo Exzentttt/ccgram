@@ -55,7 +55,8 @@
         "level": null
       }
     ],
-    "actionId": null
+    "actionId": null,
+    "phase": null
   },
   "sessionId": "s_00000000000000000000000001",
   "seq": 10

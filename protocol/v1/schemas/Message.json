@@ -36,6 +36,16 @@
     "complete": {
       "type": "boolean"
     },
+    "phase": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
     "actionId": {
       "anyOf": [
         {

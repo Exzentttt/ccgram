@@ -72,7 +72,6 @@ def test_multiplexer_package_is_covered() -> None:
         "ccgram.multiplexer.herdr",
         "ccgram.multiplexer.registry",
         "ccgram.multiplexer.vim_state",
-        "ccgram.multiplexer.window_ops",
     }
     assert expected <= set(_MODULES)
 

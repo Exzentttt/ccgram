@@ -2,7 +2,12 @@ import json
 
 import pytest
 
-from ccgram.session_protocol.messages import SourceEntry, build_messages, read_entries
+from ccgram.session_protocol.messages import (
+    SourceEntry,
+    build_messages,
+    parse_records,
+    read_entries,
+)
 
 
 @pytest.mark.parametrize("kind", ["user", "gemini", "info", "error"])
@@ -131,7 +136,104 @@ def test_codex_no_id_uses_byte_offset_and_ignores_duplicate_event_messages():
             },
         ),
     ]
-    assert [m.id for m in build_messages(entries, "conv", "codex")] == ["conv/o200"]
+    assert [m.id for m in build_messages(entries, "conv", "codex")] == ["conv/o10"]
+
+
+def test_codex_response_item_keeps_the_streamed_message_id_after_reread():
+    streamed = SourceEntry(
+        10,
+        {"type": "event_msg", "payload": {"type": "agent_message", "message": "draft"}},
+    )
+    final = SourceEntry(
+        200,
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "final"}],
+            },
+        },
+    )
+
+    before = build_messages([streamed], "conv", "codex")
+    after = build_messages([streamed, final], "conv", "codex")
+    streamed_records, parser_state = parse_records([streamed], "codex")
+    appended_records, _ = parse_records([final], "codex", parser_state)
+
+    assert before[0].id == after[0].id == "conv/o10"
+    assert after[0].revision == 2
+    assert after[0].parts[0].text == "final"
+    assert streamed_records[0][1].key == appended_records[0][1].key == "o10"
+
+
+def test_codex_response_then_matching_event_is_a_mirror_not_a_new_message():
+    entries = [
+        SourceEntry(
+            10,
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "id": "native-1",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "done"}],
+                },
+            },
+        ),
+        SourceEntry(
+            200,
+            {
+                "type": "event_msg",
+                "payload": {"type": "agent_message", "message": "done"},
+            },
+        ),
+    ]
+
+    messages = build_messages(entries, "conv", "codex")
+
+    assert [(message.id, message.parts[0].text) for message in messages] == [
+        ("conv/native-1", "done")
+    ]
+
+
+def test_codex_same_text_in_later_user_turn_keeps_distinct_native_ids():
+    def response(offset: int, message_id: str, role: str, text: str) -> SourceEntry:
+        return SourceEntry(
+            offset,
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "id": message_id,
+                    "role": role,
+                    "content": [
+                        {
+                            "type": "input_text" if role == "user" else "output_text",
+                            "text": text,
+                        }
+                    ],
+                },
+            },
+        )
+
+    messages = build_messages(
+        [
+            response(0, "u1", "user", "first"),
+            response(100, "a1", "assistant", "Done"),
+            response(200, "u2", "user", "second"),
+            response(300, "a2", "assistant", "Done"),
+        ],
+        "conv",
+        "codex",
+    )
+
+    assert [message.id for message in messages] == [
+        "conv/u1",
+        "conv/a1",
+        "conv/u2",
+        "conv/a2",
+    ]
 
 
 def test_tool_pairing_updates_original_message_across_page_boundary():
@@ -197,3 +299,81 @@ def test_reader_uses_utf8_byte_offsets_and_retries_partial_line(tmp_path):
     with path.open("ab") as file:
         file.write(b"\n")
     assert [e.offset for e in read_entries(path)] == [0, len(first)]
+
+
+def test_read_entries_accepts_the_verified_snapshot_bytes(tmp_path):
+    first = b'{"type":"user","message":{"role":"user","content":"hi"}}\n'
+    second = b'{"type":"assistant","message":{"role":"assistant","content":"ok"}}\n'
+    path = tmp_path / "transcript.jsonl"
+    path.write_bytes(first + second)
+
+    from_path = read_entries(path)
+    from_snapshot = read_entries(first + second)
+
+    assert from_snapshot == from_path
+    assert [entry.offset for entry in from_snapshot] == [0, len(first)]
+
+
+def test_read_entries_normalizes_gemini_json_snapshot_for_history_and_live(tmp_path):
+    path = tmp_path / "session.json"
+    path.write_text(
+        json.dumps(
+            {
+                "messages": [
+                    {"id": "u1", "type": "user", "content": "question"},
+                    {
+                        "id": "a1",
+                        "type": "gemini",
+                        "content": "answer",
+                        "toolCalls": [
+                            {
+                                "id": "tool1",
+                                "name": "read_file",
+                                "args": {"path": "README.md"},
+                            }
+                        ],
+                    },
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    entries = read_entries(path, "gemini")
+    history = build_messages(entries, "conv", "gemini")
+    live, _ = parse_records(entries, "gemini", deduplicate_updates=True)
+    assert [message.id for message in history] == ["conv/u1", "conv/a1"]
+    assert history[0].parts[0].text == "question"
+    assert history[1].parts[1].tool_call_id == "tool1"
+    assert [entry.offset for entry, _ in live] == [0, 1]
+
+
+def test_codex_event_stream_and_task_complete_share_a_replaceable_message():
+    entries = [
+        SourceEntry(
+            10,
+            {
+                "type": "event_msg",
+                "payload": {"type": "agent_message", "message": "working"},
+            },
+        ),
+        SourceEntry(
+            30,
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "task_complete",
+                    "last_agent_message": "working and done",
+                },
+            },
+        ),
+    ]
+
+    messages = build_messages(entries, "conv", "codex")
+
+    assert len(messages) == 1
+    assert messages[0].id == "conv/o10"
+    assert messages[0].revision == 2
+    assert messages[0].parts[0].text == "working and done"
+    assert messages[0].complete is True
+    assert messages[0].phase == "final_answer"

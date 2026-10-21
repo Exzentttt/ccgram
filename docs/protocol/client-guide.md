@@ -68,13 +68,19 @@ do not replace the subscribe-before-history merge rule.
 that session's currently bound conversation. Cursors are opaque, scoped to both
 conversation and transcript generation, and invalid after source replacement.
 
-Native transcript entry IDs are retained. Missing native IDs use UTF-8 byte offsets.
+Native transcript entry IDs are retained when first observed. Missing native IDs
+use UTF-8 byte offsets. A streamed Codex message keeps its first visible ID when
+the final response arrives.
 A tool result replaces the tool part in its original message and increases the
-revision. Result-only entries make no separate bubble. Tool pairing happens before
+revision. Adding `actionId` after send acknowledgement also advances the revision.
+Result-only entries make no separate bubble. Tool pairing happens before
 pagination, including results beyond a page boundary. Repeated Gemini entry IDs
 produce higher revisions when the provider appends another version of the record.
+`complete` reflects streaming completion. Optional `phase` preserves provider phase
+metadata, such as Codex `final_answer`. Clients can ignore phases they do not know.
 
-A transcript replacement or truncation increments persisted `historyGeneration`.
+Generation checks and parsing use the same verified source bytes. A transcript
+replacement or truncation increments persisted `historyGeneration`.
 Nonzero generations also change message IDs. On a changed `conversation.id` or
 `conversation.historyGeneration`, clear that conversation's cached messages and
 load its history again. `bindingVersion` also increases, invalidating queued input.

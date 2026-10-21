@@ -12,6 +12,7 @@ from telegram.error import RetryAfter
 from ... import window_query
 from ...multiplexer.base import canonical_window_id
 from ...multiplexer.reconciliation import window_presence
+from ...session_protocol.telegram import TelegramSessionAdapter
 from ...providers import registry as provider_registry
 from ...session import session_manager
 from ...telegram_client import TelegramClient
@@ -264,7 +265,9 @@ async def _commit_present_topic(router: ThreadRouter, claim: TopicProvisioning) 
         return "bound" if committed else "changed"
 
 
-async def _hookless_agent_has_not_started(claim: TopicProvisioning) -> bool:
+async def _hookless_agent_has_not_started(
+    claim: TopicProvisioning, adapter: TelegramSessionAdapter
+) -> bool:
     """True while a hookless agent's pane has not taken over from its shell.
 
     Committing here binds the topic while the pane still runs the shell the
@@ -284,7 +287,7 @@ async def _hookless_agent_has_not_started(claim: TopicProvisioning) -> bool:
     # An unanswerable probe (backend outage, no pane command) also holds:
     # committing on a guess is what the guard exists to prevent, and the
     # grace bound keeps a persistent outage from quarantining forever.
-    return await agent_process_started(claim.target_id) is not True
+    return await agent_process_started(claim.target_id, adapter) is not True
 
 
 async def _recover_present_topic(
@@ -292,6 +295,7 @@ async def _recover_present_topic(
     router: ThreadRouter,
     backend: object | None,
     claim: TopicProvisioning,
+    adapter: TelegramSessionAdapter,
 ) -> str:
     assert claim.target_id is not None and claim.thread_id is not None
     try:
@@ -310,7 +314,7 @@ async def _recover_present_topic(
         return "unresolved"
     if topic_exists:
         if (
-            await _hookless_agent_has_not_started(claim)
+            await _hookless_agent_has_not_started(claim, adapter)
             and time.time() - claim.created_at < HOOKLESS_START_GRACE_S
         ):
             return "unresolved"
@@ -395,6 +399,7 @@ async def _recover_known_topic(
     router: ThreadRouter,
     backend: object | None,
     claim: TopicProvisioning,
+    adapter: TelegramSessionAdapter,
 ) -> str:
     assert claim.target_id is not None and claim.thread_id is not None
     target_id = window_query.resolve_window_alias(claim.target_id) or claim.target_id
@@ -407,7 +412,7 @@ async def _recover_known_topic(
     if presence is None:
         return "unresolved"
     if presence:
-        return await _recover_present_topic(client, router, backend, claim)
+        return await _recover_present_topic(client, router, backend, claim, adapter)
     return await _recover_absent_target(client, router, target_id, claim)
 
 
@@ -416,10 +421,11 @@ async def _recover_claim(
     router: ThreadRouter,
     backend: object | None,
     claim: TopicProvisioning,
+    adapter: TelegramSessionAdapter,
 ) -> str:
     """Resolve one unowned claim according to its durable state."""
     if claim.thread_id is not None:
-        return await _recover_known_topic(client, router, backend, claim)
+        return await _recover_known_topic(client, router, backend, claim, adapter)
     if claim.retry_thread_id is None:
         return "unresolved"
     if claim.uncertain:
@@ -434,6 +440,7 @@ async def recover_topic_provisioning(
     *,
     router: ThreadRouter = thread_router,
     backend: object | None = None,
+    adapter: TelegramSessionAdapter,
     limit: int = 20,
 ) -> dict[str, int]:
     """Resolve abandoned claims from current evidence, never from their age."""
@@ -461,7 +468,7 @@ async def recover_topic_provisioning(
             outcomes["deferred"] += 1
             continue
         probes += 1
-        outcome = await _recover_claim(client, router, backend, claim)
+        outcome = await _recover_claim(client, router, backend, claim, adapter)
         outcomes[outcome] += 1
         if outcome == "rate_limited":
             break

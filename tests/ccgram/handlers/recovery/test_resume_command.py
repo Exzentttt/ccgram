@@ -807,6 +807,7 @@ def pick_env():
         patch(f"{_RC}.safe_edit", new_callable=AsyncMock) as edit,
         patch(f"{_RC}.get_thread_id", return_value=42),
         patch(f"{_RC}.Path") as path,
+        patch(f"{_RC}.adapter_for") as adapter_for,
     ):
         router.get_window_for_thread.return_value = None
         router.resolve_chat_id.return_value = -100999
@@ -814,12 +815,22 @@ def pick_env():
             claim_id="claim-1"
         )
         router.commit_topic_provisioning.return_value = True
-        tmux.create_window = AsyncMock(
-            return_value=(True, "Window created", "project", "@5")
+        adapter = MagicMock()
+        adapter.create = AsyncMock(
+            return_value=SimpleNamespace(target_id="@5", title="project")
         )
+        adapter.close = AsyncMock(return_value=(True, "Closed"))
+        adapter_for.return_value = adapter
         sync.wait_for_session_map_entry = AsyncMock()
         path.return_value.is_dir.return_value = True
-        yield SimpleNamespace(tmux=tmux, router=router, sync=sync, edit=edit, path=path)
+        yield SimpleNamespace(
+            tmux=tmux,
+            adapter=adapter,
+            router=router,
+            sync=sync,
+            edit=edit,
+            path=path,
+        )
 
 
 async def _pick(
@@ -857,10 +868,10 @@ class TestResumePickCallback:
                 ctx,
             )
 
-        pick_env.tmux.create_window.assert_called_once_with(
-            "/tmp/proj",
-            agent_args=f"--resume {expected_id}",
-            launch_command="claude",
+        pick_env.adapter.create.assert_awaited_once_with(
+            {"provider": "claude", "directory": "/tmp/proj"},
+            approval_mode="normal",
+            resume_id=expected_id,
         )
         pick_env.sync.wait_for_session_map_entry.assert_awaited_once_with(
             "@5", resolve_window_id=resolve_alias
@@ -937,8 +948,10 @@ class TestResumePickCallback:
         assert RESUME_SESSIONS not in ctx.user_data
 
     async def test_pick_reports_window_creation_failure(self, pick_env) -> None:
-        pick_env.tmux.create_window = AsyncMock(
-            return_value=(False, "Tmux error", None, None)
+        from ccgram.session_protocol.models import ProtocolError
+
+        pick_env.adapter.create = AsyncMock(
+            side_effect=ProtocolError(400, "invalid_request", "Tmux error")
         )
         ctx = _make_context()
 
@@ -950,8 +963,12 @@ class TestResumePickCallback:
 
     async def test_failed_replacement_keeps_old_binding(self, pick_env) -> None:
         pick_env.router.get_window_for_thread.return_value = "@0"
-        pick_env.tmux.create_window = AsyncMock(
-            return_value=(False, "Directory does not exist: /gone", "", "")
+        from ccgram.session_protocol.models import ProtocolError
+
+        pick_env.adapter.create = AsyncMock(
+            side_effect=ProtocolError(
+                400, "invalid_request", "Directory does not exist: /gone"
+            )
         )
 
         query = await _pick(0, [_session()], _make_context())
@@ -980,7 +997,7 @@ class TestResumePickCallback:
             pick_env.sync.wait_for_session_map_entry = AsyncMock(return_value=False)
             query = await _pick(0, [_session()], _make_context())
 
-        pick_env.tmux.kill_window.assert_not_called()
+        pick_env.adapter.close.assert_not_awaited()
         pick_env.router.mark_provisioning_uncertain.assert_called_once_with("claim-1")
         pick_env.router.unbind_thread.assert_not_called()
         assert "still starting" in pick_env.edit.call_args.args[1]
@@ -1112,21 +1129,21 @@ class TestResumePerWindowProvider:
     async def test_pick_uses_provider_recorded_on_the_session(
         self, mock_gpw: MagicMock, pick_env
     ) -> None:
-        mock_gpw.return_value.make_launch_args.return_value = "resume sess-1"
+        mock_gpw.return_value.capabilities.name = "codex"
 
         await _pick(0, [_session("sess-1", provider_name="codex")], _make_context())
 
         mock_gpw.assert_called_once_with("", provider_name="codex")
+        assert pick_env.adapter.create.call_args.args[0]["provider"] == "codex"
 
     @patch(f"{_RC}.get_provider")
     async def test_pick_falls_back_to_global_provider_when_unbound(
         self, mock_gp: MagicMock, pick_env
     ) -> None:
-        mock_gp.return_value.make_launch_args.return_value = "--resume sess-1"
+        mock_gp.return_value.capabilities.name = "claude"
 
         await _pick(0, [_session("sess-1")], _make_context())
 
         mock_gp.assert_called_once()
-        mock_gp.return_value.make_launch_args.assert_called_once_with(
-            resume_id="sess-1"
-        )
+        assert pick_env.adapter.create.call_args.args[0]["provider"] == "claude"
+        assert pick_env.adapter.create.call_args.kwargs["resume_id"] == "sess-1"

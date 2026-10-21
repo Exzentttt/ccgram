@@ -9,11 +9,11 @@ from uuid import uuid4
 
 import pytest
 
-from ccgram.api.runtime import ProtocolRuntime
 from ccgram.providers.base import HookEvent
 from ccgram.session_protocol.backend import Prompt
 from ccgram.session_protocol.models import Action
 from ccgram.session_protocol.requests import PendingHook
+from ccgram.session_protocol.runtime import ProtocolRuntime
 
 
 @pytest.mark.parametrize("kind", ["request.respond", "message.send"])
@@ -95,7 +95,7 @@ async def test_pending_hooks_release_only_after_transcript_processing(
         json.dumps(tool_input, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
     monkeypatch.setattr(
-        "ccgram.api.runtime.asyncio.sleep",
+        "ccgram.session_protocol.runtime.asyncio.sleep",
         AsyncMock(side_effect=asyncio.CancelledError),
     )
     with TemporaryFile() as lock:
@@ -130,7 +130,7 @@ async def test_lost_hook_processing_keeps_session_blocked(
     backend.target = replace(backend.target, transcript=path)
     session = (await service.list_sessions())[0]
     monkeypatch.setattr(
-        "ccgram.api.runtime.asyncio.sleep",
+        "ccgram.session_protocol.runtime.asyncio.sleep",
         AsyncMock(side_effect=asyncio.CancelledError),
     )
     with TemporaryFile() as lock:
@@ -146,7 +146,7 @@ async def test_lost_hook_processing_keeps_session_blocked(
             runtime.observe_hook(event)
         if failure == "processing":
 
-            def unavailable(path):
+            def unavailable(path, provider):
                 raise OSError("transcript unavailable")
 
             monkeypatch.setattr(

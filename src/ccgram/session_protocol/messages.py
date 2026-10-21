@@ -7,12 +7,30 @@ identical IDs/revisions after a restart. Tool pairing precedes pagination.
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, replace
+import re
+import difflib
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from datetime import UTC, datetime
 from typing import Any
 
 from .models import Message, Part
+
+_ANTIGRAVITY_METADATA_RE = re.compile(
+    r"<(ADDITIONAL_METADATA|USER_SETTINGS_CHANGE|USER_INFORMATION|USER_RULES|SKILLS|PLUGINS|SUBAGENTS|MESSAGING|CONVERSATION_TRANSCRIPT|ARTIFACTS|SLASH_COMMANDS|GUIDELINES|COMMUNICATION_STYLE)>[\s\S]*?</\1>",
+    re.IGNORECASE,
+)
+_ANTIGRAVITY_USER_REQUEST_RE = re.compile(r"</?USER_REQUEST>", re.IGNORECASE)
+_CLAUDE_SYSTEM_TAG_RE = re.compile(
+    r"<(?:bash-input|bash-stdout|bash-stderr|local-command-caveat|system-reminder|"
+    r"teammate-message|agent-message|cross-session-message|task-notification)\b",
+    re.IGNORECASE,
+)
+_CLAUDE_COMMAND_NAME_RE = re.compile(r"<command-name>(.*?)</command-name>", re.DOTALL)
+_CLAUDE_LOCAL_STDOUT_RE = re.compile(
+    r"<local-command-stdout>(.*?)</local-command-stdout>", re.DOTALL
+)
+_ANSI_SGR_RE = re.compile(r"\x1b\[[0-9;]*m")
 
 
 @dataclass(frozen=True, slots=True)
@@ -22,29 +40,51 @@ class SourceEntry:
 
 
 @dataclass(frozen=True, slots=True)
-class _Record:
+class TranscriptRecord:
     key: str
     role: str
     time: str | None
     parts: tuple[dict[str, Any], ...]
     results: tuple[tuple[str, Any, bool], ...] = ()
+    complete: bool = True
+    phase: str | None = None
 
 
-def read_entries(path: Path) -> list[SourceEntry]:
-    """Ignore an unfinished final JSONL line; the next poll will read it."""
+def read_entries(
+    source: Path | bytes, provider: str | None = None
+) -> list[SourceEntry]:
+    """Parse complete JSONL records from a path or immutable byte snapshot.
+
+    Byte offsets always refer to the original transcript. An unfinished final
+    line is ignored; the next poll will read it after it is completed.
+    """
+    raw = source.read_bytes() if isinstance(source, Path) else source
     result = []
-    with path.open("rb") as source:
-        while True:
-            offset = source.tell()
-            line = source.readline()
-            if not line or not line.endswith(b"\n"):
-                break
-            try:
-                data = json.loads(line)
-            except ValueError, UnicodeDecodeError:
-                continue
-            if isinstance(data, dict):
-                result.append(SourceEntry(offset, data))
+    if provider == "gemini":
+        try:
+            document = json.loads(raw)
+        except ValueError, UnicodeDecodeError:
+            document = None
+        if isinstance(document, dict) and isinstance(document.get("messages"), list):
+            # Gemini stores one JSON snapshot rather than JSONL. Its native
+            # message id is the stable identity; the array index is the
+            # fallback source ordinal for records without an id.
+            return [
+                SourceEntry(index, entry)
+                for index, entry in enumerate(document["messages"])
+                if isinstance(entry, dict)
+            ]
+    offset = 0
+    for line in raw.splitlines(keepends=True):
+        if not line.endswith(b"\n"):
+            break
+        try:
+            data = json.loads(line)
+        except ValueError, UnicodeDecodeError:
+            data = None
+        if isinstance(data, dict):
+            result.append(SourceEntry(offset, data))
+        offset += len(line)
     return result
 
 
@@ -89,6 +129,25 @@ def _tool(call_id: str, name: str, arguments: Any) -> dict[str, Any]:
             ),
             name,
         )
+    diff = None
+    if name in {"Edit", "NotebookEdit"} and isinstance(arguments, dict):
+        old = arguments.get("old_string")
+        new = arguments.get("new_string")
+        if isinstance(old, str) and isinstance(new, str) and old and new:
+            lines = list(
+                difflib.unified_diff(
+                    old.splitlines(keepends=True),
+                    new.splitlines(keepends=True),
+                    lineterm="",
+                )
+            )[2:]
+            diff_text = "\n".join(lines)
+            if diff_text:
+                diff = {
+                    "text": diff_text,
+                    "added": sum(line.startswith("+") for line in lines),
+                    "removed": sum(line.startswith("-") for line in lines),
+                }
     return {
         "type": "tool",
         "tool_call_id": call_id,
@@ -97,6 +156,7 @@ def _tool(call_id: str, name: str, arguments: Any) -> dict[str, Any]:
         "status": "running",
         "title": title,
         "input": arguments,
+        "diff": diff,
     }
 
 
@@ -148,35 +208,74 @@ def _content(content: Any) -> tuple[list[dict[str, Any]], list[tuple[str, Any, b
     return parts, results
 
 
-def _codex(entry: SourceEntry) -> _Record | None:
+@dataclass(slots=True)
+class _CodexState:
+    stream_key: str | None = None
+    stream_text: str | None = None
+    last_key: str | None = None
+    last_text: str | None = None
+
+
+@dataclass(slots=True)
+class TranscriptParserState:
+    """Cross-batch state needed only for provider update/dedup semantics."""
+
+    codex: _CodexState = field(default_factory=_CodexState)
+    gemini_message_ids: set[str] = field(default_factory=set)
+    gemini_tool_call_ids: set[str] = field(default_factory=set)
+    gemini_result_signatures: set[tuple[str, str, bool]] = field(default_factory=set)
+    tool_names: dict[str, str] = field(default_factory=dict)
+    tool_summaries: dict[str, str] = field(default_factory=dict)
+    tool_diffs: dict[str, dict[str, Any]] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
+class TranscriptBatch:
+    """Normalized live records and the source checkpoint that owns them."""
+
+    session_id: str
+    provider_name: str
+    records: tuple[tuple[SourceEntry, TranscriptRecord], ...]
+    byte_checkpoint: int
+    tool_names: tuple[tuple[str, str], ...] = ()
+    tool_summaries: tuple[tuple[str, str], ...] = ()
+    tool_diffs: tuple[tuple[str, dict[str, Any]], ...] = ()
+
+
+def _codex(entry: SourceEntry, state: _CodexState) -> TranscriptRecord | None:
     raw = entry.data
     if raw.get("type") not in ("response_item", "input_item"):
         return None
     data = raw.get("payload")
     if not isinstance(data, dict):
         return None
+    timestamp = raw.get("timestamp")
     key = str(data.get("id") or f"o{entry.offset}")
     kind = data.get("type")
+    if raw.get("type") == "input_item" and data.get("role") == "user":
+        return _codex_message(data, key, timestamp, state)
     if not isinstance(kind, str):
         return None
-    timestamp = raw.get("timestamp")
     if kind == "message" and data.get("role") in {"user", "assistant", "system"}:
-        parts, results = _content(data.get("content"))
-        role = (
-            "agent"
-            if data.get("role") == "assistant"
-            else str(data.get("role", "system"))
-        )
-        return _Record(key, role, timestamp, tuple(parts), tuple(results))
+        return _codex_message(data, key, timestamp, state)
+    return _codex_other_item(data, key, timestamp, state)
+
+
+def _codex_other_item(
+    data: dict[str, Any], key: str, timestamp: Any, state: _CodexState
+) -> TranscriptRecord | None:
+    kind = data.get("type")
     if kind in {"function_call", "custom_tool_call"}:
         part = _tool(
             str(data.get("call_id", "")),
             str(data.get("name", "unknown")),
             data.get("arguments", data.get("input", {})),
         )
-        return _Record(key, "agent", timestamp, (part,))
+        state.stream_key = None
+        state.stream_text = None
+        return TranscriptRecord(key, "agent", timestamp, (part,))
     if kind in {"function_call_output", "custom_tool_call_output"}:
-        return _Record(
+        return TranscriptRecord(
             key,
             "agent",
             timestamp,
@@ -184,7 +283,7 @@ def _codex(entry: SourceEntry) -> _Record | None:
             ((str(data.get("call_id", "")), data.get("output"), False),),
         )
     if kind == "reasoning":
-        return _Record(
+        return TranscriptRecord(
             key,
             "agent",
             timestamp,
@@ -194,6 +293,81 @@ def _codex(entry: SourceEntry) -> _Record | None:
                     "text": _text(data.get("summary", data.get("content"))),
                 },
             ),
+        )
+    return None
+
+
+def _codex_message(
+    data: dict[str, Any], key: str, timestamp: Any, state: _CodexState
+) -> TranscriptRecord:
+    parts, results = _content(data.get("content"))
+    role = "agent" if data.get("role") == "assistant" else str(data.get("role"))
+    if role != "agent":
+        state.stream_key = None
+        state.stream_text = None
+        state.last_key = None
+        state.last_text = None
+    text = "\n".join(str(part["text"]) for part in parts if part.get("type") == "text")
+    if role == "agent" and text:
+        if state.stream_key:
+            key = state.stream_key
+        state.stream_key = None
+        state.stream_text = None
+        state.last_key = key
+        state.last_text = text
+    phase = data.get("phase")
+    return TranscriptRecord(
+        key,
+        role,
+        timestamp if isinstance(timestamp, str) else None,
+        tuple(parts),
+        tuple(results),
+        phase=phase if isinstance(phase, str) and phase else None,
+    )
+
+
+def _codex_event(entry: SourceEntry, state: _CodexState) -> TranscriptRecord | None:
+    raw = entry.data
+    payload = raw.get("payload")
+    if not isinstance(payload, dict):
+        return None
+    timestamp = raw.get("timestamp")
+    kind = payload.get("type")
+    if kind == "agent_message":
+        text = payload.get("message")
+        if not isinstance(text, str) or not text:
+            return None
+        if not state.stream_key and text == state.last_text:
+            return None
+        key = state.stream_key or f"o{entry.offset}"
+        state.stream_key = key
+        state.stream_text = text
+        state.last_key = key
+        state.last_text = text
+        return TranscriptRecord(
+            key,
+            "agent",
+            timestamp,
+            ({"type": "text", "text": text},),
+            complete=False,
+        )
+    if kind == "task_complete":
+        text = payload.get("last_agent_message")
+        if not isinstance(text, str) or not text:
+            state.stream_key = None
+            state.stream_text = None
+            return None
+        key = state.stream_key or state.last_key or f"o{entry.offset}"
+        state.stream_key = None
+        state.stream_text = None
+        state.last_key = key
+        state.last_text = text
+        return TranscriptRecord(
+            key,
+            "agent",
+            timestamp,
+            ({"type": "text", "text": text},),
+            phase="final_answer",
         )
     return None
 
@@ -217,7 +391,7 @@ def _gemini_output(call: dict[str, Any]) -> Any:
     return "\n".join(responses)
 
 
-def _gemini(entry: SourceEntry) -> _Record | None:
+def _gemini(entry: SourceEntry) -> TranscriptRecord | None:
     data = entry.data
     kind = data.get("type")
     if not isinstance(kind, str):
@@ -256,7 +430,7 @@ def _gemini(entry: SourceEntry) -> _Record | None:
         output = _gemini_output(call)
         if output is not None:
             results.append((call_id, output, call.get("status") == "error"))
-    return _Record(
+    return TranscriptRecord(
         key,
         "user" if kind == "user" else "agent",
         data.get("timestamp"),
@@ -265,7 +439,7 @@ def _gemini(entry: SourceEntry) -> _Record | None:
     )
 
 
-def _chat(entry: SourceEntry, provider: str) -> _Record | None:
+def _chat(entry: SourceEntry, provider: str) -> TranscriptRecord | None:
     data = entry.data
     msg = data.get("message")
     if not isinstance(msg, dict):
@@ -278,7 +452,7 @@ def _chat(entry: SourceEntry, provider: str) -> _Record | None:
     if not isinstance(role, str):
         return None
     if role == "toolResult":
-        return _Record(
+        return TranscriptRecord(
             key,
             "agent",
             timestamp,
@@ -294,7 +468,7 @@ def _chat(entry: SourceEntry, provider: str) -> _Record | None:
     if role not in {"user", "assistant", "system"}:
         return None
     parts, results = _content(msg.get("content"))
-    return _Record(
+    return TranscriptRecord(
         key,
         "agent" if role == "assistant" else role,
         timestamp,
@@ -303,8 +477,269 @@ def _chat(entry: SourceEntry, provider: str) -> _Record | None:
     )
 
 
+def _claude(entry: SourceEntry) -> TranscriptRecord | None:
+    record = _chat(entry, "claude")
+    if record is None:
+        return None
+    data = entry.data
+    message = data.get("message")
+    if not isinstance(message, dict):
+        return record
+    if record.role == "user":
+        content = message.get("content")
+        blocks = content if isinstance(content, list) else []
+        if isinstance(content, str):
+            blocks = [{"type": "text", "text": content}]
+        text = "\n".join(
+            part["text"]
+            for part in blocks
+            if isinstance(part, dict)
+            and part.get("type") == "text"
+            and isinstance(part.get("text"), str)
+        )
+        command = _CLAUDE_COMMAND_NAME_RE.search(text)
+        stdout = _CLAUDE_LOCAL_STDOUT_RE.search(text)
+        if command:
+            if stdout is None:
+                return None
+            return replace(
+                record,
+                role="agent",
+                parts=(
+                    {
+                        "type": "notice",
+                        "level": "info",
+                        "text": stdout.group(1).strip(),
+                        "source": "local_command",
+                        "command": command.group(1).strip(),
+                    },
+                ),
+                results=(),
+            )
+    parts = []
+    for part in record.parts:
+        text = part.get("text")
+        if isinstance(text, str):
+            text = _ANSI_SGR_RE.sub("", text).strip()
+            if record.role == "user" and _CLAUDE_SYSTEM_TAG_RE.search(text):
+                continue
+            part = {**part, "text": text}
+        parts.append(part)
+    return replace(record, parts=tuple(parts))
+
+
+def _antigravity_role(data: dict[str, Any], kind: str) -> str | None:
+    role = data.get("role")
+    if role not in {"user", "assistant"}:
+        role_map = {
+            "user": "user",
+            "user_input": "user",
+            "user_explicit": "user",
+            "user_implicit": "user",
+            "planner_response": "assistant",
+            "model": "assistant",
+            "assistant": "assistant",
+            "info": "assistant",
+            "error": "assistant",
+        }
+        role = role_map.get(kind.lower()) or role_map.get(
+            str(data.get("source", "")).lower()
+        )
+    return role if isinstance(role, str) else None
+
+
+def _antigravity_clean_user_parts(parts: list[dict[str, Any]]) -> None:
+    for part in parts:
+        text = part.get("text")
+        if isinstance(text, str):
+            text = _ANTIGRAVITY_METADATA_RE.sub("", text)
+            part["text"] = _ANTIGRAVITY_USER_REQUEST_RE.sub("", text).strip()
+
+
+def _antigravity_tool_parts(data: dict[str, Any]) -> list[dict[str, Any]]:
+    calls = data.get("tool_calls")
+    if not isinstance(calls, list):
+        return []
+    parts = []
+    for call in calls:
+        if not isinstance(call, dict):
+            continue
+        call_id = str(
+            call.get("id") or call.get("tool_call_id") or call.get("name") or ""
+        )
+        parts.append(
+            _tool(call_id, str(call.get("name") or "unknown"), call.get("input", {}))
+        )
+    return parts
+
+
+def _antigravity(entry: SourceEntry) -> TranscriptRecord | None:
+    data = entry.data
+    kind = str(data.get("type", "")).upper()
+    role = _antigravity_role(data, kind)
+    timestamp = data.get("created_at") or data.get("timestamp")
+    if not isinstance(timestamp, str):
+        timestamp = None
+    key = str(data.get("id") or data.get("uuid") or f"o{entry.offset}")
+    parts, results = _content(data.get("content", ""))
+    if role == "user":
+        _antigravity_clean_user_parts(parts)
+    parts.extend(_antigravity_tool_parts(data))
+    if kind in {"RUN_COMMAND", "TOOL_RESULT", "EXECUTE_RESULT", "RESULT"}:
+        call_id = str(
+            data.get("tool_call_id") or data.get("id") or data.get("tool_name") or ""
+        )
+        if data.get("content") is not None:
+            results.append((call_id, data.get("content"), bool(data.get("is_error"))))
+        role = "agent"
+        parts = []
+    if role is None:
+        return None
+    if not parts and not results:
+        return None
+    return TranscriptRecord(
+        key,
+        "agent" if role == "assistant" else role,
+        timestamp,
+        tuple(parts),
+        tuple(results),
+    )
+
+
+def parse_records(
+    entries: list[SourceEntry],
+    provider: str,
+    state: TranscriptParserState | None = None,
+    *,
+    deduplicate_updates: bool = False,
+) -> tuple[tuple[tuple[SourceEntry, TranscriptRecord], ...], TranscriptParserState]:
+    """Interpret provider records once for both protocol history and live adapters.
+
+    The returned source entry keeps the byte/index checkpoint beside each
+    normalized record. Live consumers may pass state across polls to suppress
+    repeated Gemini snapshot records and to keep Codex stream identity stable.
+    """
+    parser_state = state or TranscriptParserState()
+    records: list[tuple[SourceEntry, TranscriptRecord]] = []
+    for entry in entries:
+        record = (
+            _codex_event(entry, parser_state.codex)
+            if provider == "codex" and entry.data.get("type") == "event_msg"
+            else _codex(entry, parser_state.codex)
+            if provider == "codex"
+            else _gemini(entry)
+            if provider == "gemini"
+            else _antigravity(entry)
+            if provider == "antigravity"
+            else _claude(entry)
+            if provider == "claude"
+            else _chat(entry, provider)
+        )
+        if record is None:
+            continue
+        if deduplicate_updates and provider == "gemini":
+            record = _deduplicate_gemini_record(record, entry, parser_state)
+            if record is None:
+                continue
+        if record.parts:
+            for part in record.parts:
+                call_id = part.get("tool_call_id")
+                name = part.get("name")
+                summary = part.get("title")
+                if isinstance(call_id, str) and call_id and isinstance(name, str):
+                    parser_state.tool_names[call_id] = name
+                    if isinstance(summary, str):
+                        parser_state.tool_summaries[call_id] = summary
+                    diff = part.get("diff")
+                    if isinstance(diff, dict):
+                        parser_state.tool_diffs[call_id] = diff
+        records.append((entry, record))
+    return tuple(records), parser_state
+
+
+def _deduplicate_gemini_record(
+    record: TranscriptRecord, entry: SourceEntry, state: TranscriptParserState
+) -> TranscriptRecord | None:
+    parts = _gemini_unique_parts(record, entry, state)
+    results = _gemini_unique_results(record, state)
+    if not parts and not results:
+        return None
+    return replace(record, parts=parts, results=results)
+
+
+def _gemini_unique_parts(
+    record: TranscriptRecord, entry: SourceEntry, state: TranscriptParserState
+) -> tuple[dict[str, Any], ...]:
+    message_id = entry.data.get("id")
+    key = message_id if isinstance(message_id, str) else ""
+    parts = list(record.parts)
+    if key and key in state.gemini_message_ids:
+        parts = [part for part in parts if part.get("type") != "text"]
+    elif key:
+        state.gemini_message_ids.add(key)
+    visible_tool_calls = []
+    for part in parts:
+        call_id = part.get("tool_call_id")
+        if not isinstance(call_id, str) or not call_id:
+            visible_tool_calls.append(part)
+        elif call_id not in state.gemini_tool_call_ids:
+            state.gemini_tool_call_ids.add(call_id)
+            visible_tool_calls.append(part)
+    if key:
+        visible_tool_calls.extend(_gemini_tool_calls_with_results(entry, state))
+    return tuple(visible_tool_calls)
+
+
+def _gemini_tool_calls_with_results(
+    entry: SourceEntry, state: TranscriptParserState
+) -> list[dict[str, Any]]:
+    calls = entry.data.get("toolCalls")
+    if not isinstance(calls, list):
+        return []
+    parts = []
+    for call in calls:
+        if not isinstance(call, dict):
+            continue
+        call_id = call.get("id")
+        if not isinstance(call_id, str) or not call_id:
+            continue
+        if _gemini_output(call) is None or call_id in state.gemini_tool_call_ids:
+            continue
+        state.gemini_tool_call_ids.add(call_id)
+        parts.append(
+            _tool(
+                call_id,
+                str(call.get("name", call.get("displayName", "unknown"))),
+                call.get("args", {}),
+            )
+        )
+    return parts
+
+
+def _gemini_unique_results(
+    record: TranscriptRecord, state: TranscriptParserState
+) -> tuple[tuple[str, Any, bool], ...]:
+    results = []
+    for call_id, output, failed in record.results:
+        signature = (
+            call_id,
+            json.dumps(output, ensure_ascii=False, sort_keys=True, default=str),
+            failed,
+        )
+        if signature in state.gemini_result_signatures:
+            continue
+        state.gemini_result_signatures.add(signature)
+        results.append((call_id, output, failed))
+    return tuple(results)
+
+
 def build_messages(
-    entries: list[SourceEntry], conversation_id: str, provider: str, generation: int = 0
+    entries: list[SourceEntry],
+    conversation_id: str,
+    provider: str,
+    generation: int = 0,
+    *,
+    source_range: tuple[int, int | None] | None = None,
 ) -> tuple[Message, ...]:
     """Build full replacements, joining results before a caller slices pages.
 
@@ -315,16 +750,8 @@ def build_messages(
     contributors: dict[str, set[int]] = {}
     calls: dict[str, tuple[str, int]] = {}
     results: list[tuple[int, str, Any, bool]] = []
-    for entry in entries:
-        record = (
-            _codex(entry)
-            if provider == "codex"
-            else _gemini(entry)
-            if provider == "gemini"
-            else _chat(entry, provider)
-        )
-        if record is None:
-            continue
+    records, _ = parse_records(entries, provider)
+    for entry, record in records:
         results.extend(
             (entry.offset, call_id, output, failed)
             for call_id, output, failed in record.results
@@ -343,8 +770,9 @@ def build_messages(
             conversation_id,
             record.role,
             record.time,
-            True,
+            record.complete,
             parts,
+            phase=record.phase,
         )
         for i, part in enumerate(parts):
             if part.tool_call_id:
@@ -365,4 +793,14 @@ def build_messages(
         messages[message_id] = replace(
             message, parts=tuple(parts), revision=len(contributors[message_id])
         )
-    return tuple(messages.values())
+    if source_range is None:
+        return tuple(messages.values())
+    start, end = source_range
+    return tuple(
+        message
+        for message in messages.values()
+        if any(
+            offset >= start and (end is None or offset < end)
+            for offset in contributors[message.id]
+        )
+    )

@@ -1,7 +1,7 @@
 """Reported shell identity is not evidence that agterm is at an idle prompt."""
 
 import json
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -23,10 +23,13 @@ async def test_markerless_shell_does_not_cancel_local_input(monkeypatch, pane_te
     monkeypatch.setattr(shell_commands, "tmux_manager", mux)
     monkeypatch.setattr(mux, "capture_pane", AsyncMock(return_value=pane_text))
     send_keys = AsyncMock()
-    monkeypatch.setattr(mux, "send_keys", send_keys)
     monkeypatch.setattr(shell_commands.asyncio, "sleep", AsyncMock())
+    adapter = MagicMock()
+    adapter.send_keys = send_keys
 
-    await shell_commands._cancel_stuck_input(SESSION)
+    await shell_commands._cancel_stuck_input(
+        SESSION, adapter, "test:cancel-stuck-input"
+    )
 
     send_keys.assert_not_awaited()
 

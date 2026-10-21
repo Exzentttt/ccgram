@@ -79,8 +79,12 @@ class TestScreenBufferResilience:
 
 
 class TestJsonlMalformedEntries:
-    def test_non_dict_message_field_skipped_in_parse(self):
-        from ccgram.providers._jsonl import parse_jsonl_entries
+    def test_non_dict_message_fields_are_skipped_by_both_protocol_reads(self):
+        from ccgram.session_protocol.messages import (
+            SourceEntry,
+            build_messages,
+            parse_records,
+        )
 
         entries = [
             {"type": "assistant", "message": "not a dict"},
@@ -88,27 +92,15 @@ class TestJsonlMalformedEntries:
             {"type": "assistant", "message": None},
             {"type": "assistant", "message": 42},
         ]
-        messages, _ = parse_jsonl_entries(entries, {})
-        assert len(messages) == 1
-        assert messages[0].text == "valid text"
+        source = [
+            SourceEntry(index * 100, entry) for index, entry in enumerate(entries)
+        ]
 
-    def test_non_dict_message_field_skipped_in_history(self):
-        from ccgram.providers._jsonl import parse_jsonl_history_entry
+        live, _ = parse_records(source, "claude")
+        history = build_messages(source, "conv", "claude")
 
-        assert (
-            parse_jsonl_history_entry({"type": "assistant", "message": "string"})
-            is None
-        )
-        assert parse_jsonl_history_entry({"type": "assistant", "message": None}) is None
-        assert parse_jsonl_history_entry({"type": "assistant", "message": 42}) is None
-
-    def test_valid_entry_still_parsed(self):
-        from ccgram.providers._jsonl import parse_jsonl_history_entry
-
-        entry = {"type": "assistant", "message": {"content": "hello world"}}
-        result = parse_jsonl_history_entry(entry)
-        assert result is not None
-        assert result.text == "hello world"
+        assert [record.parts[0]["text"] for _, record in live] == ["valid text"]
+        assert [message.parts[0].text for message in history] == ["valid text"]
 
 
 class TestSessionMapCorruptionGuard:

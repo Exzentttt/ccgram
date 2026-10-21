@@ -1306,6 +1306,3 @@ class TmuxManager:
 
 # Global instance with default session name
 tmux_manager = TmuxManager()
-
-# ``send_to_window`` / ``send_followup_to_window`` moved to
-# ``multiplexer.window_ops`` (backend-neutral; they route through the proxy).

@@ -6,8 +6,6 @@ from collections import deque
 from dataclasses import dataclass
 import time
 
-from ..multiplexer.window_ops import send_followup_to_window, send_to_window
-from ..session_protocol.input_lock import input_lock
 from ..session_protocol.models import ProtocolError
 
 _PENDING_INJECTION_TTL_S = 30.0
@@ -110,29 +108,31 @@ async def send_telegram_to_window(
     text: str,
     chat_id: int | None = None,
     *,
-    raw: bool = False,
+    adapter,
+    action_id: str | None = None,
 ) -> tuple[bool, str]:
+    injection = None
+    success = False
     try:
-        async with input_lock(window_id):
-            if await agent_origin_returned_to_shell(window_id):
-                return False, _AGENT_EXITED_MESSAGE
-            if thread_id is None:
-                return await send_to_window(window_id, text, raw=raw)
-            injection = remember_telegram_injection(
-                user_id, window_id, thread_id, text, chat_id
-            )
-            success = False
-            try:
-                success, message = await send_to_window(window_id, text, raw=raw)
-                return success, message
-            finally:
-                if not success:
-                    forget_telegram_injection(
-                        user_id, window_id, thread_id, injection, chat_id
-                    )
-
+        if await agent_origin_returned_to_shell(window_id):
+            return False, _AGENT_EXITED_MESSAGE
+        injection = (
+            remember_telegram_injection(user_id, window_id, thread_id, text, chat_id)
+            if thread_id is not None
+            else None
+        )
+        success, message = await adapter.send_text(
+            window_id,
+            text,
+            submit=True,
+            action_id=action_id,
+        )
+        return success, message
     except ProtocolError as exc:
         return False, exc.message
+    finally:
+        if not success and injection is not None and thread_id is not None:
+            forget_telegram_injection(user_id, window_id, thread_id, injection, chat_id)
 
 
 async def send_telegram_followup_to_window(
@@ -141,28 +141,31 @@ async def send_telegram_followup_to_window(
     thread_id: int | None,
     text: str,
     chat_id: int | None = None,
+    *,
+    adapter,
+    action_id: str | None = None,
 ) -> tuple[bool, str]:
+    injection = None
+    success = False
     try:
-        async with input_lock(window_id):
-            if await agent_origin_returned_to_shell(window_id):
-                return False, _AGENT_EXITED_MESSAGE
-            if thread_id is None:
-                return await send_followup_to_window(window_id, text)
-            injection = remember_telegram_injection(
-                user_id, window_id, thread_id, text, chat_id
-            )
-            success = False
-            try:
-                success, message = await send_followup_to_window(window_id, text)
-                return success, message
-            finally:
-                if not success:
-                    forget_telegram_injection(
-                        user_id, window_id, thread_id, injection, chat_id
-                    )
-
+        if await agent_origin_returned_to_shell(window_id):
+            return False, _AGENT_EXITED_MESSAGE
+        injection = (
+            remember_telegram_injection(user_id, window_id, thread_id, text, chat_id)
+            if thread_id is not None
+            else None
+        )
+        success, message = await adapter.send_followup(
+            window_id,
+            text,
+            action_id=action_id,
+        )
+        return success, message
     except ProtocolError as exc:
         return False, exc.message
+    finally:
+        if not success and injection is not None and thread_id is not None:
+            forget_telegram_injection(user_id, window_id, thread_id, injection, chat_id)
 
 
 def consume_telegram_injection(

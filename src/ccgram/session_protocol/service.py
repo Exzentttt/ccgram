@@ -11,7 +11,7 @@ from datetime import datetime
 from typing import Any, Protocol
 
 from ..providers.base import HookEvent
-from .backend import Prompt, SessionBackend, Target
+from .backend import CreationOptions, Prompt, SessionBackend, Target
 from .events import Event, EventHub
 from .messages import Message, build_messages, read_entries
 from .models import (
@@ -72,7 +72,7 @@ class LocalSessionService:
         self._snapshots: dict[str, SessionSnapshot] = {}
         self._targets: dict[str, Target] = {}
         self._refresh_lock = asyncio.Lock()
-        self._transcript_stamps: dict[str, tuple[int, int, int]] = {}
+        self._transcript_stamps: dict[str, tuple[int, int, int, int]] = {}
         self._revisions: dict[str, dict[str, int]] = {}
         # Lazy: ActionExecutor imports the service only for type checking.
         from .actions import ActionExecutor
@@ -98,14 +98,30 @@ class LocalSessionService:
 
     async def _update(self, target: Target) -> tuple[Target, SessionSnapshot]:
         try:
-            target = await self._source_version(target)
-            prompt = await self.backend.prompt(target)
-            sid, version = self.store.bind(target.id, target.binding, target.aliases)
-            return target, await self._observe(sid, version, target, prompt)
+            for _ in range(3):
+                prompt = await self.backend.prompt(target)
+                target = await self._source_version(target)
+                sid, version = self.store.bind(
+                    target.id, target.binding, target.aliases
+                )
+                snapshot = await self._observe(sid, version, target, prompt)
+                if target.transcript is None:
+                    return target, snapshot
+                stat = await asyncio.to_thread(target.transcript.stat)
+                if target.transcript_stamp == (
+                    stat.st_ino,
+                    stat.st_size,
+                    stat.st_mtime_ns,
+                    stat.st_ctime_ns,
+                ):
+                    return target, snapshot
+            raise OSError("Transcript changed repeatedly during observation")
         except (ProtocolError, OSError) as exc:
             target = replace(
                 target,
                 available=False,
+                transcript_content=None,
+                transcript_stamp=None,
                 status=Status("unknown", str(exc), "screen", utc_now()),
             )
             sid, version = self.store.bind(target.id, target.binding, target.aliases)
@@ -119,7 +135,9 @@ class LocalSessionService:
             self.requests.close(session_id, "vanished")
             self._revisions.pop(session_id, None)
             self._transcript_stamps.pop(session_id, None)
-        self._targets[session_id] = target
+        self._targets[session_id] = replace(
+            target, transcript_content=None, transcript_stamp=None
+        )
         opened = self.requests.reconcile(
             session_id, target.conversation_id, version, prompt
         )
@@ -181,20 +199,38 @@ class LocalSessionService:
         if target.transcript is None:
             return target
         try:
-            generation = await self.store.transcript_generation(
+            observation = await self.store.transcript_snapshot(
                 f"{target.id.casefold()}:{target.conversation_id}", target.transcript
             )
         except OSError as exc:
             raise ProtocolError(
                 503, "backend_unavailable", "Transcript source is unavailable"
             ) from exc
-        return replace(target, history_generation=generation)
+        return replace(
+            target,
+            history_generation=observation.generation,
+            transcript_content=observation.content,
+            transcript_stamp=observation.stamp,
+        )
 
-    async def _messages(self, target: Target) -> tuple[Message, ...]:
+    async def _messages(
+        self,
+        target: Target,
+        *,
+        source_range: tuple[int, int | None] | None = None,
+    ) -> tuple[Message, ...]:
         if target.transcript is None:
             return ()
         try:
-            entries = await asyncio.to_thread(read_entries, target.transcript)
+            if target.transcript_content is None:
+                raise ProtocolError(
+                    503, "backend_unavailable", "Transcript observation is unavailable"
+                )
+            entries = await asyncio.to_thread(
+                read_entries,
+                target.transcript_content,
+                target.transcript_provider or target.provider,
+            )
         except OSError as exc:
             raise ProtocolError(
                 503, "backend_unavailable", "Transcript is unavailable"
@@ -205,6 +241,7 @@ class LocalSessionService:
             target.conversation_id,
             target.transcript_provider or target.provider,
             target.history_generation,
+            source_range=source_range,
         )
         sid = next((sid for sid, t in self._targets.items() if t.id == target.id), "")
         return tuple(self._correlate(sid, message) for message in messages)
@@ -227,11 +264,7 @@ class LocalSessionService:
     async def _publish_messages(self, session_id: str, target: Target) -> None:
         if target.transcript is None:
             return
-        try:
-            stat = await asyncio.to_thread(target.transcript.stat)
-        except OSError:
-            return
-        stamp = (stat.st_ino, stat.st_size, stat.st_mtime_ns)
+        stamp = target.transcript_stamp
         if self._transcript_stamps.get(session_id) == stamp:
             return
         messages = await self._messages(target)
@@ -242,7 +275,8 @@ class LocalSessionService:
                 changed = True
                 self.hub.publish("message.upsert", session_id, message)
                 revisions[message.id] = message.revision
-        self._transcript_stamps[session_id] = stamp
+        if stamp is not None:
+            self._transcript_stamps[session_id] = stamp
         if changed:
             snapshot = replace(self._snapshots[session_id], last_activity=utc_now())
             self._snapshots[session_id] = snapshot
@@ -272,7 +306,11 @@ class LocalSessionService:
                 session_id,
                 {"actionId": action_id, "outcome": "sent", "messageId": message.id},
             )
-        return replace(message, action_id=action_id) if action_id else message
+        return (
+            replace(message, action_id=action_id, revision=message.revision + 1)
+            if action_id
+            else message
+        )
 
     async def list_sessions(self) -> list[SessionSnapshot]:
         await self.refresh()
@@ -293,6 +331,10 @@ class LocalSessionService:
             if target is None:
                 raise ProtocolError(404, "not_found", "Session not found")
             return await self._update(await self.backend.inspect(target.id))
+
+    async def for_target(self, target_id: str) -> tuple[Target, SessionSnapshot]:
+        async with self._refresh_lock:
+            return await self._update(await self.backend.inspect(target_id))
 
     async def history(
         self,
@@ -351,6 +393,30 @@ class LocalSessionService:
             target.history_generation,
         )
 
+    async def history_by_source_range(
+        self,
+        session_id: str,
+        start_byte: int,
+        end_byte: int | None = None,
+    ) -> HistoryPage:
+        """Read canonical messages contributed by source records in a byte range.
+
+        Telegram's unread view stores transcript byte offsets. Tool calls and
+        results still normalize together; a result in the range includes its
+        owning tool message even when the call itself preceded the range.
+        """
+        if start_byte < 0 or (end_byte is not None and end_byte < start_byte):
+            raise ProtocolError(400, "invalid_request", "Invalid transcript byte range")
+        target, _ = await self.current(session_id)
+        messages = await self._messages(target, source_range=(start_byte, end_byte))
+        return HistoryPage(
+            target.conversation_id or None,
+            messages,
+            None,
+            "full" if target.transcript else "scrollback",
+            target.history_generation,
+        )
+
     async def watch(
         self, session_ids: Collection[str] | None = None
     ) -> AsyncIterator[Event]:
@@ -362,14 +428,80 @@ class LocalSessionService:
             self.hub.unsubscribe(subscriber)
 
     async def execute(
-        self, session_id: str, action: Action
+        self,
+        session_id: str,
+        action: Action,
+        *,
+        pane_id: str | None = None,
+        expected_prompt: str | None = None,
     ) -> tuple[ActionResult, int]:
-        return await self.executor.execute(session_id, action)
+        return await self.executor.execute(
+            session_id,
+            action,
+            pane_id=pane_id,
+            expected_prompt=expected_prompt,
+        )
 
-    async def create_session(self, data: dict[str, Any]) -> SessionSnapshot:
+    async def execute_internal(
+        self,
+        session_id: str,
+        action: Action,
+        *,
+        pane_id: str | None = None,
+        expected_prompt: str | None = None,
+    ) -> tuple[ActionResult, int]:
+        return await self.executor.execute_internal(
+            session_id,
+            action,
+            pane_id=pane_id,
+            expected_prompt=expected_prompt,
+        )
+
+    async def create_session(
+        self,
+        data: dict[str, Any],
+        *,
+        options: CreationOptions | None = None,
+    ) -> SessionSnapshot:
+        _, snapshot = await self.create_target(data, options=options)
+        return snapshot
+
+    async def create_target(
+        self,
+        data: dict[str, Any],
+        *,
+        options: CreationOptions | None = None,
+    ) -> tuple[Target, SessionSnapshot]:
         async with self._refresh_lock:
-            _, snapshot = await self._update(await self.backend.create(data))
-            return snapshot
+            created = (
+                await self.backend.create(data)
+                if options is None
+                else await self.backend.create(data, trusted_options=options)
+            )
+            return await self._update(created)
+
+    async def split_session(
+        self,
+        session_id: str,
+        *,
+        expected_binding_version: int,
+        action_id: str,
+    ) -> str | None:
+        action = Action(action_id, expected_binding_version, "session.split", {})
+        result, status = await self.execute_internal(session_id, action)
+        if result.outcome == "sent" and result.data:
+            pane_id = result.data.get("paneId")
+            if isinstance(pane_id, str):
+                return pane_id
+        if result.outcome == "rejected":
+            error = result.error or {}
+            raise ProtocolError(
+                status,
+                error.get("code", "backend_unavailable"),
+                error.get("message", "Could not confirm split"),
+                error.get("details", {}),
+            )
+        return None
 
     async def terminal(self, session_id: str, pane: str = "p0") -> dict[str, Any]:
         target, _ = await self.current(session_id)
@@ -453,6 +585,11 @@ class LocalSessionService:
     async def _match_hook(self, sid: str, target: Target, event: HookEvent) -> bool:
         tool_name = event.data.get("tool_name")
         if not isinstance(tool_name, str):
+            return False
+        # Hook records can arrive after the last poll; do not reconcile requests
+        # while refreshing this evidence, as a newer queued hook may own them.
+        target = await self._source_version(await self.backend.inspect(target.id))
+        if target.conversation_id != event.session_id:
             return False
         for message in reversed(await self._messages(target)):
             for part in message.parts:

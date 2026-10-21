@@ -102,6 +102,9 @@ class TestRawCommandFlow:
     async def test_bang_prefix_sends_to_tmux_and_marks_command(self) -> None:
         bot = AsyncMock(spec=Bot)
         message = AsyncMock(spec=Message)
+        adapter = MagicMock()
+        adapter.send_text = AsyncMock(return_value=(True, ""))
+        adapter.send_keys = AsyncMock(return_value=(True, ""))
 
         with (
             patch(f"{_MOD_CMD}.enqueue_status_update", new_callable=AsyncMock),
@@ -109,11 +112,6 @@ class TestRawCommandFlow:
             patch("ccgram.handlers.shell.shell_context.view_window"),
             patch(f"{_MOD_CMD}.thread_router") as mock_tr,
             patch(f"{_MOD_CMD}.tmux_manager") as mock_tm,
-            patch(
-                f"{_MOD_CMD}.send_to_window",
-                new_callable=AsyncMock,
-                return_value=(True, ""),
-            ) as mock_send,
             patch(
                 "ccgram.providers.shell.has_prompt_marker",
                 new_callable=AsyncMock,
@@ -126,11 +124,21 @@ class TestRawCommandFlow:
             mock_tm.capture_pane = AsyncMock(return_value=None)
 
             await handle_shell_message(
-                bot, TEST_USER_ID, TEST_THREAD_ID, TEST_WINDOW_ID, "!ls -la", message
+                bot,
+                TEST_USER_ID,
+                TEST_THREAD_ID,
+                TEST_WINDOW_ID,
+                "!ls -la",
+                message,
+                adapter=adapter,
             )
 
-        mock_send.assert_called_once_with(
-            TEST_USER_ID, TEST_WINDOW_ID, TEST_THREAD_ID, "ls -la", ANY, raw=True
+        adapter.send_text.assert_awaited_once_with(
+            TEST_WINDOW_ID,
+            "ls -la",
+            submit=True,
+            terminal_input=True,
+            action_id=ANY,
         )
         assert mock_mark.call_args.args[:4] == (
             TEST_WINDOW_ID,
@@ -173,6 +181,7 @@ class TestLlmCommandFlow:
         bot = AsyncMock(spec=Bot)
         message = AsyncMock(spec=Message)
         completer = _fixed_completer("ls -la", "List files")
+        adapter = MagicMock()
 
         with (
             patch(f"{_MOD_CMD}.enqueue_status_update", new_callable=AsyncMock),
@@ -197,6 +206,7 @@ class TestLlmCommandFlow:
                 TEST_WINDOW_ID,
                 "list all files",
                 message,
+                adapter=adapter,
             )
 
         completer.generate_command.assert_called_once()
@@ -212,6 +222,9 @@ class TestLlmCommandFlow:
     async def test_no_llm_falls_back_to_raw(self) -> None:
         bot = AsyncMock(spec=Bot)
         message = AsyncMock(spec=Message)
+        adapter = MagicMock()
+        adapter.send_text = AsyncMock(return_value=(True, ""))
+        adapter.send_keys = AsyncMock(return_value=(True, ""))
 
         with (
             patch(f"{_MOD_CMD}.enqueue_status_update", new_callable=AsyncMock),
@@ -219,11 +232,6 @@ class TestLlmCommandFlow:
             patch(f"{_MOD_CMD}.get_completer", return_value=None),
             patch("ccgram.handlers.shell.shell_context.view_window"),
             patch(f"{_MOD_CMD}.thread_router") as mock_tr,
-            patch(
-                f"{_MOD_CMD}.send_to_window",
-                new_callable=AsyncMock,
-                return_value=(True, ""),
-            ) as mock_send,
             patch(f"{_MOD_CAP}.mark_telegram_command") as mock_mark,
         ):
             mock_tr.resolve_chat_id.return_value = TEST_CHAT_ID
@@ -235,15 +243,15 @@ class TestLlmCommandFlow:
                 TEST_WINDOW_ID,
                 "find . -name foo",
                 message,
+                adapter=adapter,
             )
 
-        mock_send.assert_called_once_with(
-            TEST_USER_ID,
+        adapter.send_text.assert_awaited_once_with(
             TEST_WINDOW_ID,
-            TEST_THREAD_ID,
             "find . -name foo",
-            TEST_CHAT_ID,
-            raw=True,
+            submit=True,
+            terminal_input=True,
+            action_id=ANY,
         )
         mock_mark.assert_called_once()
 

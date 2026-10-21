@@ -6,7 +6,7 @@ import asyncio
 import secrets
 import time
 from collections import deque
-from collections.abc import Callable, Collection
+from collections.abc import Awaitable, Callable, Collection
 from dataclasses import dataclass
 from typing import Any
 
@@ -83,6 +83,30 @@ class EventHub:
         self.clock = clock
         self._ring: deque[tuple[float, Event]] = deque()
         self._subscribers: set[Subscription] = set()
+        self._durable_consumers: dict[str, Callable[[Any], Awaitable[None]]] = {}
+
+    def register_durable_consumer(
+        self, name: str, handler: Callable[[Any], Awaitable[None]]
+    ) -> None:
+        """Register an awaited in-process sink, separate from remote replay."""
+        if not name:
+            raise ValueError("durable consumer name must not be empty")
+        if name in self._durable_consumers:
+            raise ValueError(f"durable consumer already registered: {name}")
+        self._durable_consumers[name] = handler
+
+    def unregister_durable_consumer(self, name: str) -> None:
+        self._durable_consumers.pop(name, None)
+
+    def durable_consumer_names(self) -> tuple[str, ...]:
+        return tuple(self._durable_consumers)
+
+    async def dispatch_durable(self, name: str, payload: Any) -> None:
+        """Await one named in-process sink; callers own retry/checkpoint policy."""
+        handler = self._durable_consumers.get(name)
+        if handler is None:
+            raise KeyError(f"durable consumer is not registered: {name}")
+        await handler(payload)
 
     def _prune(self) -> None:
         cutoff = self.clock() - self.max_age

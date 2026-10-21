@@ -88,21 +88,6 @@ class TestShellOverrides:
             == ""
         )
 
-    def test_parse_transcript_line_returns_none_for_valid_json(
-        self, provider: ShellProvider
-    ) -> None:
-        assert (
-            provider.parse_transcript_line(
-                '{"type": "assistant", "message": {"content": "hi"}}'
-            )
-            is None
-        )
-
-    def test_read_transcript_file_returns_empty(self, provider: ShellProvider) -> None:
-        entries, offset = provider.read_transcript_file("/any/path.jsonl", 0)
-        assert entries == []
-        assert offset == 0
-
     def test_extract_bash_output_returns_none_even_with_match(
         self, provider: ShellProvider
     ) -> None:

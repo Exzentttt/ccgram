@@ -31,7 +31,7 @@ Outbound agent output (provider transcript/event → Telegram):
 
 1. `session_monitor.py` gets a fresh live-window listing and converges any uniquely attested identity aliases before reading hooks or loading the session-map delta.
 2. It dispatches hook events only after convergence, then parses the reconciled session map and transcript updates while creating dependency-light receipts from `delivery_contract.py`.
-3. Provider parser (`providers/*.py` + `transcript_parser.py` / `terminal_parser.py`) emits normalized updates.
+3. The shared session core normalizes transcripts in `session_protocol/messages.py`; providers and `terminal_parser.py` detect terminal status.
 4. `handlers/messaging_pipeline/message_queue.py` enforces ordering, merge rules, rate limits and settles the shared receipt contract. Worker takes a `TelegramClient`.
 5. `handlers/messaging_pipeline/message_sender.py` delivers via the Protocol.
 
@@ -95,4 +95,4 @@ Topic command panel (`/commands`):
 - In-function imports must carry `# Lazy: <reason>` (or live inside `if TYPE_CHECKING:` / `_reset_*_for_testing`). `make lint` runs `lint-lazy`.
 - Ordering invariant: `bootstrap.wire_runtime_callbacks` must run before `bootstrap.start_session_monitor`. The monitor checks `_callbacks_wired` and raises if violated.
 - Topic-creation seam: window creation state is consolidated in `handlers/topics/window_launch_service.py`. Callers build a `WindowLaunchRequest(user_id, thread_id, provider_name, cwd, mode, pending_text)` and call `launch_window(query, context, request) -> WindowLaunchResult`. Creation-flow key constants (`PENDING_THREAD_ID`, `PENDING_THREAD_TEXT`, `PENDING_WORKTREE_PATH`, etc.) are defined in `topic_creation_draft.py`; callers that access them via `context.user_data` must import only the constants from that module, not bypass the `launch_window` entry point. `TopicCreationDraft` exists in `topic_creation_draft.py` as a future accessor class but has no production callers yet.
-- TranscriptParser delegation: `transcript_parser.py` delegates internally to `_handle_*` methods and tracks `_ParseState`; callers must not bypass the public `parse_entries` API.
+- Transcript normalization: `session_protocol/messages.py` owns `parse_records` and `build_messages`. History uses a verified source snapshot; durable Telegram batches retain receipt checkpoints. All client mutations go through the shared service/executor; handlers must not call multiplexer mutation methods. `transcript_parser.py` and the provider parse APIs are removed.

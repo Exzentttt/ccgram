@@ -73,7 +73,7 @@ class TestTickWindowDeadWindow:
         with patch.object(
             window_tick, "_handle_dead_window_notification", new_callable=AsyncMock
         ) as mock_dead:
-            await tick_window(bot, 1, 100, "@0", None)
+            await tick_window(bot, 1, 100, "@0", None, MagicMock())
             mock_dead.assert_called_once()
             args, kwargs = mock_dead.call_args
             assert args == (bot, 1, 100, "@0")
@@ -91,7 +91,7 @@ class TestTickWindowDeadWindow:
                 window_tick, "_scan_window_panes", new_callable=AsyncMock
             ) as mock_scan,
         ):
-            await tick_window(bot, 1, 100, "@0", None)
+            await tick_window(bot, 1, 100, "@0", None, MagicMock())
             mock_status.assert_not_called()
             mock_scan.assert_not_called()
 
@@ -101,12 +101,14 @@ class TestTickWindowDeadWindow:
         with patch.object(
             window_tick, "_handle_dead_window_notification", new_callable=AsyncMock
         ) as mock_dead:
-            await tick_window(bot, 1, 100, "@0", None)
+            await tick_window(bot, 1, 100, "@0", None, MagicMock())
             mock_dead.assert_not_called()
 
     async def test_agent_exit_kills_managed_window_and_enters_recovery(self):
         bot = AsyncMock(spec=Bot)
         window = _make_window()
+        adapter = MagicMock()
+        adapter.close = AsyncMock(return_value=(True, "closed"))
         with (
             patch.object(
                 window_tick,
@@ -120,20 +122,15 @@ class TestTickWindowDeadWindow:
                 return_value="ccgram_created",
             ),
             patch.object(
-                window_tick,
-                "tmux_manager",
-                MagicMock(kill_window=AsyncMock()),
-            ) as mock_tmux,
-            patch.object(
                 window_tick, "_handle_dead_window_notification", new_callable=AsyncMock
             ) as mock_dead,
             patch.object(
                 window_tick, "_update_status", new_callable=AsyncMock
             ) as mock_status,
         ):
-            await tick_window(bot, 1, 100, "@0", window)
+            await tick_window(bot, 1, 100, "@0", window, adapter)
 
-        mock_tmux.kill_window.assert_awaited_once_with("@0")
+        adapter.close.assert_awaited_once_with("@0")
         mock_dead.assert_awaited_once_with(
             bot, 1, 100, "@0", runtime=window_tick.get_default_runtime()
         )
@@ -142,6 +139,8 @@ class TestTickWindowDeadWindow:
     async def test_agent_exit_keeps_manually_discovered_window(self):
         bot = AsyncMock(spec=Bot)
         window = _make_window()
+        adapter = MagicMock()
+        adapter.close = AsyncMock(return_value=(True, "closed"))
         with (
             patch.object(
                 window_tick,
@@ -155,17 +154,12 @@ class TestTickWindowDeadWindow:
                 return_value="manual_discovered",
             ),
             patch.object(
-                window_tick,
-                "tmux_manager",
-                MagicMock(kill_window=AsyncMock()),
-            ) as mock_tmux,
-            patch.object(
                 window_tick, "_handle_dead_window_notification", new_callable=AsyncMock
             ) as mock_dead,
         ):
-            await tick_window(bot, 1, 100, "@0", window)
+            await tick_window(bot, 1, 100, "@0", window, adapter)
 
-        mock_tmux.kill_window.assert_not_awaited()
+        adapter.close.assert_not_awaited()
         mock_dead.assert_awaited_once()
 
 
@@ -194,7 +188,7 @@ class TestTickWindowPendingQueue:
                 window_tick, "_maybe_check_passive_shell", new_callable=AsyncMock
             ) as mock_shell,
         ):
-            await tick_window(bot, 1, 100, "@0", w)
+            await tick_window(bot, 1, 100, "@0", w, MagicMock())
             mock_interactive.assert_called_once()
             mock_status.assert_not_called()
             mock_scan.assert_called_once()
@@ -223,7 +217,7 @@ class TestTickWindowEmptyQueue:
                 window_tick, "_maybe_check_passive_shell", new_callable=AsyncMock
             ) as mock_shell,
         ):
-            await tick_window(bot, 1, 100, "@0", w)
+            await tick_window(bot, 1, 100, "@0", w, MagicMock())
             mock_status.assert_called_once()
             mock_scan.assert_called_once()
             mock_shell.assert_called_once()
@@ -245,7 +239,7 @@ class TestTickWindowEmptyQueue:
                 window_tick, "_maybe_check_passive_shell", new_callable=AsyncMock
             ),
         ):
-            await tick_window(bot, 1, 100, "@0", w)
+            await tick_window(bot, 1, 100, "@0", w, MagicMock())
             mock_status.assert_called_once()
 
 

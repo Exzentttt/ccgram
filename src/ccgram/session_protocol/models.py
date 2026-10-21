@@ -96,6 +96,7 @@ class Message:
     complete: bool
     parts: tuple[Part, ...]
     action_id: str | None = None
+    phase: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -181,3 +182,4 @@ class ActionResult:
     action_id: str
     outcome: str
     error: dict[str, Any] | None = None
+    data: dict[str, Any] | None = None

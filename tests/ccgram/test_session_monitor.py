@@ -16,6 +16,11 @@ from ccgram.providers.claude import ClaudeProvider
 from ccgram.providers.codex import CodexProvider
 from ccgram.session import SessionManager
 from ccgram.session_monitor import NewMessage, NewWindowEvent, SessionMonitor
+from ccgram.session_protocol.messages import (
+    SourceEntry,
+    TranscriptBatch,
+    TranscriptRecord,
+)
 from ccgram.thread_router import thread_router
 from ccgram.telegram_client import FakeTelegramClient
 from ccgram.window_state_store import window_store
@@ -32,6 +37,24 @@ HERDR_TARGETS = {
         "new": "f",
     }.items()
 }
+
+
+def _transcript_batch(
+    session_id: str, checkpoint: int, record_count: int = 1
+) -> TranscriptBatch:
+    records = tuple(
+        (
+            SourceEntry(index, {}),
+            TranscriptRecord(
+                f"message-{index}",
+                "agent",
+                None,
+                ({"type": "text", "text": f"delivered {index}"},),
+            ),
+        )
+        for index in range(record_count)
+    )
+    return TranscriptBatch(session_id, "claude", records, checkpoint)
 
 
 @pytest.fixture
@@ -426,6 +449,11 @@ class TestMonitorLoop:
                 AsyncMock(return_value=current_map),
             ),
             patch.object(monitor, "check_for_updates", side_effect=check_for_updates),
+            patch.object(
+                monitor._transcript_reader,
+                "drain_batches",
+                return_value=(_transcript_batch(session_id, 20),),
+            ),
             patch(
                 "ccgram.session_monitor.read_session_map_raw",
                 AsyncMock(return_value={}),
@@ -460,14 +488,13 @@ async def test_cancelled_dispatch_retains_failed_receipt(
 
     monitor.set_message_callback(callback)
     pending = monitor._register_delivery_receipts(
-        [
-            NewMessage("s1", "first", True),
-            NewMessage("s1", "second", True),
-        ]
+        (_transcript_batch("s1", 10), _transcript_batch("s1", 20))
     )
-    first_msg, first_receipt = pending[0]
+    first_batch, consumer_name, first_receipt = pending[0]
     task = asyncio.create_task(
-        monitor._dispatch_message_with_receipt(first_msg, first_receipt)
+        monitor._dispatch_message_with_receipt(
+            first_batch, first_receipt, consumer_name
+        )
     )
     await started.wait()
     task.cancel()
@@ -480,6 +507,45 @@ async def test_cancelled_dispatch_retains_failed_receipt(
     assert receipts[0].failed is True
     assert receipts[0].commit_ready is False
     assert receipts[1].commit_ready is False
+
+
+async def test_failed_consumer_fences_batch_checkpoint_for_replay(
+    monitor: SessionMonitor,
+) -> None:
+    async def fail(batch: TranscriptBatch) -> None:
+        assert len(batch.records) == 2
+        raise RuntimeError("delivery failed")
+
+    async def succeed(batch: TranscriptBatch) -> None:
+        assert len(batch.records) == 2
+        return None
+
+    monitor.register_delivery_consumer("telegram", fail)
+    monitor.register_delivery_consumer("archive", succeed)
+    monitor.state.update_session(
+        TrackedSession(
+            session_id="s1",
+            file_path="/transcript.jsonl",
+            last_byte_offset=0,
+            parsed_offset=20,
+        )
+    )
+    batch = _transcript_batch("s1", 20, record_count=2)
+    pending = monitor._register_delivery_receipts((batch,))
+
+    assert [name for _, name, _ in pending] == ["telegram", "archive"]
+    assert all(receipt.checkpoint == 20 for _, _, receipt in pending)
+    for pending_batch, consumer_name, receipt in pending:
+        await monitor._dispatch_message_with_receipt(
+            pending_batch, receipt, consumer_name
+        )
+    monitor.commit_delivered_watermarks()
+
+    failed, delivered = [receipt for _, _, receipt in pending]
+    assert failed.failed is True
+    assert delivered.commit_ready is True
+    assert monitor.state.tracked_sessions["s1"].last_byte_offset == 0
+    assert monitor._delivery_receipts["s1"] == [failed, delivered]
 
 
 class TestSettledPrefixWatermarkCommit:
@@ -1411,7 +1477,9 @@ class TestCorruptedOffset:
         entries = await monitor._read_new_lines(tracked, session_file)
         # Should recover: skip rest of line1, read line2
         assert len(entries) == 1
-        text = entries[0].get("message", {}).get("content", [{}])[0].get("text", "")
+        text = (
+            entries[0].data.get("message", {}).get("content", [{}])[0].get("text", "")
+        )
         assert text == "second"
 
 
@@ -1977,7 +2045,7 @@ class TestScanProjects:
 
 
 class TestGeminiTranscriptReading:
-    """Test _read_new_lines delegation for Gemini with supports_incremental_read=True."""
+    """Read Gemini JSONL into the same raw source-entry contract as other providers."""
 
     _GEMINI_META = {
         "sessionId": "g1",
@@ -2016,8 +2084,19 @@ class TestGeminiTranscriptReading:
             # First read: gets everything
             entries = await monitor._read_new_lines(tracked, transcript, window_id="@5")
             assert len(entries) == 4  # meta + 3 messages
-            assert entries[0]["sessionId"] == "g1"
-            assert entries[1]["type"] == "user"
+            assert entries[0].data["sessionId"] == "g1"
+            assert entries[1].data["type"] == "user"
+            assert [entry.offset for entry in entries] == [
+                0,
+                len((json.dumps(self._GEMINI_META) + "\n").encode()),
+                len((json.dumps(self._GEMINI_META) + "\n").encode())
+                + len((json.dumps(self._GEMINI_MESSAGES[0]) + "\n").encode()),
+                len((json.dumps(self._GEMINI_META) + "\n").encode())
+                + sum(
+                    len((json.dumps(message) + "\n").encode())
+                    for message in self._GEMINI_MESSAGES[:2]
+                ),
+            ]
 
             # Second read: nothing new
             entries = await monitor._read_new_lines(tracked, transcript, window_id="@5")
@@ -2031,7 +2110,7 @@ class TestGeminiTranscriptReading:
 
             entries = await monitor._read_new_lines(tracked, transcript, window_id="@5")
             assert len(entries) == 1
-            assert entries[0]["type"] == "gemini"
+            assert entries[0].data["type"] == "gemini"
 
     async def test_gemini_end_to_end_process_session(self, tmp_path) -> None:
         transcript = tmp_path / "transcript.jsonl"

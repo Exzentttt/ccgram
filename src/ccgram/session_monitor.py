@@ -55,7 +55,9 @@ from .multiplexer.reconciliation import list_windows_for_reconciliation
 from .multiplexer.window_liveness import note_live_windows
 from .multiplexer.topic_mapping import is_agent_topic_window
 from .monitor_events import NewMessage, NewWindowEvent, SessionInfo
-from .transcript_reader import TranscriptReader
+from .transcript_reader import TranscriptReader, render_transcript_batch
+from .session_protocol.events import EventHub
+from .session_protocol.messages import TranscriptBatch
 from .utils import task_done_callback
 
 import json
@@ -77,8 +79,6 @@ _BACKOFF_MIN = 2.0
 _BACKOFF_MAX = 30.0
 _SKIP_RETRY_BASE_SECONDS = 2.0
 _SKIP_RETRY_MAX_SECONDS = 60.0
-_MSG_PREVIEW_LENGTH = 80
-
 logger = structlog.get_logger()
 
 
@@ -106,6 +106,7 @@ class SessionMonitor:
         projects_path: Path | None = None,
         poll_interval: float | None = None,
         state_file: Path | None = None,
+        event_hub: EventHub | None = None,
     ):
         self.projects_path = (
             projects_path if projects_path is not None else config.claude_projects_path
@@ -119,7 +120,7 @@ class SessionMonitor:
 
         self._running = False
         self._task: asyncio.Task | None = None
-        self._message_callback: Callable[[NewMessage], Awaitable[None]] | None = None
+        self._event_hub = event_hub or EventHub()
         self._new_window_callback: (
             Callable[[NewWindowEvent], Awaitable[None]] | None
         ) = None
@@ -186,7 +187,22 @@ class SessionMonitor:
     def set_message_callback(
         self, callback: Callable[[NewMessage], Awaitable[None]]
     ) -> None:
-        self._message_callback = callback
+        """Register the legacy Telegram message adapter for monitor tests."""
+
+        async def render_and_deliver(batch: TranscriptBatch) -> None:
+            for message in render_transcript_batch(batch):
+                await callback(message)
+
+        self._event_hub.unregister_durable_consumer("telegram")
+        self._event_hub.register_durable_consumer("telegram", render_and_deliver)
+
+    def register_delivery_consumer(
+        self, name: str, handler: Callable[[TranscriptBatch], Awaitable[None]]
+    ) -> None:
+        self._event_hub.register_durable_consumer(name, handler)
+
+    def unregister_delivery_consumer(self, name: str) -> None:
+        self._event_hub.unregister_durable_consumer(name)
 
     def set_new_window_callback(
         self, callback: Callable[[NewWindowEvent], Awaitable[None]]
@@ -901,40 +917,46 @@ class SessionMonitor:
                 )
 
     def _register_delivery_receipts(
-        self, messages: list[NewMessage]
-    ) -> list[tuple[NewMessage, DeliveryReceipt]]:
-        """Register a non-ready receipt for every parsed message synchronously."""
-        pending: list[tuple[NewMessage, DeliveryReceipt]] = []
-        if self._message_callback is None:
-            return pending
-        for msg in messages:
-            session = self.state.get_session(msg.session_id)
-            checkpoint = session.parsed_offset if session is not None else None
-            receipt = new_delivery_receipt(checkpoint=checkpoint)
-            self._delivery_receipts.setdefault(msg.session_id, []).append(receipt)
-            pending.append((msg, receipt))
+        self, batches: tuple[TranscriptBatch, ...]
+    ) -> list[tuple[TranscriptBatch, str, DeliveryReceipt]]:
+        """Register each parse-cycle batch per consumer before any await.
+
+        All records in a batch share its real source checkpoint. Keeping one
+        receipt per batch and consumer preserves the settled-prefix tie rule:
+        a failed sibling consumer cannot let that checkpoint advance.
+        """
+        pending: list[tuple[TranscriptBatch, str, DeliveryReceipt]] = []
+        consumer_names = self._event_hub.durable_consumer_names()
+        for batch in batches:
+            for consumer_name in consumer_names:
+                receipt = new_delivery_receipt(checkpoint=batch.byte_checkpoint)
+                self._delivery_receipts.setdefault(batch.session_id, []).append(receipt)
+                pending.append((batch, consumer_name, receipt))
         return pending
 
     async def _dispatch_message_with_receipt(
-        self, msg: NewMessage, receipt: DeliveryReceipt | None = None
+        self,
+        batch: TranscriptBatch,
+        receipt: DeliveryReceipt | None = None,
+        consumer_name: str = "telegram",
     ) -> None:
-        """Run one transcript callback under a delivery-boundary receipt."""
-        if self._message_callback is None:
-            return
+        """Run one durable consumer under its source-checkpoint receipt."""
         if receipt is None:
-            session = self.state.get_session(msg.session_id)
-            checkpoint = session.parsed_offset if session is not None else None
-            receipt = new_delivery_receipt(checkpoint=checkpoint)
-            self._delivery_receipts.setdefault(msg.session_id, []).append(receipt)
+            receipt = new_delivery_receipt(checkpoint=batch.byte_checkpoint)
+            self._delivery_receipts.setdefault(batch.session_id, []).append(receipt)
         token = activate_delivery_receipt(receipt)
         try:
-            await self._message_callback(msg)
+            await self._event_hub.dispatch_durable(consumer_name, batch)
         except asyncio.CancelledError:
             receipt.fail()
             raise
         except _CallbackError:
             receipt.fail()
-            logger.exception("Message callback error for session=%s", msg.session_id)
+            logger.exception(
+                "Durable delivery callback error for session=%s consumer=%s",
+                batch.session_id,
+                consumer_name,
+            )
         finally:
             deactivate_delivery_receipt(token)
             receipt.close()
@@ -1043,21 +1065,27 @@ class SessionMonitor:
                 # A persisted barrier must be noticed before its source is read
                 # again; this preserves the exact EOF snapshot across restarts.
                 await self._advance_skip_barriers()
-                new_messages = await self.check_for_updates(monitored_map)
-                # Register every parsed message before the next await. A
+                await self.check_for_updates(monitored_map)
+                transcript_batches = self._transcript_reader.drain_batches()
+                # Register every normalized batch before the next await. A
                 # shutdown cancellation between parse and dispatch must leave
-                # a non-ready receipt so its offset remains replayable.
-                pending_dispatches = self._register_delivery_receipts(new_messages)
+                # a non-ready receipt so its source offset remains replayable.
+                pending_dispatches = self._register_delivery_receipts(
+                    transcript_batches
+                )
 
-                for msg, receipt in pending_dispatches:
+                for batch, consumer_name, receipt in pending_dispatches:
                     structlog.contextvars.clear_contextvars()
-                    structlog.contextvars.bind_contextvars(session_id=msg.session_id)
-                    status = "complete" if msg.is_complete else "streaming"
-                    preview = msg.text[:_MSG_PREVIEW_LENGTH] + (
-                        "..." if len(msg.text) > _MSG_PREVIEW_LENGTH else ""
+                    structlog.contextvars.bind_contextvars(session_id=batch.session_id)
+                    logger.debug(
+                        "Dispatching %s transcript records for session=%s to %s",
+                        len(batch.records),
+                        batch.session_id,
+                        consumer_name,
                     )
-                    logger.debug("[%s] session=%s: %s", status, msg.session_id, preview)
-                    await self._dispatch_message_with_receipt(msg, receipt)
+                    await self._dispatch_message_with_receipt(
+                        batch, receipt, consumer_name
+                    )
 
                 self.commit_delivered_watermarks()
 

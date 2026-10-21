@@ -10,7 +10,7 @@ from ccgram.handlers.text.text_handler import (
     _bash_capture_tasks,
     _capture_bash_output,
     _check_ui_guards,
-    _forward_message,
+    _forward_message as _forward_message_core,
     _handle_dead_window,
     _handle_unbound_topic,
     handle_text_message,
@@ -29,6 +29,25 @@ from ccgram.handlers.user_state import (
 )
 
 _TH = "ccgram.handlers.text.text_handler"
+_TEST_ADAPTER = MagicMock()
+_TEST_ADAPTER.send_text = AsyncMock(return_value=(True, "Sent"))
+_TEST_ADAPTER.send_keys = AsyncMock(return_value=(True, "Sent"))
+
+
+async def _forward_message(*args, **kwargs):
+    kwargs.setdefault("adapter", _TEST_ADAPTER)
+    return await _forward_message_core(*args, **kwargs)
+
+
+@pytest.fixture(autouse=True)
+def _use_session_adapter(monkeypatch):
+    _TEST_ADAPTER.send_text.reset_mock(return_value=True, side_effect=True)
+    _TEST_ADAPTER.send_keys.reset_mock(return_value=True, side_effect=True)
+    _TEST_ADAPTER.send_text.return_value = (True, "Sent")
+    _TEST_ADAPTER.send_keys.return_value = (True, "Sent")
+    monkeypatch.setattr(
+        "ccgram.session_protocol.telegram.adapter_for", lambda _: _TEST_ADAPTER
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -407,7 +426,15 @@ class TestForwardMessage:
         with patch(f"{_TH}.get_interactive_window", return_value=None):
             await _forward_message("@0", 100, 42, "hello", bot, message)
 
-        mock_send.assert_called_once_with(100, "@0", 42, "hello", ANY)
+        mock_send.assert_awaited_once_with(
+            100,
+            "@0",
+            42,
+            "hello",
+            ANY,
+            adapter=_TEST_ADAPTER,
+            action_id=ANY,
+        )
 
     @patch(f"{_TH}.safe_reply", new_callable=AsyncMock)
     @patch(
@@ -491,28 +518,20 @@ class TestForwardMessage:
         monkeypatch,
     ) -> None:
         """Interactive mode: Escape, verified dismissal, then delivery."""
-        from types import SimpleNamespace
-
         bot = AsyncMock()
         message = AsyncMock()
         message.chat.id = -100
 
         sent_keys = []
 
-        async def fake_send_keys(wid, key, **kw):
-            sent_keys.append((wid, key, kw))
-            return True
+        async def fake_send_keys(wid, keys, **kw):
+            sent_keys.append((wid, keys, kw))
+            return True, "Sent"
 
         async def no_prompt(wid, pane_id=None):
             return False
 
-        import ccgram.multiplexer as _mux_mod
-
-        monkeypatch.setattr(
-            _mux_mod,
-            "multiplexer",
-            SimpleNamespace(send_keys=fake_send_keys),
-        )
+        _TEST_ADAPTER.send_keys = AsyncMock(side_effect=fake_send_keys)
 
         cleared = []
         import ccgram.handlers.interactive as _int_mod
@@ -527,12 +546,9 @@ class TestForwardMessage:
 
         await _forward_message("@0", 100, 42, "hello", bot, message)
 
-        escape_calls = [(k, kw) for _, k, kw in sent_keys if k == "Escape"]
+        escape_calls = [(keys, kw) for _, keys, kw in sent_keys if keys == ["Escape"]]
         assert escape_calls, "an Escape keypress was sent"
-        assert all(
-            kw.get("literal") is False and kw.get("enter") is False
-            for _, kw in escape_calls
-        ), "literal=True would type the word Escape into the modal"
+        assert all(kw.get("expected_prompt") is None for _, kw in escape_calls)
         assert cleared, "clear_interactive_mode should have been called"
         assert _mock_send.await_count == 1, "text must be forwarded after Escape"
 
@@ -542,35 +558,18 @@ class TestDismissalFailurePaths:
     forward the text, must keep the tracking, and must echo the text."""
 
     def _wire(self, monkeypatch, *, escape_result, prompt_still_shown):
-        from types import SimpleNamespace
-
         sent_keys = []
 
-        async def fake_send_keys(wid, key, **kw):
-            sent_keys.append((wid, key, kw))
+        async def fake_send_keys(wid, keys, **kw):
+            sent_keys.append((wid, keys, kw))
             if isinstance(escape_result, Exception):
                 raise escape_result
-            return escape_result
-
-        async def fake_send_keys_to_pane(pane, key, **kw):
-            sent_keys.append((f"pane:{pane}", key, kw))
-            if isinstance(escape_result, Exception):
-                raise escape_result
-            return escape_result
+            return escape_result, "send failed"
 
         async def fake_prompt(wid, pane_id=None):
             return prompt_still_shown
 
-        import ccgram.multiplexer as _mux_mod
-
-        monkeypatch.setattr(
-            _mux_mod,
-            "multiplexer",
-            SimpleNamespace(
-                send_keys=fake_send_keys,
-                send_keys_to_pane=fake_send_keys_to_pane,
-            ),
-        )
+        _TEST_ADAPTER.send_keys = AsyncMock(side_effect=fake_send_keys)
         import ccgram.handlers.interactive as _int_mod
 
         monkeypatch.setattr(_int_mod, "pane_has_interactive_prompt", fake_prompt)
@@ -688,16 +687,11 @@ class TestDismissalFailurePaths:
         pane_escapes = [
             (t, k, kw)
             for t, k, kw in sent_keys
-            if k == "Escape" and str(t).startswith("pane:")
+            if k == ["Escape"] and kw.get("pane_id") == "%7"
         ]
-        assert pane_escapes, "Escape must go through send_keys_to_pane"
-        assert all(t == "pane:%7" for t, _, _ in pane_escapes)
-        window_escapes = [
-            (t, k)
-            for t, k, _ in sent_keys
-            if k == "Escape" and not str(t).startswith("pane:")
-        ]
-        assert window_escapes == [], "no window-level Escape for a pane-owned prompt"
+        assert pane_escapes, "Escape must target the owning pane"
+        window_escapes = [(t, k) for t, k, _ in sent_keys if k == ["Escape"]]
+        assert len(window_escapes) == 1
         assert _mock_send.await_count == 1
 
     @patch(f"{_TH}.get_interactive_window", return_value="@0")

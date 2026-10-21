@@ -22,6 +22,7 @@ from ...session import session_manager
 from ...thread_router import thread_router
 from ...multiplexer import multiplexer as tmux_manager
 from ..telegram_origin import send_telegram_to_window
+from ...session_protocol.telegram import adapter_for
 from ..callback_data import CB_WIN_BIND, CB_WIN_CANCEL, CB_WIN_NEW
 from ..callback_helpers import get_thread_id
 from .directory_browser import (
@@ -151,6 +152,7 @@ async def _forward_pending_text(
     text: str,
     provider_name: str,
     *,
+    adapter,
     is_existing_window: bool = False,
     chat_id: int | None = None,
 ) -> None:
@@ -171,14 +173,20 @@ async def _forward_pending_text(
         from ..shell.shell_commands import handle_shell_message
 
         await handle_shell_message(
-            client, user_id, thread_id, window_id, text, chat_id=chat_id
+            client,
+            user_id,
+            thread_id,
+            window_id,
+            text,
+            chat_id=chat_id,
+            adapter=adapter,
         )
     else:
         # For non-shell providers or existing shell windows, send raw text.
         # Existing shell windows skip handle_shell_message to avoid
         # _ensure_prompt_marker racing with the offer keyboard just shown.
         send_ok, send_msg = await send_telegram_to_window(
-            user_id, window_id, thread_id, text, chat_id
+            user_id, window_id, thread_id, text, chat_id, adapter=adapter
         )
         if not send_ok:
             logger.warning(
@@ -284,6 +292,7 @@ async def _handle_bind(
             selected_wid,
             pending_text,
             detected,
+            adapter=adapter_for(context.bot_data),
             is_existing_window=True,
             chat_id=(
                 update.callback_query.message.chat.id

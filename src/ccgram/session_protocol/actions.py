@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import re
 import time
 from weakref import WeakValueDictionary
@@ -128,6 +130,26 @@ def _validate_response_data(data: dict[str, Any]) -> None:
         raise ProtocolError(400, "invalid_request", "Choose optionId or answer")
 
 
+def _validate_internal_action(action: Action) -> Action:
+    if action.kind not in {"terminal.submit", "message.followup", "session.split"}:
+        raise ProtocolError(422, "unsupported_action", "Unsupported adapter operation")
+    try:
+        if str(UUID(action.id)) != action.id.lower():
+            raise ValueError
+    except ValueError as exc:
+        raise ProtocolError(400, "invalid_request", "id must be a UUID") from exc
+    if type(action.binding_version) is not int or action.binding_version < 1:
+        raise ProtocolError(400, "invalid_request", "Invalid bindingVersion")
+    if not isinstance(action.data, dict):
+        raise ProtocolError(400, "invalid_request", "Action data must be an object")
+    if action.kind == "session.split":
+        if action.data:
+            raise ProtocolError(400, "invalid_request", "session.split takes no data")
+    else:
+        _string(action.data, "text")
+    return action
+
+
 class ActionExecutor:
     def __init__(self, service: LocalSessionService) -> None:
         self.service = service
@@ -136,17 +158,64 @@ class ActionExecutor:
         )
 
     async def execute(
-        self, session_id: str, action: Action
+        self,
+        session_id: str,
+        action: Action,
+        *,
+        pane_id: str | None = None,
+        expected_prompt: str | None = None,
     ) -> tuple[ActionResult, int]:
         # Validate in-process clients too; the HTTP decoder is not a trust boundary.
         action = parse_action(wire(action))
         lock = self._action_locks.setdefault(action.id, asyncio.Lock())
         async with lock:
-            return await self._once(session_id, action)
+            return await self._once(
+                session_id, action, pane_id=pane_id, expected_prompt=expected_prompt
+            )
 
-    async def _once(self, session_id: str, action: Action) -> tuple[ActionResult, int]:
+    async def execute_internal(
+        self,
+        session_id: str,
+        action: Action,
+        *,
+        pane_id: str | None = None,
+        expected_prompt: str | None = None,
+    ) -> tuple[ActionResult, int]:
+        """Run adapter-only semantic actions through the shared action lifecycle."""
+        action = _validate_internal_action(action)
+        lock = self._action_locks.setdefault(action.id, asyncio.Lock())
+        async with lock:
+            return await self._once(
+                session_id,
+                action,
+                internal=True,
+                pane_id=pane_id,
+                expected_prompt=expected_prompt,
+            )
+
+    async def _once(
+        self,
+        session_id: str,
+        action: Action,
+        *,
+        internal: bool = False,
+        pane_id: str | None = None,
+        expected_prompt: str | None = None,
+    ) -> tuple[ActionResult, int]:
         store = self.service.store
         fingerprint = store.action_fingerprint(session_id, action)
+        if pane_id is not None or expected_prompt is not None:
+            fingerprint = hashlib.sha256(
+                json.dumps(
+                    [
+                        "ccgram/action-execution-context/v1",
+                        fingerprint,
+                        pane_id,
+                        expected_prompt,
+                    ],
+                    separators=(",", ":"),
+                ).encode()
+            ).hexdigest()
         previous = store.action(action.id, fingerprint)
         if previous is not None:
             return previous
@@ -155,12 +224,36 @@ class ActionExecutor:
         try:
             target, _ = await self.service.current(session_id)
             async with input_lock(target.id):
-                target = await self._preflight(session_id, action)
+                target = await self._preflight(
+                    session_id,
+                    action,
+                    internal=internal,
+                    pane_id=pane_id,
+                    expected_prompt=expected_prompt,
+                )
                 sent_at = time.time()
                 attempted = True
                 async with asyncio.timeout(10):
-                    success = await self._perform(session_id, target, action)
-                result = ActionResult(action.id, "sent" if success else "unknown")
+                    effect = (
+                        await self._perform_split(session_id, target)
+                        if action.kind == "session.split"
+                        else await self._perform(session_id, target, action)
+                    )
+                success = bool(effect)
+                result = ActionResult(
+                    action.id,
+                    "sent" if success else "unknown",
+                    data={"paneId": effect}
+                    if action.kind == "session.split" and isinstance(effect, str)
+                    else None,
+                    error={
+                        "code": "backend_unavailable",
+                        "message": "Could not confirm split",
+                        "details": {},
+                    }
+                    if action.kind == "session.split" and not success
+                    else None,
+                )
                 if success:
                     await self._record_delivery(session_id, target, action, sent_at)
         except ProtocolError as exc:
@@ -190,8 +283,42 @@ class ActionExecutor:
         self.service.hub.publish("action.updated", session_id, result)
         return result, 200
 
-    async def _preflight(self, session_id: str, action: Action) -> Target:
+    async def _preflight(
+        self,
+        session_id: str,
+        action: Action,
+        *,
+        internal: bool = False,
+        pane_id: str | None = None,
+        expected_prompt: str | None = None,
+    ) -> Target:
         target, snapshot = await self.service.current(session_id)
+        self._validate_target(target, snapshot, action)
+        if action.kind in {
+            "message.send",
+            "request.respond",
+        } and self.service.requests.has_deferred(session_id):
+            raise ProtocolError(409, "request_open", "Hook evidence awaits processing")
+        if action.kind == "request.respond":
+            await self._validate_response(session_id, target, action)
+        self._validate_action_capability(target, snapshot, action, internal)
+        self._validate_message_request(session_id, action)
+        if action.kind == "message.send":
+            self.service.uploads.message_text(
+                action.data["text"], action.data.get("files", [])
+            )
+        if pane_id is not None:
+            target = await self.service.backend.select_pane(target, pane_id)
+        if expected_prompt is not None:
+            prompt = await self.service.backend.prompt(target)
+            if prompt is None or prompt.fingerprint != expected_prompt:
+                raise ProtocolError(
+                    409, "binding_conflict", "Interactive prompt changed before input"
+                )
+        return target
+
+    @staticmethod
+    def _validate_target(target: Target, snapshot: Any, action: Action) -> None:
         if snapshot.binding_version != action.binding_version:
             raise ProtocolError(
                 409, "binding_conflict", "Session binding changed", snapshot
@@ -202,13 +329,12 @@ class ActionExecutor:
                 "backend_unavailable",
                 "Foreground process could not be verified",
             )
-        if action.kind in {
-            "message.send",
-            "request.respond",
-        } and self.service.requests.has_deferred(session_id):
-            raise ProtocolError(409, "request_open", "Hook evidence awaits processing")
-        if action.kind == "request.respond":
-            await self._validate_response(session_id, target, action)
+
+    def _validate_action_capability(
+        self, target: Target, snapshot: Any, action: Action, internal: bool
+    ) -> None:
+        if action.kind == "session.split":
+            return
         if action.kind == "session.resume" and (
             target.provider != "shell"
             or action.data["conversationId"] != target.conversation_id
@@ -218,12 +344,24 @@ class ActionExecutor:
                 "unsupported_action",
                 "Resume requires the previous conversation in a shell",
             )
-        if action.kind not in snapshot.capabilities:
+        public_kind = {
+            "terminal.submit": "terminal.paste",
+            "message.followup": "message.send",
+        }.get(action.kind, action.kind)
+        if public_kind not in snapshot.capabilities:
             raise ProtocolError(
                 422,
                 "unsupported_action",
                 "Session does not support this action",
             )
+        if internal and action.kind == "message.followup" and target.provider != "pi":
+            raise ProtocolError(
+                422,
+                "unsupported_action",
+                "Follow-up input is supported for Pi sessions",
+            )
+
+    def _validate_message_request(self, session_id: str, action: Action) -> None:
         if (
             action.kind == "message.send"
             and self.service.requests.get(session_id)
@@ -232,11 +370,6 @@ class ActionExecutor:
             raise ProtocolError(
                 409, "request_open", "Sending text requires dismissRequest"
             )
-        if action.kind == "message.send":
-            self.service.uploads.message_text(
-                action.data["text"], action.data.get("files", [])
-            )
-        return target
 
     async def _record_delivery(
         self, session_id: str, target: Target, action: Action, sent_at: float
@@ -276,9 +409,17 @@ class ActionExecutor:
                 409, "request_closed", "Prompt changed before the response"
             )
 
+    async def _perform_split(self, session_id: str, target: Target) -> str | None:
+        pane_id = await self.service.backend.split(target)
+        if pane_id:
+            await self.service.current(session_id)
+        return pane_id
+
     async def _perform(self, session_id: str, target: Target, action: Action) -> bool:
         backend = self.service.backend
         kind, data = action.kind, action.data
+        if kind in {"terminal.submit", "message.followup"}:
+            return await self._perform_internal(target, action)
         if kind == "message.send":
             return await self._send_message(session_id, target, action)
         if kind == "request.respond":
@@ -291,12 +432,22 @@ class ActionExecutor:
                 self.service.requests.close(session_id, "interrupted")
             return success
         if kind == "terminal.paste":
-            return await backend.send_text(target, data["text"], enter=False)
-        if kind == "session.close":
-            return await backend.close(target)
-        if kind == "session.rename":
-            return await backend.rename(target, data["title"])
+            return await backend.send_text(target, data["text"], enter=False, raw=True)
+        if kind in {"session.close", "session.rename"}:
+            return await self._perform_session_action(target, action)
         return await backend.resume(target, data["conversationId"])
+
+    async def _perform_internal(self, target: Target, action: Action) -> bool:
+        if action.kind == "terminal.submit":
+            return await self.service.backend.send_text(
+                target, action.data["text"], enter=True, raw=True
+            )
+        return await self.service.backend.send_followup(target, action.data["text"])
+
+    async def _perform_session_action(self, target: Target, action: Action) -> bool:
+        if action.kind == "session.close":
+            return await self.service.backend.close(target)
+        return await self.service.backend.rename(target, action.data["title"])
 
     async def _send_keys(self, target: Target, keys: list[str]) -> bool:
         for key in keys:

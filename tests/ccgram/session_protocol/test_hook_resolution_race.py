@@ -9,11 +9,11 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from ccgram.api.runtime import ProtocolRuntime
 from ccgram.providers.base import HookEvent
 from ccgram.session_protocol import service as service_module
 from ccgram.session_protocol.backend import Prompt
 from ccgram.session_protocol.requests import hook_input_hash
+from ccgram.session_protocol.runtime import ProtocolRuntime
 
 
 async def test_obsolete_unmatched_resolution_preserves_newer_queued_evidence(
@@ -48,16 +48,16 @@ async def test_obsolete_unmatched_resolution_preserves_newer_queued_evidence(
     entered, release = asyncio.Event(), threading.Event()
     loop = asyncio.get_running_loop()
 
-    def delayed_read(source):
+    def delayed_read(source, provider):
         if not release.is_set():
             loop.call_soon_threadsafe(entered.set)
             if not release.wait(5):
                 raise TimeoutError("test did not release transcript read")
-        return read_entries(source)
+        return read_entries(source, provider)
 
     monkeypatch.setattr(service_module, "read_entries", delayed_read)
     monkeypatch.setattr(
-        "ccgram.api.runtime.asyncio.sleep",
+        "ccgram.session_protocol.runtime.asyncio.sleep",
         AsyncMock(side_effect=asyncio.CancelledError),
     )
     now = time.time()

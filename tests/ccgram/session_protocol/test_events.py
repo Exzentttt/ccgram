@@ -1,3 +1,5 @@
+import asyncio
+
 import pytest
 
 from ccgram.session_protocol.events import EventHub, ResyncRequiredError
@@ -46,6 +48,55 @@ async def test_slow_subscriber_requires_resync_without_blocking_another():
     assert (await fast.get()).data == {"text": "second"}
     hub.unsubscribe(slow)
     hub.unsubscribe(fast)
+
+
+async def test_durable_consumers_are_awaited_separately_from_replay_ring():
+    hub = EventHub()
+    received = []
+
+    async def consume(payload):
+        received.append(payload)
+
+    hub.register_durable_consumer("telegram", consume)
+    assert hub.durable_consumer_names() == ("telegram",)
+    await hub.dispatch_durable("telegram", {"records": ["entry"]})
+
+    assert received == [{"records": ["entry"]}]
+    assert hub.replay(hub.epoch, 0) == (True, [])
+
+    hub.unregister_durable_consumer("telegram")
+    assert hub.durable_consumer_names() == ()
+    with pytest.raises(KeyError, match="not registered"):
+        await hub.dispatch_durable("telegram", object())
+
+
+async def test_unread_remote_subscriber_does_not_delay_durable_delivery():
+    hub = EventHub(queue_capacity=1)
+    remote = hub.subscribe()
+    delivered = asyncio.Event()
+
+    async def consume(_payload):
+        delivered.set()
+
+    hub.register_durable_consumer("telegram", consume)
+    await asyncio.wait_for(hub.dispatch_durable("telegram", object()), timeout=0.1)
+
+    assert delivered.is_set()
+    assert remote.queue.empty()
+    hub.unsubscribe(remote)
+
+
+def test_durable_consumer_names_must_be_unique_and_nonempty():
+    hub = EventHub()
+
+    async def consume(_payload):
+        return None
+
+    with pytest.raises(ValueError, match="must not be empty"):
+        hub.register_durable_consumer("", consume)
+    hub.register_durable_consumer("telegram", consume)
+    with pytest.raises(ValueError, match="already registered"):
+        hub.register_durable_consumer("telegram", consume)
 
 
 def test_published_payload_is_immutable_snapshot():

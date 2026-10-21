@@ -589,7 +589,7 @@ class TestProbeFailures:
         bot = AsyncMock(spec=Bot)
         with patch("ccgram.handlers.topics.topic_lifecycle.thread_router") as mock_tr:
             mock_tr.iter_thread_bindings.return_value = [(1, 42, "@5")]
-            await probe_topic_existence(bot)
+            await probe_topic_existence(bot, MagicMock())
         bot.unpin_all_forum_topic_messages.assert_not_called()
 
     async def test_probe_retries_after_suspension_expires(self) -> None:
@@ -613,7 +613,7 @@ class TestProbeFailures:
         ):
             mock_tr.iter_thread_bindings.return_value = [(1, 42, "@5")]
             mock_tr.resolve_chat_id.return_value = -100
-            await probe_topic_existence(bot)
+            await probe_topic_existence(bot, MagicMock())
 
         bot.unpin_all_forum_topic_messages.assert_not_called()
 
@@ -631,7 +631,7 @@ class TestProbeFailures:
         ):
             mock_tr.iter_thread_bindings.return_value = [(1, 42, "@5")]
             mock_tr.resolve_chat_id.return_value = -100
-            await probe_topic_existence(bot)
+            await probe_topic_existence(bot, MagicMock())
 
         bot.unpin_all_forum_topic_messages.assert_awaited_once_with(
             chat_id=-100,
@@ -647,7 +647,7 @@ class TestProbeFailures:
         with patch("ccgram.handlers.topics.topic_lifecycle.thread_router") as mock_tr:
             mock_tr.iter_thread_bindings.return_value = [(1, 42, "@5")]
             mock_tr.resolve_chat_id.return_value = -100
-            await probe_topic_existence(bot)
+            await probe_topic_existence(bot, MagicMock())
         assert (
             _window_poll_state.get("@5") is None
             or _window_poll_state["@5"].probe_failures == 0
@@ -671,7 +671,7 @@ class TestProbeFailures:
         with patch("ccgram.handlers.topics.topic_lifecycle.thread_router") as mock_tr:
             mock_tr.iter_thread_bindings.return_value = [(1, 42, "@5")]
             mock_tr.resolve_chat_id.return_value = -100
-            await probe_topic_existence(bot)
+            await probe_topic_existence(bot, MagicMock())
         assert _window_poll_state["@5"].probe_failures == 1
 
     async def test_probe_suspends_after_max_failures(self) -> None:
@@ -683,7 +683,7 @@ class TestProbeFailures:
             for _ in range(MAX_PROBE_FAILURES + 1):
                 # Stands in for PROBE_INTERVAL elapsing between poll cycles.
                 reset_probe_schedule()
-                await probe_topic_existence(bot)
+                await probe_topic_existence(bot, MagicMock())
         assert bot.unpin_all_forum_topic_messages.call_count == MAX_PROBE_FAILURES
         assert _window_poll_state["@5"].probe_failures == MAX_PROBE_FAILURES
 
@@ -714,7 +714,7 @@ class TestProbeFailures:
                 return_value=mock_window if window_alive else None
             )
             mock_tm.kill_window = AsyncMock()
-            await probe_topic_existence(bot)
+            await probe_topic_existence(bot, MagicMock())
         mock_tm.kill_window.assert_not_called()
         mock_cleanup.assert_called_once_with(1, 42, bot, window_id="@5", chat_id=-100)
         mock_tr.unbind_thread.assert_called_once_with(
@@ -2186,7 +2186,7 @@ class TestDeadWindowNotification:
             mock_tr.resolve_chat_id.return_value = -100
             mock_tm.find_window_by_id = AsyncMock(return_value=mock_window)
             mock_tm.kill_window = AsyncMock()
-            await probe_topic_existence(bot)
+            await probe_topic_existence(bot, MagicMock())
 
         mock_tm.kill_window.assert_not_called()
         mock_cleanup.assert_called_once_with(1, 42, bot, window_id="@5", chat_id=-100)

@@ -50,5 +50,6 @@
       "level": null
     }
   ],
-  "actionId": null
+  "actionId": null,
+  "phase": null
 }
