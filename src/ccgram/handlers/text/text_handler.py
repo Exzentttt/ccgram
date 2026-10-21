@@ -54,6 +54,10 @@ from ..messaging_pipeline.message_sender import (
 )
 from ..recovery.recovery_banner import RecoveryBanner, render_banner
 from ..recovery.transcript_discovery import discover_and_register_transcript
+from ...session_protocol.telegram import (
+    TelegramSessionAdapter,
+    adapter_for as protocol_adapter_for,
+)
 from ..polling.polling_state import lifecycle_strategy
 from ..telegram_origin import (
     agent_origin_returned_to_shell,
@@ -343,6 +347,8 @@ async def _handle_dead_window(
     text: str,
     user_data: dict | None,
     message: Message,
+    *,
+    adapter: TelegramSessionAdapter,
 ) -> bool:
     """Show recovery UI or directory browser for a dead (killed) window.
 
@@ -407,7 +413,9 @@ async def _handle_dead_window(
             )
             return True
 
-        returned_to_shell = await discover_and_register_transcript(window_id, _window=w)
+        returned_to_shell = await discover_and_register_transcript(
+            window_id, _window=w, adapter=adapter
+        )
 
     if w is not None and not returned_to_shell:
         lifecycle_strategy.clear_dead_notification(user_id, thread_id)
@@ -724,7 +732,13 @@ async def handle_text_message(
     assert window_id is not None  # _handle_unbound_topic returned False
 
     if await _handle_dead_window(
-        window_id, user.id, thread_id, text, context.user_data, message
+        window_id,
+        user.id,
+        thread_id,
+        text,
+        context.user_data,
+        message,
+        adapter=protocol_adapter_for(context.bot_data),
     ):
         return
 

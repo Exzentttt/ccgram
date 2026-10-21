@@ -112,6 +112,12 @@ cannot constrain what a device does through those terminal controls. Pair only
 trusted operator devices. A shell accepts raw terminal input. `message.send` is
 unavailable there, so an agent message cannot accidentally become a shell command.
 
+An existing terminal target can still be closed when its transcript is unreadable
+or its foreground is unknown. The session advertises `session.close` in this
+state. Closing requires a confirmed target and the current binding version.
+An unavailable backend or stale binding rejects the action. Input remains blocked
+until the source and foreground can be verified.
+
 APNs registration returns `422 unsupported_action`. `push.apns` is absent from
 capabilities. Telegram remains the notification channel. This implementation does
 not install or publish an iOS application.

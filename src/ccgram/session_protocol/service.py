@@ -158,7 +158,7 @@ class LocalSessionService:
         capabilities = tuple(
             k
             for k in SUPPORTED_ACTIONS
-            if target.foreground_verified
+            if (k == "session.close" or target.foreground_verified)
             and (k != "message.send" or target.provider not in {"shell", "unknown"})
             and (
                 k != "request.respond"

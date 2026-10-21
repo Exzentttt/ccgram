@@ -9,12 +9,14 @@ from __future__ import annotations
 import json
 import re
 import difflib
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field, fields, replace
 from pathlib import Path
 from datetime import UTC, datetime
 from typing import Any
 
 from .models import Message, Part
+
+_PART_FIELDS = frozenset(part_field.name for part_field in fields(Part)) - {"id"}
 
 _ANTIGRAVITY_METADATA_RE = re.compile(
     r"<(ADDITIONAL_METADATA|USER_SETTINGS_CHANGE|USER_INFORMATION|USER_RULES|SKILLS|PLUGINS|SUBAGENTS|MESSAGING|CONVERSATION_TRANSCRIPT|ARTIFACTS|SLASH_COMMANDS|GUIDELINES|COMMUNICATION_STYLE)>[\s\S]*?</\1>",
@@ -230,6 +232,7 @@ class TranscriptParserState:
     tool_summaries: dict[str, str] = field(default_factory=dict)
     tool_diffs: dict[str, dict[str, Any]] = field(default_factory=dict)
     pending_tools: dict[str, str] = field(default_factory=dict)
+    claude_local_command_name: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -508,7 +511,9 @@ def _chat(entry: SourceEntry, provider: str) -> TranscriptRecord | None:
     )
 
 
-def _claude(entry: SourceEntry) -> TranscriptRecord | None:
+def _claude(
+    entry: SourceEntry, state: TranscriptParserState
+) -> TranscriptRecord | None:
     record = _chat(entry, "claude")
     if record is None:
         return None
@@ -528,25 +533,9 @@ def _claude(entry: SourceEntry) -> TranscriptRecord | None:
             and part.get("type") == "text"
             and isinstance(part.get("text"), str)
         )
-        command = _CLAUDE_COMMAND_NAME_RE.search(text)
-        stdout = _CLAUDE_LOCAL_STDOUT_RE.search(text)
-        if command:
-            if stdout is None:
-                return None
-            return replace(
-                record,
-                role="agent",
-                parts=(
-                    {
-                        "type": "notice",
-                        "level": "info",
-                        "text": stdout.group(1).strip(),
-                        "source": "local_command",
-                        "command": command.group(1).strip(),
-                    },
-                ),
-                results=(),
-            )
+        local_command = _claude_local_command(record, text, state)
+        if local_command is not record:
+            return local_command
     parts = []
     for part in record.parts:
         text = part.get("text")
@@ -557,6 +546,88 @@ def _claude(entry: SourceEntry) -> TranscriptRecord | None:
             part = {**part, "text": text}
         parts.append(part)
     return replace(record, parts=tuple(parts))
+
+
+def _claude_local_command(
+    record: TranscriptRecord, text: str, state: TranscriptParserState
+) -> TranscriptRecord | None:
+    command = _CLAUDE_COMMAND_NAME_RE.search(text)
+    stdout = _CLAUDE_LOCAL_STDOUT_RE.search(text)
+    if command is not None:
+        state.claude_local_command_name = command.group(1).strip()
+    if stdout is not None:
+        command_name = state.claude_local_command_name or ""
+        state.claude_local_command_name = None
+        return replace(
+            record,
+            role="agent",
+            parts=(
+                {
+                    "type": "notice",
+                    "level": "info",
+                    "text": stdout.group(1).strip(),
+                    "source": "local_command",
+                    "command": command_name,
+                },
+            ),
+            results=(),
+        )
+    if command is not None:
+        return None
+    return record
+
+
+def _pi(entry: SourceEntry) -> TranscriptRecord | None:
+    data = entry.data
+    message = data.get("message")
+    message = message if isinstance(message, dict) else None
+    execution = (
+        message
+        if message is not None and message.get("role") == "bashExecution"
+        else data
+        if data.get("type") == "bashExecution"
+        else None
+    )
+    if execution is None:
+        return _chat(entry, "pi")
+    if execution.get("excludeFromContext") or data.get("excludeFromContext"):
+        return None
+
+    command = execution.get("command")
+    output = execution.get("output")
+    command = command if isinstance(command, str) else ""
+    output = output if isinstance(output, str) else ""
+    exit_code = execution.get("exitCode")
+    cancelled = bool(execution.get("cancelled"))
+    lines = []
+    if command:
+        lines.append(f"$ {command}")
+    if output:
+        lines.append(output)
+    if cancelled:
+        lines.append("(cancelled)")
+    elif isinstance(exit_code, int) and exit_code != 0:
+        lines.append(f"exit code {exit_code}")
+    if not lines:
+        return None
+
+    timestamp = data.get("timestamp") or execution.get("timestamp")
+    return TranscriptRecord(
+        str(data.get("id") or execution.get("id") or f"o{entry.offset}"),
+        "agent",
+        timestamp if isinstance(timestamp, str) else None,
+        (
+            {
+                "type": "notice",
+                "level": (
+                    "error"
+                    if not cancelled and isinstance(exit_code, int) and exit_code != 0
+                    else "info"
+                ),
+                "text": "\n".join(lines),
+            },
+        ),
+    )
 
 
 def _antigravity_role(data: dict[str, Any], kind: str) -> str | None:
@@ -714,8 +785,10 @@ def parse_records(
             if provider == "gemini"
             else _antigravity(entry)
             if provider == "antigravity"
-            else _claude(entry)
+            else _claude(entry, parser_state)
             if provider == "claude"
+            else _pi(entry)
+            if provider == "pi"
             else _chat(entry, provider)
         )
         if record is None:
@@ -843,7 +916,11 @@ def build_messages(
         contributors.setdefault(message_id, set()).add(entry.offset)
         previous = messages.get(message_id)
         parts = tuple(
-            Part(id=f"{message_id}#{i}", **part) for i, part in enumerate(record.parts)
+            Part(
+                id=f"{message_id}#{i}",
+                **{name: value for name, value in part.items() if name in _PART_FIELDS},
+            )
+            for i, part in enumerate(record.parts)
         )
         messages[message_id] = Message(
             message_id,

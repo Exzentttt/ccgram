@@ -57,6 +57,7 @@ def _patch_recovery_session_manager():
     """
     with (
         patch(f"{_RC}.session_manager"),
+        patch(f"{_TH}.protocol_adapter_for", return_value=MagicMock()),
         patch(
             "ccgram.multiplexer.reconciliation.list_windows_for_reconciliation",
             new_callable=AsyncMock,

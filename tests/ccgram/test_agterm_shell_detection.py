@@ -121,10 +121,17 @@ async def test_unsupported_prompt_setup_does_not_offer_an_unusable_keyboard(
     monkeypatch.setattr("ccgram.multiplexer.multiplexer", mux)
     monkeypatch.setattr("ccgram.multiplexer.get_active_multiplexer", lambda: mux)
     client = AsyncMock()
+    adapter = AsyncMock()
     await ensure_setup(
-        SESSION, "provider_switch", client=client, chat_id=-871, thread_id=871
+        SESSION,
+        "provider_switch",
+        adapter=adapter,
+        client=client,
+        chat_id=-871,
+        thread_id=871,
     )
     client.send_message.assert_not_awaited()
+    adapter.setup_prompt.assert_not_awaited()
 
 
 async def test_shell_hint_never_injects_prompt_setup_into_a_possible_builtin(
@@ -133,10 +140,10 @@ async def test_shell_hint_never_injects_prompt_setup_into_a_possible_builtin(
     mux = manager({"foregroundShell": "fish"})
     monkeypatch.setattr("ccgram.multiplexer.multiplexer", mux)
     monkeypatch.setattr("ccgram.multiplexer.get_active_multiplexer", lambda: mux)
-    send = AsyncMock()
+    adapter = AsyncMock()
     capture = AsyncMock(return_value="read> ")
 
-    await setup_shell_prompt(SESSION, send_keys_fn=send, capture_fn=capture)
+    await setup_shell_prompt(SESSION, adapter=adapter, capture_fn=capture)
 
-    send.assert_not_awaited()
+    adapter.setup_prompt.assert_not_awaited()
     capture.assert_not_awaited()

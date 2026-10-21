@@ -60,7 +60,11 @@ def _clean_shell_state():
     _TEST_ADAPTER.send_keys.reset_mock(return_value=True, side_effect=True)
     _TEST_ADAPTER.send_text.return_value = (True, "Sent")
     _TEST_ADAPTER.send_keys.return_value = (True, "Sent")
-    yield
+    with patch(
+        "ccgram.handlers.shell.shell_prompt_orchestrator.ensure_setup",
+        new_callable=AsyncMock,
+    ):
+        yield
     _shell_pending.clear()
     _generation_counter.clear()
     _shell_hint_seen.clear()
@@ -126,6 +130,7 @@ class TestHandleShellMessage:
         with (
             patch(f"{_MOD}.enqueue_status_update", new_callable=AsyncMock),
             patch(f"{_MOD}.lifecycle_strategy.clear_probe_failures"),
+            patch(f"{_MOD}._ensure_prompt_marker", new_callable=AsyncMock) as prompt,
             patch(f"{_CTX}.view_window"),
             patch(f"{_MOD}.tmux_manager") as mock_tm,
             patch.object(
@@ -142,6 +147,7 @@ class TestHandleShellMessage:
             mock_tm.capture_pane = AsyncMock(return_value=None)
             await handle_shell_message(bot, 1, 42, "@0", "!ls -la", message)
 
+            prompt.assert_awaited_once_with("@0", adapter=_TEST_ADAPTER)
             mock_send.assert_awaited_once_with(
                 "@0",
                 "ls -la",
@@ -671,7 +677,7 @@ class TestLazyMarkerRecovery:
             mock_tm.capture_pane = AsyncMock(return_value=None)
             await handle_shell_message(bot, 1, 42, "@0", "!ls", message)
 
-        mock_ensure.assert_awaited_once_with("@0", "lazy")
+        mock_ensure.assert_awaited_once_with("@0", "lazy", adapter=_TEST_ADAPTER)
 
 
 class TestHasPromptMarker:

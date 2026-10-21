@@ -478,7 +478,7 @@ async def test_unknown_foreground_does_not_advertise_actions(mux, store, foregro
     mux.foreground.return_value = foreground
     service = LocalSessionService(MultiplexerSessionBackend(mux, "/tmp"), store)
     session = (await service.list_sessions())[0]
-    assert session.capabilities == ("terminal.view",)
+    assert session.capabilities == ("session.close", "terminal.view")
 
 
 @pytest.mark.parametrize(
@@ -659,3 +659,125 @@ async def test_antigravity_bound_history_survives_shared_core_cutover(
         ("user", "question"),
         ("agent", "answer"),
     ]
+
+
+@pytest.mark.parametrize("clear", [True, False])
+async def test_prompt_setup_uses_selected_pane_and_raw_submission(mux, store, clear):
+    mux.foreground.return_value = ForegroundInfo(23, 23, ["bash"], "/tmp")
+    mux.list_panes.return_value = [PaneInfo("%1", 0, True, "bash", "/tmp", 80, 24)]
+    service = LocalSessionService(MultiplexerSessionBackend(mux, "/tmp"), store)
+    adapter = adapter_for({"session_service": service})
+    target, snapshot = await adapter.resolve("@1")
+
+    success, _ = await adapter.setup_prompt(
+        "@1",
+        "setup command",
+        clear=clear,
+        pane_id=target.pane_id,
+        expected_binding_version=snapshot.binding_version,
+    )
+
+    assert success
+    assert mux.send_to_pane.await_args_list == [
+        call("%1", "C-c", enter=False, literal=False, window_id="@1"),
+        call("%1", "setup command", enter=True, literal=True, window_id="@1", raw=True),
+        *(
+            [call("%1", "clear", enter=True, literal=True, window_id="@1", raw=True)]
+            if clear
+            else []
+        ),
+    ]
+
+
+@pytest.mark.parametrize("change", ["provider", "pane", "script", "unavailable"])
+async def test_prompt_setup_revalidates_before_second_write(mux, store, change):
+    mux.foreground.return_value = ForegroundInfo(23, 23, ["bash"], "/tmp")
+    mux.list_panes.return_value = [PaneInfo("%1", 0, True, "bash", "/tmp", 80, 24)]
+    service = LocalSessionService(MultiplexerSessionBackend(mux, "/tmp"), store)
+    adapter = adapter_for({"session_service": service})
+    target, snapshot = await adapter.resolve("@1")
+
+    async def change_after_interrupt(*args, **kwargs):
+        if change == "provider":
+            mux.foreground.return_value = ForegroundInfo(24, 24, ["claude"], "/tmp")
+        elif change == "pane":
+            mux.list_panes.return_value = []
+        elif change == "script":
+            mux.foreground.return_value = ForegroundInfo(
+                23, 23, ["bash", "script.sh"], "/tmp"
+            )
+        else:
+            mux.foreground.return_value = None
+        return True
+
+    mux.send_to_pane.side_effect = change_after_interrupt
+    success, _ = await adapter.setup_prompt(
+        "@1",
+        "setup command",
+        clear=True,
+        pane_id=target.pane_id,
+        expected_binding_version=snapshot.binding_version,
+    )
+
+    assert not success
+    mux.send_to_pane.assert_awaited_once_with(
+        "%1", "C-c", enter=False, literal=False, window_id="@1"
+    )
+
+
+@pytest.mark.parametrize("change", ["binding", "provider", "pane"])
+async def test_prompt_setup_stale_resolution_sends_nothing(mux, store, change):
+    mux.foreground.return_value = ForegroundInfo(23, 23, ["bash"], "/tmp")
+    mux.list_panes.return_value = [PaneInfo("%1", 0, True, "bash", "/tmp", 80, 24)]
+    service = LocalSessionService(MultiplexerSessionBackend(mux, "/tmp"), store)
+    adapter = adapter_for({"session_service": service})
+    target, snapshot = await adapter.resolve("@1")
+    if change == "binding":
+        mux.foreground.return_value = ForegroundInfo(24, 24, ["bash"], "/tmp")
+    elif change == "provider":
+        mux.foreground.return_value = ForegroundInfo(24, 24, ["claude"], "/tmp")
+    else:
+        mux.list_panes.return_value = []
+
+    success, _ = await adapter.setup_prompt(
+        "@1",
+        "setup command",
+        clear=True,
+        pane_id=target.pane_id,
+        expected_binding_version=snapshot.binding_version,
+    )
+
+    assert not success
+    mux.send_to_pane.assert_not_awaited()
+
+
+async def test_close_can_kill_confirmed_window_without_foreground_or_capture(
+    mux, store
+):
+    mux.foreground.return_value = None
+    mux.capture_pane_by_id.return_value = None
+    mux.kill_window.return_value = True
+    service = LocalSessionService(MultiplexerSessionBackend(mux, "/tmp"), store)
+    adapter = adapter_for({"session_service": service})
+    _, snapshot = await adapter.resolve("@1")
+    assert snapshot.capabilities == ("session.close", "terminal.view")
+
+    success, _ = await adapter.close("@1")
+
+    assert success
+    mux.kill_window.assert_awaited_once_with("@1")
+
+
+@pytest.mark.parametrize("windows", [None, []])
+async def test_close_never_kills_when_native_presence_is_unconfirmed(
+    mux, store, windows
+):
+    service = LocalSessionService(MultiplexerSessionBackend(mux, "/tmp"), store)
+    adapter = adapter_for({"session_service": service})
+    await adapter.resolve("@1")
+    mux.list_windows_for_reconciliation.return_value = windows
+
+    success, _ = await adapter.close("@1")
+
+    assert not success
+    mux.kill_window.assert_not_awaited()

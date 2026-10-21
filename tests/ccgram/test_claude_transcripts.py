@@ -205,6 +205,10 @@ class TestCanonicalClaudeTranscript:
                 },
             }
         )
+        messages = build_messages(entries, "session", "claude")
+        assert len(messages) == 1
+        assert messages[0].role == "agent"
+        assert messages[0].parts[0].text == "all good"
         records, state = parse_records(entries, "claude")
 
         rendered = render_protocol_records("session", "claude", records, state)
@@ -214,6 +218,83 @@ class TestCanonicalClaudeTranscript:
         assert "/status" in rendered[0].text
         assert "all good" in rendered[0].text
         assert "<local-command-stdout>" not in rendered[0].text
+
+    def test_local_command_stdout_uses_prior_invocation_across_batches(self) -> None:
+        invocation = self._entries(
+            {
+                "type": "user",
+                "uuid": "command-invocation",
+                "message": {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "<command-name>/status</command-name>",
+                        }
+                    ],
+                },
+            }
+        )
+        stdout = self._entries(
+            {
+                "type": "user",
+                "uuid": "command-stdout",
+                "message": {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "<local-command-stdout>ready</local-command-stdout>",
+                        }
+                    ],
+                },
+            }
+        )
+        invocation_records, state = parse_records(invocation, "claude")
+        assert invocation_records == ()
+        stdout_records, state = parse_records(stdout, "claude", state)
+        assert len(stdout_records) == 1
+        assert stdout_records[0][1].role == "agent"
+        rendered = render_protocol_records("session", "claude", stdout_records, state)
+        assert len(rendered) == 1
+        assert rendered[0].content_type == "local_command"
+        assert "/status" in rendered[0].text
+        assert "ready" in rendered[0].text
+        assert "<local-command-stdout>" not in rendered[0].text
+
+        combined = build_messages(invocation + stdout, "session", "claude")
+        assert len(combined) == 1
+        assert combined[0].role == "agent"
+        assert combined[0].parts[0].text == "ready"
+
+    def test_standalone_local_command_stdout_is_an_agent_notice(self) -> None:
+        entries = self._entries(
+            {
+                "type": "user",
+                "uuid": "command-stdout",
+                "message": {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "<local-command-stdout>ready</local-command-stdout>",
+                        }
+                    ],
+                },
+            }
+        )
+
+        messages = build_messages(entries, "session", "claude")
+        records, state = parse_records(entries, "claude")
+        rendered = render_protocol_records("session", "claude", records, state)
+
+        assert len(messages) == 1
+        assert messages[0].role == "agent"
+        assert messages[0].parts[0].text == "ready"
+        assert len(rendered) == 1
+        assert rendered[0].role == "assistant"
+        assert rendered[0].content_type == "local_command"
+        assert rendered[0].text == "`ready`"
 
     def test_internal_user_metadata_is_not_rendered_as_chat(self) -> None:
         entries = self._entries(

@@ -48,6 +48,7 @@ def _use_session_adapter(monkeypatch):
     monkeypatch.setattr(
         "ccgram.session_protocol.telegram.adapter_for", lambda _: _TEST_ADAPTER
     )
+    monkeypatch.setattr(f"{_TH}.protocol_adapter_for", lambda _: _TEST_ADAPTER)
 
 
 @pytest.fixture(autouse=True)
@@ -177,7 +178,9 @@ class TestHandleDeadWindow:
         )
         message = AsyncMock()
 
-        result = await _handle_dead_window("@0", 100, 42, "hello", {}, message)
+        result = await _handle_dead_window(
+            "@0", 100, 42, "hello", {}, message, adapter=_TEST_ADAPTER
+        )
 
         assert result is False
 
@@ -213,7 +216,9 @@ class TestHandleDeadWindow:
             mock_router.get_display_name.return_value = "project"
             mock_path.return_value.is_dir.return_value = True
 
-            result = await _handle_dead_window("@0", 100, 42, "hello", {}, message)
+            result = await _handle_dead_window(
+                "@0", 100, 42, "hello", {}, message, adapter=_TEST_ADAPTER
+            )
 
         assert result is True
         mock_reply.assert_awaited_once()
@@ -247,7 +252,7 @@ class TestHandleDeadWindow:
         with patch(f"{_TH}.Path") as mock_path:
             mock_path.return_value.is_dir.return_value = True
             result = await _handle_dead_window(
-                "@0", 100, 42, "hello", user_data, message
+                "@0", 100, 42, "hello", user_data, message, adapter=_TEST_ADAPTER
             )
 
         assert result is True
@@ -287,7 +292,9 @@ class TestHandleDeadWindow:
             caps.supports_resume = True
             with patch(f"{_TH}.Path") as mock_path:
                 mock_path.return_value.is_dir.return_value = True
-                await _handle_dead_window("@0", 100, 42, "hello", user_data, message)
+                await _handle_dead_window(
+                    "@0", 100, 42, "hello", user_data, message, adapter=_TEST_ADAPTER
+                )
 
         body = mock_reply.call_args.args[1]
         assert "Start fresh" in body
@@ -325,7 +332,7 @@ class TestHandleDeadWindow:
             str_mock = MagicMock(return_value="/cwd")
             mock_path.cwd.return_value.__str__ = str_mock
             result = await _handle_dead_window(
-                "@0", 100, 42, "hello", user_data, message
+                "@0", 100, 42, "hello", user_data, message, adapter=_TEST_ADAPTER
             )
 
         assert result is True
@@ -896,7 +903,9 @@ class TestDeadWindowNeedsAConfirmedRead:
             # An invalid cached cwd: the shape that reaches the unbind.
             mock_query.view_window.return_value = MagicMock(cwd="/nonexistent")
 
-            result = await _handle_dead_window("@0", 100, 42, "hi", {}, message)
+            result = await _handle_dead_window(
+                "@0", 100, 42, "hi", {}, message, adapter=_TEST_ADAPTER
+            )
 
         assert result is True
         mock_router.unbind_thread.assert_not_called()
@@ -937,7 +946,9 @@ class TestStaleDeadMarkerDoesNotOutliveTheWindow:
             # Stale cached cwd: the shape that otherwise reaches the unbind.
             mock_query.view_window.return_value = MagicMock(cwd="/nonexistent")
 
-            result = await _handle_dead_window("@0", 100, 42, "hi", {}, message)
+            result = await _handle_dead_window(
+                "@0", 100, 42, "hi", {}, message, adapter=_TEST_ADAPTER
+            )
 
         assert result is False
         mock_router.unbind_thread.assert_not_called()
@@ -975,7 +986,9 @@ class TestStaleDeadMarkerDoesNotOutliveTheWindow:
             mock_router.get_display_name.return_value = "project"
             mock_path.return_value.is_dir.return_value = True
 
-            result = await _handle_dead_window("@0", 100, 42, "hi", {}, message)
+            result = await _handle_dead_window(
+                "@0", 100, 42, "hi", {}, message, adapter=_TEST_ADAPTER
+            )
 
         assert result is True
         mock_reply.assert_awaited_once()
@@ -1022,7 +1035,9 @@ class TestUnknownAgentStateDoesNotClearTheMarker:
             mock_query.get_window_provider.return_value = bound_provider
             # Stale cached cwd: the shape that reaches the unbind.
             mock_query.view_window.return_value = MagicMock(cwd="/nonexistent")
-            result = await _handle_dead_window("@0", 100, 42, "hi", {}, message)
+            result = await _handle_dead_window(
+                "@0", 100, 42, "hi", {}, message, adapter=_TEST_ADAPTER
+            )
         return result, mock_router, mock_reply, mock_sync_provider
 
     @pytest.mark.parametrize("pane_command", ["", "vim", "less", "top", "bash"])
@@ -1091,7 +1106,13 @@ class TestUnknownAgentStateDoesNotClearTheMarker:
             mock_path.return_value.is_dir.return_value = True
 
             handled = await _handle_dead_window(
-                "@0", 100, 42, "keep this prompt", user_data, message
+                "@0",
+                100,
+                42,
+                "keep this prompt",
+                user_data,
+                message,
+                adapter=_TEST_ADAPTER,
             )
 
         assert handled is True

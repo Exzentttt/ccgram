@@ -18,6 +18,7 @@ from ccgram.session_protocol.messages import (
     parse_records,
     read_entries,
 )
+from ccgram.transcript_reader import render_protocol_records
 
 
 class TestEncodeCwdDirname:
@@ -122,6 +123,82 @@ class TestCanonicalTranscriptParsing:
         records, _ = parse_records(entries, "pi")
         assert records == ()
         assert read_entries(b"not json\n", "pi") == []
+
+    @pytest.mark.parametrize(
+        ("payload", "expected_text", "expected_level"),
+        [
+            pytest.param(
+                {"command": "ls", "output": "a\nb"},
+                "$ ls\na\nb",
+                "info",
+                id="success",
+            ),
+            pytest.param(
+                {"command": "false", "exitCode": 2},
+                "$ false\nexit code 2",
+                "error",
+                id="non-zero-exit",
+            ),
+            pytest.param(
+                {"command": "sleep 10", "output": "stopped", "cancelled": True},
+                "$ sleep 10\nstopped\n(cancelled)",
+                "info",
+                id="cancelled",
+            ),
+        ],
+    )
+    @pytest.mark.parametrize("envelope_type", ["bashExecution", "message"])
+    def test_bash_execution_is_visible_in_history_and_telegram_rendering(
+        self,
+        payload: dict,
+        expected_text: str,
+        expected_level: str,
+        envelope_type: str,
+    ) -> None:
+        message = {
+            "role": "bashExecution",
+            "timestamp": "2024-12-03T14:00:03.000Z",
+            **payload,
+        }
+        entry = SourceEntry(
+            0,
+            {"type": envelope_type, "id": "bash-1", "message": message},
+        )
+
+        records, state = parse_records([entry], "pi")
+        messages = build_messages([entry], "pi-test", "pi")
+        rendered = render_protocol_records("pi-test", "pi", records, state)
+
+        assert len(messages) == 1
+        assert messages[0].role == "agent"
+        assert messages[0].time == "2024-12-03T14:00:03.000Z"
+        assert messages[0].parts[0].type == "notice"
+        assert messages[0].parts[0].text == expected_text
+        assert messages[0].parts[0].level == expected_level
+        assert len(rendered) == 1
+        assert rendered[0].text == expected_text
+        assert rendered[0].role == "assistant"
+
+    def test_bash_execution_excluded_from_history_and_telegram(self) -> None:
+        entry = SourceEntry(
+            0,
+            {
+                "type": "bashExecution",
+                "id": "excluded-bash",
+                "message": {
+                    "role": "bashExecution",
+                    "command": "echo secret",
+                    "output": "secret",
+                    "excludeFromContext": True,
+                },
+            },
+        )
+
+        records, state = parse_records([entry], "pi")
+
+        assert records == ()
+        assert build_messages([entry], "pi-test", "pi") == ()
+        assert render_protocol_records("pi-test", "pi", records, state) == []
 
     def test_history_message_preserves_order_and_timestamp(self) -> None:
         entry = {

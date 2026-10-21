@@ -126,6 +126,7 @@ def _bind_env(window: MagicMock | None = None) -> Iterator[_BindMocks]:
         patch(_FIND_WINDOW, new_callable=AsyncMock, return_value=window) as find_window,
         patch(f"{_MODULE}safe_edit") as edit,
         patch(f"{_MODULE}format_topic_name_for_mode"),
+        patch(f"{_MODULE}adapter_for", return_value=MagicMock()),
     ):
         router.resolve_chat_id.return_value = -100
         session.get_approval_mode.return_value = "normal"
@@ -345,6 +346,7 @@ class TestBindProviderDetection:
         if expects_prompt_setup:
             mock_ensure.assert_awaited_once()
             assert mock_ensure.call_args[0] == ("@5", "external_bind")
+            assert mock_ensure.call_args.kwargs["adapter"] is not None
         else:
             mock_ensure.assert_not_awaited()
 

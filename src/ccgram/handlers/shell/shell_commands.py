@@ -143,14 +143,14 @@ def _clear_shell_hint_seen(chat_id: int, thread_id: int) -> None:
     _shell_hint_seen.discard((chat_id, thread_id))
 
 
-async def _ensure_prompt_marker(window_id: str) -> None:
+async def _ensure_prompt_marker(window_id: str, *, adapter) -> None:
     """Lazily restore prompt marker if lost (exec bash, profile reload)."""
     # Lazy: sibling cycle — shell_prompt_orchestrator imports
     # shell_commands.handle_shell_message via callback dispatch.
     # Lazy: prompt orchestrator ↔ commands cycle
     from .shell_prompt_orchestrator import ensure_setup
 
-    await ensure_setup(window_id, "lazy")
+    await ensure_setup(window_id, "lazy", adapter=adapter)
 
 
 async def _cancel_stuck_input(window_id: str, adapter, action_id: str) -> None:
@@ -235,7 +235,7 @@ async def handle_shell_message(
         else thread_router.resolve_chat_id(user_id, thread_id)
     )
     clear_shell_pending(chat_id, thread_id)
-    await _ensure_prompt_marker(window_id)
+    await _ensure_prompt_marker(window_id, adapter=adapter)
 
     # Immediate ``typing`` action so the user sees the bot is processing
     # before any reply lands. Self-expires after ~5s; pulse() refreshes it

@@ -89,6 +89,7 @@ async def tick_window(
     agent_exited = await discover_and_register_transcript(
         window_id,
         _window=window,
+        adapter=adapter,
         client=PTBTelegramClient(bot),
         user_id=user_id,
         thread_id=thread_id,

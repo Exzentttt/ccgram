@@ -377,6 +377,16 @@ class MultiplexerSessionBackend:
     async def _verify_selected_pane(self, target: Target) -> None:
         if target.selected_pane_command is None:
             return
+        foreground = await self.mux.foreground(target.id)
+        if foreground is None or not foreground.argv:
+            raise ProtocolError(
+                503, "backend_unavailable", "Foreground process could not be verified"
+            )
+        if (foreground.pid, tuple(foreground.argv)) != (
+            target.process_id,
+            target.foreground_argv,
+        ):
+            raise ProtocolError(409, "binding_conflict", "Foreground process changed")
         panes = await self.mux.list_panes(target.id)
         pane = next(
             (candidate for candidate in panes if candidate.pane_id == target.pane_id),

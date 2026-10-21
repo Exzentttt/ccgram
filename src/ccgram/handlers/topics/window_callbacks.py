@@ -23,7 +23,7 @@ from ...thread_router import thread_router
 from ...multiplexer import multiplexer as tmux_manager
 from ...window_state_ports.identity_state import get_initial_provider_name
 from ..telegram_origin import send_telegram_to_window
-from ...session_protocol.telegram import adapter_for
+from ...session_protocol.telegram import TelegramSessionAdapter, adapter_for
 from ...session_protocol.models import ProtocolError
 from ..callback_data import CB_WIN_BIND, CB_WIN_CANCEL, CB_WIN_NEW
 from ..callback_helpers import get_thread_id
@@ -104,6 +104,7 @@ async def _detect_and_setup_provider(
     window_id: str,
     pane_current_command: str | None,
     *,
+    adapter: TelegramSessionAdapter,
     client: TelegramClient | None = None,
     user_id: int = 0,
     thread_id: int = 0,
@@ -139,6 +140,7 @@ async def _detect_and_setup_provider(
             await ensure_setup(
                 window_id,
                 "external_bind",
+                adapter=adapter,
                 client=client,
                 chat_id=thread_router.resolve_chat_id(user_id, thread_id),
                 thread_id=thread_id,
@@ -338,6 +340,7 @@ async def _handle_bind(
     detected = await _detect_and_setup_provider(
         selected_wid,
         w.pane_current_command,
+        adapter=adapter_for(context.bot_data),
         client=client,
         user_id=user_id,
         thread_id=thread_id,

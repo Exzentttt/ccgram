@@ -115,7 +115,7 @@ class TestTickWindowDeadWindow:
                 "discover_and_register_transcript",
                 new_callable=AsyncMock,
                 return_value=True,
-            ),
+            ) as mock_discover,
             patch.object(
                 window_tick.lifecycle_state,
                 "get_origin",
@@ -131,6 +131,7 @@ class TestTickWindowDeadWindow:
             await tick_window(bot, 1, 100, "@0", window, adapter)
 
         adapter.close.assert_awaited_once_with("@0")
+        assert mock_discover.call_args.kwargs["adapter"] is adapter
         mock_dead.assert_awaited_once_with(
             bot, 1, 100, "@0", runtime=window_tick.get_default_runtime()
         )

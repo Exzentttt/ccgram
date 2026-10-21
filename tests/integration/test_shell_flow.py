@@ -6,6 +6,7 @@ shell_commands/shell_capture logic.
 """
 
 from contextlib import ExitStack, contextmanager
+from types import SimpleNamespace
 from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
@@ -25,6 +26,7 @@ from ccgram.handlers.shell.shell_commands import (
 )
 from ccgram.llm.base import CommandResult
 from ccgram.multiplexer.base import CaptureResult
+from ccgram.session_protocol.telegram import TelegramSessionAdapter
 
 pytestmark = pytest.mark.integration
 
@@ -35,6 +37,19 @@ TEST_USER_ID = 1
 TEST_THREAD_ID = 42
 TEST_CHAT_ID = -100
 TEST_WINDOW_ID = "@0"
+
+
+@pytest.fixture
+def protocol_adapter():
+    adapter = AsyncMock(spec=TelegramSessionAdapter)
+    adapter.resolve.return_value = (
+        SimpleNamespace(pane_id="%0"),
+        SimpleNamespace(binding_version=1),
+    )
+    adapter.setup_prompt.return_value = (True, "")
+    adapter.send_text.return_value = (True, "")
+    adapter.send_keys.return_value = (True, "")
+    return adapter
 
 
 @pytest.fixture(autouse=True)
@@ -99,12 +114,12 @@ def _fixed_completer(command: str, explanation: str) -> AsyncMock:
 
 
 class TestRawCommandFlow:
-    async def test_bang_prefix_sends_to_tmux_and_marks_command(self) -> None:
+    async def test_bang_prefix_sends_to_tmux_and_marks_command(
+        self, protocol_adapter
+    ) -> None:
         bot = AsyncMock(spec=Bot)
         message = AsyncMock(spec=Message)
-        adapter = MagicMock()
-        adapter.send_text = AsyncMock(return_value=(True, ""))
-        adapter.send_keys = AsyncMock(return_value=(True, ""))
+        adapter = protocol_adapter
 
         with (
             patch(f"{_MOD_CMD}.enqueue_status_update", new_callable=AsyncMock),
@@ -177,11 +192,13 @@ class TestRawCommandFlow:
 
 
 class TestLlmCommandFlow:
-    async def test_nl_generates_command_and_shows_approval(self) -> None:
+    async def test_nl_generates_command_and_shows_approval(
+        self, protocol_adapter
+    ) -> None:
         bot = AsyncMock(spec=Bot)
         message = AsyncMock(spec=Message)
         completer = _fixed_completer("ls -la", "List files")
-        adapter = MagicMock()
+        adapter = protocol_adapter
 
         with (
             patch(f"{_MOD_CMD}.enqueue_status_update", new_callable=AsyncMock),
@@ -219,12 +236,10 @@ class TestLlmCommandFlow:
         assert pending[0] == "ls -la"
         assert pending[1] == TEST_USER_ID
 
-    async def test_no_llm_falls_back_to_raw(self) -> None:
+    async def test_no_llm_falls_back_to_raw(self, protocol_adapter) -> None:
         bot = AsyncMock(spec=Bot)
         message = AsyncMock(spec=Message)
-        adapter = MagicMock()
-        adapter.send_text = AsyncMock(return_value=(True, ""))
-        adapter.send_keys = AsyncMock(return_value=(True, ""))
+        adapter = protocol_adapter
 
         with (
             patch(f"{_MOD_CMD}.enqueue_status_update", new_callable=AsyncMock),

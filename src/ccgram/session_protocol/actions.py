@@ -131,7 +131,12 @@ def _validate_response_data(data: dict[str, Any]) -> None:
 
 
 def _validate_internal_action(action: Action) -> Action:
-    if action.kind not in {"terminal.submit", "message.followup", "session.split"}:
+    if action.kind not in {
+        "terminal.submit",
+        "terminal.setup_prompt",
+        "message.followup",
+        "session.split",
+    }:
         raise ProtocolError(422, "unsupported_action", "Unsupported adapter operation")
     try:
         if str(UUID(action.id)) != action.id.lower():
@@ -147,6 +152,11 @@ def _validate_internal_action(action: Action) -> Action:
             raise ProtocolError(400, "invalid_request", "session.split takes no data")
     else:
         _string(action.data, "text")
+    if (
+        action.kind == "terminal.setup_prompt"
+        and type(action.data.get("clear")) is not bool
+    ):
+        raise ProtocolError(400, "invalid_request", "clear must be boolean")
     return action
 
 
@@ -294,6 +304,28 @@ class ActionExecutor:
     ) -> Target:
         target, snapshot = await self.service.current(session_id)
         self._validate_target(target, snapshot, action)
+        if action.kind == "session.close":
+            # Observation failures hide input capabilities, but cannot prevent
+            # closing a target whose backend still confirms its identity.
+            fresh = await self.service.backend.inspect(target.id)
+            if not fresh.available:
+                raise ProtocolError(
+                    503, "backend_unavailable", "Session backend is unavailable"
+                )
+            if (
+                fresh.provider,
+                fresh.conversation_id,
+                fresh.pane_id,
+                fresh.process_id,
+                fresh.foreground_argv,
+            ) != (
+                target.provider,
+                target.conversation_id,
+                target.pane_id,
+                target.process_id,
+                target.foreground_argv,
+            ):
+                raise ProtocolError(409, "binding_conflict", "Session binding changed")
         if action.kind in {
             "message.send",
             "request.respond",
@@ -323,7 +355,7 @@ class ActionExecutor:
             raise ProtocolError(
                 409, "binding_conflict", "Session binding changed", snapshot
             )
-        if not target.foreground_verified:
+        if action.kind != "session.close" and not target.foreground_verified:
             raise ProtocolError(
                 503,
                 "backend_unavailable",
@@ -335,6 +367,12 @@ class ActionExecutor:
     ) -> None:
         if action.kind == "session.split":
             return
+        if action.kind == "terminal.setup_prompt" and (
+            target.provider != "shell" or len(target.foreground_argv) != 1
+        ):
+            raise ProtocolError(
+                422, "unsupported_action", "Prompt setup requires an interactive shell"
+            )
         if action.kind == "session.resume" and (
             target.provider != "shell"
             or action.data["conversationId"] != target.conversation_id
@@ -346,6 +384,7 @@ class ActionExecutor:
             )
         public_kind = {
             "terminal.submit": "terminal.paste",
+            "terminal.setup_prompt": "terminal.paste",
             "message.followup": "message.send",
         }.get(action.kind, action.kind)
         if public_kind not in snapshot.capabilities:
@@ -418,7 +457,7 @@ class ActionExecutor:
     async def _perform(self, session_id: str, target: Target, action: Action) -> bool:
         backend = self.service.backend
         kind, data = action.kind, action.data
-        if kind in {"terminal.submit", "message.followup"}:
+        if kind in {"terminal.submit", "terminal.setup_prompt", "message.followup"}:
             return await self._perform_internal(target, action)
         if kind == "message.send":
             return await self._send_message(session_id, target, action)
@@ -438,6 +477,19 @@ class ActionExecutor:
         return await backend.resume(target, data["conversationId"])
 
     async def _perform_internal(self, target: Target, action: Action) -> bool:
+        if action.kind == "terminal.setup_prompt":
+            backend = self.service.backend
+            if not await backend.send_key(target, "C-c"):
+                return False
+            await asyncio.sleep(0.1)
+            if not await backend.send_text(
+                target, action.data["text"], enter=True, raw=True
+            ):
+                return False
+            await asyncio.sleep(0.3)
+            return not action.data["clear"] or await backend.send_text(
+                target, "clear", enter=True, raw=True
+            )
         if action.kind == "terminal.submit":
             return await self.service.backend.send_text(
                 target, action.data["text"], enter=True, raw=True

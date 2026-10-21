@@ -54,7 +54,9 @@ Outbound (user → Claude):
 ```
 User sends "hello" in topic (thread_id=42)
   → thread_bindings[user_id][42] → "@0"
-  → send_to_window("@0", "hello")   # resolves via find_window_by_id
+  → TelegramSessionAdapter.send_text("@0", "hello", action_id=...)
+  → ActionExecutor: verified binding, prompt checks, per-target input lock
+  → MultiplexerSessionBackend → backend window
 ```
 
 Inbound (Claude → user):

@@ -50,6 +50,11 @@ records used by both `build_messages` and Telegram delivery. Telegram rendering
 keeps formatting, tool batching, topics, chunking, edits, and queue retries in the
 adapter. Codex streaming completion and phase survive normalization. Tool results
 can complete calls observed in an earlier delivery batch.
+Claude local-command replies and Pi shell-execution records become notices.
+Claude command names survive across parser batches until their reply arrives.
+Protocol message construction projects records into the declared `Part` fields.
+Telegram rendering retains its command metadata. Telegram history includes an
+`ExitPlanMode` plan before the corresponding tool and result rows.
 
 History and live mobile events read a verified immutable transcript observation.
 Generation tracking and parsing use the same bytes. The reader checks file identity
@@ -82,7 +87,11 @@ ownership checks and presentation, then call the in-process adapter. The executo
 owns reservation, binding checks, prompt checks, and the per-target input lock.
 A handler that authorizes shell input against a resolved snapshot passes that
 binding version through the adapter. A changed foreground or pane rejects input.
-Shell submission is one atomic paste-and-submit operation. Explicit sibling-pane
+Shell submission is one atomic paste-and-submit operation. Shell prompt setup is
+one internal executor action: interruption, setup text, and optional clearing hold
+the same target lock throughout. Providers generate setup commands and receive the
+adapter explicitly. Setup writes recheck the captured pane and foreground.
+Explicit sibling-pane
 controls retain pane ownership checks. The multiplexer does not expose a sibling
 foreground PID. Those controls therefore do not claim the active pane's PID guarantee.
 Explicit sibling-pane controls are available on tmux. Herdr and agterm use their

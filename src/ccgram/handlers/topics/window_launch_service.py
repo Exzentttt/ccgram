@@ -674,7 +674,9 @@ async def launch_window(  # noqa: C901, PLR0911, PLR0912, PLR0915
 
         try:
             await _wait_for_shell_ready(created_wid, adapter_for(context.bot_data))
-            await ensure_setup(created_wid, "auto")
+            await ensure_setup(
+                created_wid, "auto", adapter=adapter_for(context.bot_data)
+            )
         except BaseException as exc:  # noqa: BLE001
             created_wid = _follow_supersession(created_wid, claim_id=claim_id)
             await _finish_failed_provisioning(

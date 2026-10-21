@@ -245,7 +245,7 @@ async def test_unavailable_transcript_does_not_block_healthy_sessions(
         s for s in sessions if s.conversation and s.conversation.id == "other"
     )
     assert failed.status.state == "unknown"
-    assert not set(failed.capabilities) - {"terminal.view"}
+    assert set(failed.capabilities) == {"session.close", "terminal.view"}
     assert (
         await service.get_session(next(s.id for s in sessions if s.id != failed.id))
     ).provider == "claude"

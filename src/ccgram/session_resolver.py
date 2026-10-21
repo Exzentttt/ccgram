@@ -310,6 +310,18 @@ def _legacy_history_messages(messages: tuple[Message, ...]) -> list[dict[str, An
     all_messages: list[dict[str, Any]] = []
     for message in messages:
         for part in message.parts:
+            if part.type == "tool" and part.name == "ExitPlanMode":
+                tool_input = part.input
+                plan = tool_input.get("plan") if isinstance(tool_input, dict) else None
+                if isinstance(plan, str) and plan.strip():
+                    all_messages.append(
+                        {
+                            "role": "assistant",
+                            "text": plan.strip(),
+                            "content_type": "text",
+                            "timestamp": message.time,
+                        }
+                    )
             text = part.text or part.title or part.name or ""
             content_type = {
                 "text": "text",

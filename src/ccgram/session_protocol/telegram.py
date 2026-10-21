@@ -130,6 +130,24 @@ class TelegramSessionAdapter:
             expected_binding_version=expected_binding_version,
         )
 
+    async def setup_prompt(
+        self,
+        window_id: str,
+        text: str,
+        *,
+        clear: bool,
+        pane_id: str,
+        expected_binding_version: int,
+    ) -> tuple[bool, str]:
+        return await self._execute(
+            window_id,
+            "terminal.setup_prompt",
+            {"text": text, "clear": clear},
+            pane_id=pane_id,
+            expected_binding_version=expected_binding_version,
+            internal=True,
+        )
+
     async def send_followup(
         self,
         window_id: str,
