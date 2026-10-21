@@ -184,6 +184,13 @@ class SessionMonitor:
         self._skip_notice_receipts.pop(session_id, None)
         self._clear_skip_retry(session_id)
 
+    def _cancel_pending_skip(self, session_id: str) -> None:
+        """Cancel a barrier and restore source work to its durable watermark."""
+        self.state.cancel_skip(session_id)
+        self._transcript_reader.replay_from_watermark(session_id)
+        self.state.save_if_dirty()
+        self._discard_session_delivery_state(session_id)
+
     def set_message_callback(
         self, callback: Callable[[NewMessage], Awaitable[None]]
     ) -> None:
@@ -265,7 +272,7 @@ class SessionMonitor:
         # The durable barrier is written before destructive queue retirement.
         self.state.begin_skip(intent)
         if not self.state.save_if_dirty():
-            self.state.cancel_skip(session_id)
+            self._cancel_pending_skip(session_id)
             return None
         prepared = await self._prepare_pending_skip(intent)
         if prepared is not True:
@@ -321,9 +328,7 @@ class SessionMonitor:
         """Retire frozen source work before a skip notice may be sent."""
         if not self._skip_is_current(intent):
             logger.warning("Cancelling stale backlog skip for %s", intent.session_id)
-            self.state.cancel_skip(intent.session_id)
-            self.state.save_if_dirty()
-            self._clear_skip_retry(intent.session_id)
+            self._cancel_pending_skip(intent.session_id)
             return None
         if intent.purge_complete:
             return True
@@ -340,9 +345,7 @@ class SessionMonitor:
             return False
         if skipped is None:
             logger.warning("Cancelling stale backlog skip for %s", intent.session_id)
-            self.state.cancel_skip(intent.session_id)
-            self.state.save_if_dirty()
-            self._clear_skip_retry(intent.session_id)
+            self._cancel_pending_skip(intent.session_id)
             return None
         self.state.update_skip_count(intent.session_id, skipped)
         if not self.state.save_if_dirty():
@@ -355,9 +358,7 @@ class SessionMonitor:
     async def _enqueue_pending_skip_notice(self, intent: BacklogSkipIntent) -> bool:
         """Create one receipt-tracked visible notice for a persisted barrier."""
         if not self._skip_is_current(intent):
-            self.state.cancel_skip(intent.session_id)
-            self.state.save_if_dirty()
-            self._clear_skip_retry(intent.session_id)
+            self._cancel_pending_skip(intent.session_id)
             return False
         if intent.session_id in self._skip_notice_receipts or not self._skip_retry_due(
             intent.session_id
@@ -419,7 +420,7 @@ class SessionMonitor:
                     "Backlog skip barrier expired on a rebound topic; cancelling",
                     session_id=session_id,
                 )
-                self.state.cancel_skip(session_id)
+                self._cancel_pending_skip(session_id)
             elif not intent.purge_complete:
                 # The queued range was never retired: prefer replay over
                 # silently skipping bytes the queue may still deliver.
@@ -428,7 +429,7 @@ class SessionMonitor:
                     "cancelling so the range replays",
                     session_id=session_id,
                 )
-                self.state.cancel_skip(session_id)
+                self._cancel_pending_skip(session_id)
             else:
                 logger.warning(
                     "Backlog skip barrier expired without a delivered notice; "
@@ -437,9 +438,9 @@ class SessionMonitor:
                     barrier_age_seconds=round(now - intent.created_at, 1),
                 )
                 if self.state.complete_skip(session_id):
-                    self._transcript_reader._tool_delivery_fences.pop(session_id, None)
+                    self._transcript_reader.retire_skipped_tool_state(session_id)
                 else:
-                    self.state.cancel_skip(session_id)
+                    self._cancel_pending_skip(session_id)
             self._discard_session_delivery_state(session_id)
         # One batched write for any stamps and retirements this pass made.
         self.state.save_if_dirty()
@@ -480,23 +481,17 @@ class SessionMonitor:
             if intent is None or not self._skip_is_current(intent):
                 # A topic may rebind after the notice was queued or delivered.
                 # Never advance the old source watermark across that boundary.
-                self.state.cancel_skip(session_id)
-                self.state.save_if_dirty()
-                self._delivery_receipts.pop(session_id, None)
-                self._skip_notice_receipts.pop(session_id, None)
-                self._clear_skip_retry(session_id)
+                self._cancel_pending_skip(session_id)
                 continue
             if self.state.complete_skip(session_id):
                 # The skip retires the result receipts this fence was waiting for.
-                self._transcript_reader._tool_delivery_fences.pop(session_id, None)
+                self._transcript_reader.retire_skipped_tool_state(session_id)
                 self.state.save_if_dirty()
                 self._delivery_receipts.pop(session_id, None)
             else:
                 # The tracked session was removed or re-keyed. Do not retain a
                 # barrier that can no longer be committed or replay safely.
-                self.state.cancel_skip(session_id)
-                self.state.save_if_dirty()
-                self._delivery_receipts.pop(session_id, None)
+                self._cancel_pending_skip(session_id)
             self._skip_notice_receipts.pop(session_id, None)
             self._clear_skip_retry(session_id)
 

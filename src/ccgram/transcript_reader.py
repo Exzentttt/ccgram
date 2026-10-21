@@ -355,6 +355,7 @@ class TranscriptReader:
         self._pending_tools: dict[str, dict[str, Any]] = {}
         self._tool_delivery_fences: dict[str, _ToolDeliveryFence] = {}
         self._protocol_parser_states: dict[str, tuple[str, TranscriptParserState]] = {}
+        self._parser_rebuild_pending: set[str] = set()
         self._pending_batches: list[TranscriptBatch] = []
         self._file_mtimes: dict[str, float] = {}
         self._file_ctimes: dict[str, int] = self._snapshot_file_ctimes()
@@ -639,6 +640,66 @@ class TranscriptReader:
         self._file_markers[session_id] = (self._parse_pos(tracked), marker)
         return True
 
+    async def _rebuild_committed_parser_context(
+        self,
+        session_id: str,
+        file_path: Path,
+        provider_name: str,
+        expected_stat: Any,
+        *,
+        supports_incremental_read: bool,
+    ) -> bool:
+        """Recreate parser context from a stable, committed JSONL prefix."""
+        if not supports_incremental_read:
+            # Live built-in providers with transcript records use byte-addressed
+            # JSONL. Whole-document history snapshots do not have a byte range
+            # for each entry, so they cannot be reconstructed from this watermark.
+            self.reset_parser_state(session_id)
+            return True
+        tracked = self._state.get_session(session_id)
+        if tracked is None:
+            return False
+        try:
+            before = file_path.stat()
+            raw = await asyncio.to_thread(file_path.read_bytes)
+            after = file_path.stat()
+        except OSError:
+            return False
+        expected_generation = (
+            expected_stat.st_dev,
+            expected_stat.st_ino,
+            expected_stat.st_size,
+            expected_stat.st_ctime_ns,
+        )
+        if any(
+            (
+                stat.st_dev,
+                stat.st_ino,
+                stat.st_size,
+                stat.st_ctime_ns,
+            )
+            != expected_generation
+            for stat in (before, after)
+        ):
+            return False
+
+        prefix = [
+            entry
+            for entry in read_entries(raw, provider_name)
+            if entry.offset < tracked.last_byte_offset
+        ]
+        _, parser_state = parse_records(
+            prefix,
+            provider_name,
+            TranscriptParserState(),
+            deduplicate_updates=True,
+        )
+        self._protocol_parser_states[session_id] = (provider_name, parser_state)
+        self._pending_tools[session_id] = dict(parser_state.pending_tools)
+        self.retire_skipped_tool_state(session_id)
+        self._parser_rebuild_pending.discard(session_id)
+        return True
+
     def clear_session(self, session_id: str) -> None:
         """Remove all per-session state for a cleaned-up session."""
         # A skip barrier belongs to the tracked session lifetime. Once that
@@ -648,9 +709,7 @@ class TranscriptReader:
             self._on_session_retired(session_id)
         self._state.remove_session(session_id)
         self._file_mtimes.pop(session_id, None)
-        self._pending_tools.pop(session_id, None)
-        self._tool_delivery_fences.pop(session_id, None)
-        self._protocol_parser_states.pop(session_id, None)
+        self.reset_parser_state(session_id)
         self._pending_batches = [
             batch for batch in self._pending_batches if batch.session_id != session_id
         ]
@@ -661,6 +720,34 @@ class TranscriptReader:
         self._file_markers.pop(session_id, None)
         self._startup_file_boundaries.pop(session_id, None)
         log_throttle_reset(f"partial-jsonl:{session_id}")
+
+    def retire_skipped_tool_state(self, session_id: str) -> None:
+        """Retire only tool calls whose source range a completed skip consumed."""
+        self._pending_tools.pop(session_id, None)
+        self._tool_delivery_fences.pop(session_id, None)
+
+        parser_state = self._protocol_parser_states.get(session_id)
+        if parser_state is not None:
+            parser_state[1].pending_tools.clear()
+
+    def reset_parser_state(self, session_id: str) -> None:
+        """Drop parser context before replaying a source from its watermark."""
+        self.retire_skipped_tool_state(session_id)
+        self._protocol_parser_states.pop(session_id, None)
+        self._parser_rebuild_pending.discard(session_id)
+
+    def replay_from_watermark(self, session_id: str) -> None:
+        """Discard uncommitted parse context and resume from durable progress."""
+        tracked = self._state.get_session(session_id)
+        if tracked is None:
+            return
+        tracked.parsed_offset = tracked.last_byte_offset
+        self.reset_parser_state(session_id)
+        self._parser_rebuild_pending.add(session_id)
+        self._file_mtimes.pop(session_id, None)
+        self._pending_batches = [
+            batch for batch in self._pending_batches if batch.session_id != session_id
+        ]
 
     def _adopt_tracking_for_file(
         self, session_id: str, file_path: Path
@@ -693,8 +780,7 @@ class TranscriptReader:
                 self._on_session_retired(old_session_id)
             self._state.remove_session(old_session_id)
             self._state.update_session(tracked)
-            if old_session_id in self._file_mtimes:
-                self._file_mtimes[session_id] = self._file_mtimes.pop(old_session_id)
+            self._file_mtimes.pop(old_session_id, None)
             if old_session_id in self._file_generations:
                 self._file_generations[session_id] = self._file_generations.pop(
                     old_session_id
@@ -707,24 +793,14 @@ class TranscriptReader:
                 self._file_prefixes[session_id] = self._file_prefixes.pop(
                     old_session_id
                 )
-            if old_session_id in self._pending_tools:
-                self._pending_tools[session_id] = self._pending_tools.pop(
-                    old_session_id
-                )
-            if old_session_id in self._tool_delivery_fences:
-                self._tool_delivery_fences[session_id] = self._tool_delivery_fences.pop(
-                    old_session_id
-                )
-            if old_session_id in self._protocol_parser_states:
-                self._protocol_parser_states[session_id] = (
-                    self._protocol_parser_states.pop(old_session_id)
-                )
+            self.reset_parser_state(old_session_id)
             if old_session_id in self._file_markers:
                 self._file_markers[session_id] = self._file_markers.pop(old_session_id)
             if old_session_id in self._startup_file_boundaries:
                 self._startup_file_boundaries[session_id] = (
                     self._startup_file_boundaries.pop(old_session_id)
                 )
+            self._parser_rebuild_pending.add(session_id)
             log_throttle_reset(f"partial-jsonl:{old_session_id}")
             logger.debug(
                 "Adopted transcript offset for refreshed session: %s -> %s (%s)",
@@ -849,15 +925,21 @@ class TranscriptReader:
                 self._startup_file_boundaries[session_id] = probe_boundary
             return
         previous_parsed_offset = tracked.parsed_offset
+        rebuild_parser = session_id in self._parser_rebuild_pending
         last_mtime = self._file_mtimes.get(session_id, 0.0)
         if provider.capabilities.supports_incremental_read:
             if (
                 not generation_changed
+                and not rebuild_parser
                 and current_mtime <= last_mtime
                 and current_size <= self._parse_pos(tracked)
             ):
                 return
-        elif not generation_changed and current_mtime <= last_mtime:
+        elif (
+            not generation_changed
+            and not rebuild_parser
+            and current_mtime <= last_mtime
+        ):
             return
 
         startup_boundary = (
@@ -898,9 +980,29 @@ class TranscriptReader:
         if reset_during_read:
             startup_boundary = None
         if generation_changed or reset_during_read:
-            self._protocol_parser_states.pop(session_id, None)
-            self._pending_tools.pop(session_id, None)
-            self._tool_delivery_fences.pop(session_id, None)
+            if self._on_session_retired is not None:
+                self._on_session_retired(session_id)
+            self.reset_parser_state(session_id)
+        elif rebuild_parser:
+            rebuilt = await self._rebuild_committed_parser_context(
+                session_id,
+                file_path,
+                provider_name,
+                stable_read.stat,
+                supports_incremental_read=provider.capabilities.supports_incremental_read,
+            )
+            if not rebuilt:
+                tracked.parsed_offset = tracked.last_byte_offset
+                self._file_mtimes.pop(session_id, None)
+                new_entries = []
+            elif not self._admit_read(
+                window_id, provider_name, tracked, previous_parsed_offset
+            ):
+                self.reset_parser_state(session_id)
+                self._parser_rebuild_pending.add(session_id)
+                if probe_boundary is not None:
+                    self._startup_file_boundaries[session_id] = probe_boundary
+                new_entries = []
 
         # Deliver pre-start unread history, but count activity only when a
         # complete entry advances beyond the startup file-size boundary.
@@ -938,6 +1040,8 @@ class TranscriptReader:
         if window_id and not identity_state.accepts_provider_observation(
             window_id, provider.capabilities.name
         ):
+            return
+        if not new_entries:
             return
         if provider.capabilities.supports_task_tracking and window_id:
             provider.apply_task_entries(

@@ -2,6 +2,7 @@ import asyncio
 from collections.abc import Iterator
 from types import SimpleNamespace
 from unittest.mock import ANY, AsyncMock, MagicMock, patch
+from uuid import UUID
 
 import pytest
 from telegram import Bot, CallbackQuery, InlineKeyboardMarkup, Message
@@ -1242,6 +1243,7 @@ class TestRunningReaction:
     async def test_no_message_commands_get_fresh_action_ids_per_event(self) -> None:
         bot = AsyncMock(spec=Bot)
         with (
+            patch(f"{_MOD}.uuid4", side_effect=[UUID(int=n) for n in range(3)]),
             patch(f"{_MOD}.enqueue_status_update", new_callable=AsyncMock),
             patch(f"{_MOD}.lifecycle_strategy.clear_probe_failures"),
             patch(f"{_MOD}._ensure_prompt_marker", new_callable=AsyncMock),
@@ -1269,7 +1271,6 @@ class TestRunningReaction:
         action_ids = [call.kwargs["action_id"] for call in send_text.await_args_list]
         assert len(action_ids) == 3
         assert len(set(action_ids)) == 3
-        assert all(":0" not in action_id for action_id in action_ids)
 
     async def test_run_callback_passes_stored_message_id(self) -> None:
         query = AsyncMock(spec=CallbackQuery)

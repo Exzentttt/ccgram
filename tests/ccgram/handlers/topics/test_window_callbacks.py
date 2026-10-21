@@ -6,7 +6,7 @@ import contextlib
 from collections.abc import Iterator
 from dataclasses import dataclass, replace
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 from telegram import Bot, CallbackQuery, Update
@@ -16,6 +16,7 @@ from ccgram.handlers.callback_data import CB_WIN_BIND, CB_WIN_CANCEL, CB_WIN_NEW
 from ccgram.handlers.topics.directory_browser import UNBOUND_WINDOWS_KEY
 from ccgram.handlers.topics.new_command import new_command
 from ccgram.handlers.user_state import PENDING_THREAD_ID, PENDING_THREAD_TEXT
+from ccgram.multiplexer.base import ForegroundInfo
 from ccgram.handlers.topics.window_callbacks import (
     _forward_pending_text,
     _send_verified_shell_input,
@@ -398,35 +399,61 @@ class TestBindProviderDetection:
             }
         )
         adapter, backend, _, store = _protocol_adapter(tmp_path, "shell")
-        window = _unbound_window("former-agent", "bash")
-        provider = MagicMock()
-        provider.capabilities.chat_first_command_path = True
+        window = _unbound_window("former-agent", "node")
+        mux = MagicMock()
+        mux.find_window_by_id = AsyncMock(return_value=window)
+        mux.foreground = AsyncMock(
+            side_effect=[
+                ForegroundInfo(
+                    pid=1,
+                    pgid=101,
+                    argv=["node", "/opt/claude"],
+                    cwd="/workspace",
+                ),
+                ForegroundInfo(
+                    pid=2,
+                    pgid=102,
+                    argv=["bash"],
+                    cwd="/workspace",
+                ),
+            ]
+        )
+        claude_provider = MagicMock()
+        claude_provider.capabilities.chat_first_command_path = False
+        shell_provider = MagicMock()
+        shell_provider.capabilities.chat_first_command_path = True
+
+        def provider_for_window(_window_id: str, provider_name: str):
+            return {"claude": claude_provider, "shell": shell_provider}[provider_name]
 
         with (
             _bind_env(window),
             patch(f"{_MODULE}window_query.get_window_provider", return_value="claude"),
+            patch(f"{_MODULE}get_initial_provider_name", return_value="claude"),
             patch(
-                f"{_MODULE}agent_origin_returned_to_shell",
-                new_callable=AsyncMock,
-                return_value=True,
-            ) as mock_exit_guard,
-            patch(
-                "ccgram.providers.detect_provider_from_pane",
-                new_callable=AsyncMock,
-                return_value="shell",
+                "ccgram.window_state_ports.identity_state.get_initial_provider_name",
+                return_value="claude",
             ),
-            patch("ccgram.providers.get_provider_for_window", return_value=provider),
+            patch("ccgram.multiplexer.multiplexer", mux),
+            patch("ccgram.providers.process_detection._pgid_cache", {}),
+            patch(
+                "ccgram.providers.get_provider_for_window",
+                side_effect=provider_for_window,
+            ),
             patch(
                 "ccgram.handlers.shell.shell_prompt_orchestrator.ensure_setup",
                 new_callable=AsyncMock,
             ),
             patch(f"{_MODULE}adapter_for", return_value=adapter),
-            patch(f"{_MODULE}safe_send", new_callable=AsyncMock),
+            patch(f"{_MODULE}safe_send", new_callable=AsyncMock) as mock_safe_send,
         ):
             await handle_window_callback(query, 100, f"{CB_WIN_BIND}0", update, context)
 
-        mock_exit_guard.assert_awaited_once_with("@5", window)
+        mux.foreground.assert_has_awaits([call("@5"), call("@5")])
+        assert mux.foreground.await_count == 2
         backend.send_text.assert_not_awaited()
+        mock_safe_send.assert_awaited_once()
+        assert "recover the session" in mock_safe_send.call_args.args[2]
         query.answer.assert_awaited_with("Bound")
         store.close()
 
@@ -450,6 +477,10 @@ class TestBindProviderDetection:
                 "ccgram.providers.detect_provider_from_pane",
                 new_callable=AsyncMock,
                 return_value="shell",
+            ),
+            patch(
+                f"{_MODULE}get_initial_provider_name",
+                return_value="",
             ),
             patch("ccgram.providers.get_provider_for_window", return_value=provider),
             patch(
@@ -485,12 +516,13 @@ class TestBindProviderDetection:
                 new_callable=AsyncMock,
                 return_value="claude",
             ),
-            patch("ccgram.providers.get_provider_for_window", return_value=provider),
+            patch(f"{_MODULE}window_query.get_window_provider", return_value="claude"),
+            patch(f"{_MODULE}get_initial_provider_name", return_value="claude"),
             patch(
-                "ccgram.handlers.telegram_origin.agent_origin_returned_to_shell",
-                new_callable=AsyncMock,
-                return_value=False,
+                "ccgram.window_state_ports.identity_state.get_initial_provider_name",
+                return_value="claude",
             ),
+            patch("ccgram.providers.get_provider_for_window", return_value=provider),
             patch(f"{_MODULE}adapter_for", return_value=adapter),
         ):
             await handle_window_callback(query, 100, f"{CB_WIN_BIND}0", update, context)
@@ -498,6 +530,75 @@ class TestBindProviderDetection:
         backend.send_text.assert_awaited_once_with(
             target, "continue the task", enter=True
         )
+        store.close()
+
+    @pytest.mark.parametrize(
+        ("current_provider", "initial_provider", "submits"),
+        [
+            ("claude", "shell", True),
+            ("shell", "", False),
+            ("mystery", "mystery", False),
+            (None, "", True),
+        ],
+        ids=[
+            "explicit-shell-origin",
+            "legacy-shell-state",
+            "unknown-provider",
+            "untracked-verified-shell",
+        ],
+    )
+    async def test_shell_exit_policy_uses_captured_origin(
+        self,
+        tmp_path: Path,
+        current_provider: str | None,
+        initial_provider: str,
+        submits: bool,
+    ) -> None:
+        query, update, context = _make_query_update_context(
+            user_data={
+                UNBOUND_WINDOWS_KEY: ["@5"],
+                PENDING_THREAD_ID: 42,
+                PENDING_THREAD_TEXT: "ls -la",
+            }
+        )
+        adapter, backend, target, store = _protocol_adapter(tmp_path, "shell")
+        provider = MagicMock()
+        provider.capabilities.chat_first_command_path = True
+
+        with (
+            _bind_env(_unbound_window("my-shell", "bash")),
+            patch(
+                f"{_MODULE}window_query.get_window_provider",
+                return_value=current_provider,
+            ),
+            patch(
+                f"{_MODULE}get_initial_provider_name",
+                return_value=initial_provider,
+            ),
+            patch(
+                "ccgram.providers.detect_provider_from_pane",
+                new_callable=AsyncMock,
+                return_value="shell",
+            ),
+            patch("ccgram.providers.get_provider_for_window", return_value=provider),
+            patch(
+                "ccgram.handlers.shell.shell_prompt_orchestrator.ensure_setup",
+                new_callable=AsyncMock,
+            ),
+            patch(f"{_MODULE}adapter_for", return_value=adapter),
+            patch(f"{_MODULE}safe_send", new_callable=AsyncMock) as mock_safe_send,
+        ):
+            await handle_window_callback(query, 100, f"{CB_WIN_BIND}0", update, context)
+
+        if submits:
+            backend.send_text.assert_awaited_once_with(
+                target, "ls -la", enter=True, raw=True
+            )
+            mock_safe_send.assert_not_awaited()
+        else:
+            backend.send_text.assert_not_awaited()
+            mock_safe_send.assert_awaited_once()
+            assert "recover the session" in mock_safe_send.call_args.args[2]
         store.close()
 
 

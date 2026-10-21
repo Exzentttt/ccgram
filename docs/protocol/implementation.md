@@ -66,7 +66,11 @@ in-process consumers. Telegram renders them under delivery receipts. Only settle
 receipts advance its checkpoint. Consumed input with no visible records still
 produces a checkpoint-only batch. A tool-call fence stays in place until delivery
 through its result checkpoint settles. Later unrelated output does not hold that
-fence. A completed backlog skip retires tool fences for discarded receipts.
+fence. A completed backlog skip retires pending calls and tool fences for the
+skipped range. Canceled skips leave the durable checkpoint unchanged and rewind
+parsing if their receipts retire. Session identity adoption rebuilds parser
+context from the durable checkpoint. Source replacement retires the old
+generation's receipts and parser context.
 Skip fences retain their source boundary.
 Mobile replay subscriptions keep their bounded queues and never hold Telegram's
 checkpoint. Telegram does not replay the mobile history ring at startup.

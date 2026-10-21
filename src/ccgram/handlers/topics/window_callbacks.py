@@ -21,7 +21,8 @@ from ...telegram_client import PTBTelegramClient, TelegramClient
 from ...session import session_manager
 from ...thread_router import thread_router
 from ...multiplexer import multiplexer as tmux_manager
-from ..telegram_origin import agent_origin_returned_to_shell, send_telegram_to_window
+from ...window_state_ports.identity_state import get_initial_provider_name
+from ..telegram_origin import send_telegram_to_window
 from ...session_protocol.telegram import adapter_for
 from ...session_protocol.models import ProtocolError
 from ..callback_data import CB_WIN_BIND, CB_WIN_CANCEL, CB_WIN_NEW
@@ -329,20 +330,21 @@ async def _handle_bind(
     )
     _store_group_chat_id(user_id, thread_id, update, query)
     client: TelegramClient = PTBTelegramClient(context.bot)
+    # Capture origin before detection updates the window's current provider.
+    # One foreground observation must drive both routing and exit policy: a
+    # second probe can see a different process during an agent exit.
     previous_provider = window_query.get_window_provider(selected_wid)
-    shell_exit_detected = False
-    if previous_provider and previous_provider != "shell":
-        # Lazy: provider registry imports the process-detection stack.
-        from ...providers import is_known_provider
-
-        if is_known_provider(previous_provider):
-            shell_exit_detected = await agent_origin_returned_to_shell(selected_wid, w)
+    initial_provider = get_initial_provider_name(selected_wid)
     detected = await _detect_and_setup_provider(
         selected_wid,
         w.pane_current_command,
         client=client,
         user_id=user_id,
         thread_id=thread_id,
+    )
+    shell_exit_detected = detected == "shell" and (
+        initial_provider != "shell"
+        and (previous_provider is not None or bool(initial_provider))
     )
 
     await _rename_forum_topic(
