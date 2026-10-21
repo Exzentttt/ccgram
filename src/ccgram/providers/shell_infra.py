@@ -313,7 +313,7 @@ async def setup_shell_prompt(
         window_id,
         cmd,
         clear=clear,
-        pane_id=target.pane_id,
+        pane_id=target.pane_id or None,
         expected_binding_version=snapshot.binding_version,
     )
     if not success:

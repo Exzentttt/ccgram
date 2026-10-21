@@ -781,3 +781,66 @@ async def test_close_never_kills_when_native_presence_is_unconfirmed(
 
     assert not success
     mux.kill_window.assert_not_awaited()
+
+
+@pytest.mark.parametrize("clear", [True, False])
+async def test_prompt_setup_without_pane_handles_uses_native_target(mux, store, clear):
+    mux.foreground.return_value = ForegroundInfo(23, 23, ["bash"], "/tmp")
+    mux.list_panes.return_value = []
+    mux.send.return_value = True
+    service = LocalSessionService(MultiplexerSessionBackend(mux, "/tmp"), store)
+    adapter = adapter_for({"session_service": service})
+    target, snapshot = await adapter.resolve("@1")
+    assert target.pane_id == ""
+
+    success, _ = await adapter.setup_prompt(
+        "@1",
+        "setup command",
+        clear=clear,
+        pane_id=None,
+        expected_binding_version=snapshot.binding_version,
+    )
+
+    assert success
+    assert mux.send.await_args_list == [
+        call("@1", "C-c", enter=False, literal=False, raw=True),
+        call("@1", "setup command", enter=True, literal=True, raw=True),
+        *([call("@1", "clear", enter=True, literal=True, raw=True)] if clear else []),
+    ]
+    mux.send_to_pane.assert_not_awaited()
+
+
+@pytest.mark.parametrize("change", ["process", "script", "unavailable"])
+@pytest.mark.parametrize("after_write", [1, 2])
+async def test_prompt_setup_without_panes_rechecks_every_write(
+    mux, store, change, after_write
+):
+    mux.foreground.return_value = ForegroundInfo(23, 23, ["bash"], "/tmp")
+    mux.list_panes.return_value = []
+    service = LocalSessionService(MultiplexerSessionBackend(mux, "/tmp"), store)
+    adapter = adapter_for({"session_service": service})
+    _, snapshot = await adapter.resolve("@1")
+
+    async def change_after_write(*args, **kwargs):
+        if mux.send.await_count == after_write:
+            mux.foreground.return_value = (
+                ForegroundInfo(24, 24, ["bash"], "/tmp")
+                if change == "process"
+                else ForegroundInfo(23, 23, ["bash", "script.sh"], "/tmp")
+                if change == "script"
+                else None
+            )
+        return True
+
+    mux.send.side_effect = change_after_write
+    success, _ = await adapter.setup_prompt(
+        "@1",
+        "setup command",
+        clear=True,
+        pane_id=None,
+        expected_binding_version=snapshot.binding_version,
+    )
+
+    assert not success
+    assert mux.send.await_count == after_write
+    mux.send_to_pane.assert_not_awaited()

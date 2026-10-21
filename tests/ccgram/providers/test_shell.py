@@ -610,3 +610,17 @@ async def test_setup_resolution_failure_is_reported_without_sending(
         await setup_shell_prompt("@0", adapter=prompt_setup_adapter)
     prompt_setup_adapter.setup_prompt.assert_not_awaited()
     prompt_setup_mux.send_keys.assert_not_called()
+
+
+async def test_setup_omits_absent_pane_handle(prompt_setup_mux, prompt_setup_adapter):
+    prompt_setup_mux.find_window_by_id = AsyncMock(return_value=_window("bash"))
+    prompt_setup_adapter.resolve.return_value = (
+        SimpleNamespace(pane_id=""),
+        SimpleNamespace(binding_version=7),
+    )
+
+    await setup_shell_prompt("@0", adapter=prompt_setup_adapter)
+
+    args = prompt_setup_adapter.setup_prompt.await_args
+    assert args.kwargs["pane_id"] is None
+    assert args.kwargs["expected_binding_version"] == 7

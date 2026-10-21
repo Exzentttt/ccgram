@@ -136,7 +136,7 @@ class TelegramSessionAdapter:
         text: str,
         *,
         clear: bool,
-        pane_id: str,
+        pane_id: str | None,
         expected_binding_version: int,
     ) -> tuple[bool, str]:
         return await self._execute(

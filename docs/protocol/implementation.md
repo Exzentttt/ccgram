@@ -119,7 +119,8 @@ The implementation makes these clarifications to the proposed design:
 - `bindingVersion` remains a persisted increasing integer. The active pane,
   foreground PID and arguments, source availability, and transcript generation
   also participate in the binding. agterm uses its observed arguments when no PID
-  is available. Unknown foreground state exposes no actions.
+  is available. Unknown foreground state blocks input actions. Closing remains
+  available subject to native target and binding checks.
 - Message revision counts repeated native records and result records. Adding an
   action correlation also increases the revision, so a client replaces an entry
   published before send acknowledgement. The association and revision survive
@@ -148,8 +149,9 @@ received during that read remains available for later matching.
 
 Refresh, current-session inspection, creation, and hook transcript resolution share
 one lock to serialize authoritative observations. An unavailable
-transcript or pane capture degrades only that session to unknown status with no
-actions. Its identity stays present, and healthy sessions continue to refresh.
+transcript or pane capture degrades only that session to unknown status and blocks
+input actions. Its identity stays present, closing remains available subject to
+native target and binding checks, and healthy sessions continue to refresh.
 Successful delivery registration shares that lock and invalidates the transcript
 stamp, so the next refresh can correlate a user entry observed before send acknowledgement.
 

@@ -121,7 +121,8 @@ Binding checks include the foreground process and active pane. Input stays pinne
 to that pane. A focus change cannot redirect the remaining keys to a sibling.
 agterm supplies foreground arguments without a PID. Those arguments participate
 in its binding. A restart with identical arguments in the same pane cannot be
-distinguished through that backend. Unknown foreground observations expose no actions.
+distinguished through that backend. Unknown foreground observations block input
+actions. `session.close` remains available subject to native target and binding checks.
 A process can still exit between verification and input. The multiplexer has no
 atomic compare-and-send operation.
 
