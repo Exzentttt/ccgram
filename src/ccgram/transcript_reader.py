@@ -924,6 +924,14 @@ class TranscriptReader:
             if probe_boundary is not None:
                 self._startup_file_boundaries[session_id] = probe_boundary
             return
+        if (
+            not generation_changed
+            and tracked.last_byte_offset > 0
+            and session_id not in self._protocol_parser_states
+        ):
+            # Parser-only context is volatile. Recreate it from the durable
+            # prefix before parsing a post-restart suffix or Codex mirror.
+            self._parser_rebuild_pending.add(session_id)
         previous_parsed_offset = tracked.parsed_offset
         rebuild_parser = session_id in self._parser_rebuild_pending
         last_mtime = self._file_mtimes.get(session_id, 0.0)
@@ -1023,6 +1031,7 @@ class TranscriptReader:
             window_id,
             new_messages,
             byte_checkpoint=self._parse_pos(tracked),
+            emit_checkpoint_if_empty=generation_changed or reset_during_read,
         )
         self._state.update_session(tracked)
 
@@ -1036,12 +1045,22 @@ class TranscriptReader:
         new_messages: list[NewMessage],
         *,
         byte_checkpoint: int = 0,
+        emit_checkpoint_if_empty: bool = False,
     ) -> None:
         if window_id and not identity_state.accepts_provider_observation(
             window_id, provider.capabilities.name
         ):
             return
         if not new_entries:
+            if emit_checkpoint_if_empty:
+                self._pending_batches.append(
+                    TranscriptBatch(
+                        session_id=session_id,
+                        provider_name=provider.capabilities.name,
+                        records=(),
+                        byte_checkpoint=byte_checkpoint,
+                    )
+                )
             return
         if provider.capabilities.supports_task_tracking and window_id:
             provider.apply_task_entries(

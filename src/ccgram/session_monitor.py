@@ -272,7 +272,10 @@ class SessionMonitor:
         # The durable barrier is written before destructive queue retirement.
         self.state.begin_skip(intent)
         if not self.state.save_if_dirty():
-            self._cancel_pending_skip(session_id)
+            # Queue work has not been purged yet. Rewinding here would make
+            # the monitor enqueue a second copy while the original still runs.
+            self.state.cancel_skip(session_id)
+            self.state.save_if_dirty()
             return None
         prepared = await self._prepare_pending_skip(intent)
         if prepared is not True:

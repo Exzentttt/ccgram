@@ -21,6 +21,7 @@ from ccgram.session_protocol.messages import (
     SourceEntry,
     TranscriptBatch,
     TranscriptRecord,
+    TranscriptParserState,
 )
 from ccgram.thread_router import thread_router
 from ccgram.telegram_client import FakeTelegramClient
@@ -1007,6 +1008,128 @@ class TestSettledPrefixWatermarkCommit:
             )
         )
 
+    async def test_initial_skip_persistence_failure_preserves_queued_source_work(
+        self, tmp_path
+    ) -> None:
+        session_file = tmp_path / "session.jsonl"
+        session_file.write_text("queued transcript bytes")
+        monitor = SessionMonitor(
+            projects_path=tmp_path / "projects",
+            state_file=tmp_path / "monitor-state.json",
+        )
+        tracked = TrackedSession(
+            session_id="s1",
+            file_path=str(session_file),
+            last_byte_offset=5,
+            parsed_offset=12,
+        )
+        monitor.state.update_session(tracked)
+        queued_receipt = self._unsettled(12)
+        monitor._delivery_receipts["s1"] = [queued_receipt]
+        batch = _transcript_batch("s1", 12)
+        monitor._transcript_reader._pending_batches.append(batch)
+        purge = AsyncMock(return_value=1)
+        monitor.set_skip_callbacks(
+            purge=purge,
+            notice=AsyncMock(),
+            validate=Mock(return_value=True),
+        )
+
+        with (
+            patch.object(monitor.state, "save_if_dirty", side_effect=[False, True]),
+            patch(
+                "ccgram.session_monitor.session_lifecycle.resolve_session_id",
+                return_value="s1",
+            ),
+        ):
+            result = await monitor.request_backlog_skip(1, "window-1", 2, -100)
+
+        assert result is None
+        assert "s1" not in monitor.state.pending_skips
+        assert tracked.parsed_offset == 12
+        assert monitor._delivery_receipts["s1"] == [queued_receipt]
+        assert monitor._transcript_reader.drain_batches() == (batch,)
+        purge.assert_not_awaited()
+
+    @pytest.mark.parametrize("newly_tracked_baseline", [False, True])
+    async def test_restart_rebuilds_codex_mirror_context_before_task_complete(
+        self, tmp_path, newly_tracked_baseline: bool
+    ) -> None:
+        session_file = tmp_path / "codex-session.jsonl"
+        state_file = tmp_path / "monitor-state.json"
+        response = {
+            "type": "response_item",
+            "payload": {
+                "id": "response-1",
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "finished"}],
+            },
+        }
+        task_complete = {
+            "type": "event_msg",
+            "payload": {"type": "task_complete", "last_agent_message": "finished"},
+        }
+        session_file.write_text(json.dumps(response) + "\n")
+        first = SessionMonitor(
+            projects_path=tmp_path / "projects", state_file=state_file
+        )
+        if not newly_tracked_baseline:
+            first.state.update_session(
+                TrackedSession(session_id="s1", file_path=str(session_file))
+            )
+        first.set_message_callback(AsyncMock())
+        with patch(
+            "ccgram.transcript_reader._resolve_provider_for_file",
+            return_value=CodexProvider(),
+        ):
+            await first._process_session_file("s1", session_file, [])
+        if newly_tracked_baseline:
+            assert first._transcript_reader.drain_batches() == ()
+            first.state.save_if_dirty()
+        else:
+            response_batches = first._transcript_reader.drain_batches()
+            pending = first._register_delivery_receipts(response_batches)
+            for batch, consumer_name, receipt in pending:
+                await first._dispatch_message_with_receipt(
+                    batch, receipt, consumer_name
+                )
+            first.commit_delivered_watermarks()
+        response_offset = session_file.stat().st_size
+        assert first.state.tracked_sessions["s1"].last_byte_offset == response_offset
+
+        restarted = (
+            first
+            if newly_tracked_baseline
+            else SessionMonitor(
+                projects_path=tmp_path / "projects", state_file=state_file
+            )
+        )
+        delivery = AsyncMock()
+        restarted.set_message_callback(delivery)
+        with session_file.open("a") as transcript:
+            transcript.write(json.dumps(task_complete) + "\n")
+        with patch(
+            "ccgram.transcript_reader._resolve_provider_for_file",
+            return_value=CodexProvider(),
+        ):
+            await restarted._process_session_file("s1", session_file, [])
+
+        batches = restarted._transcript_reader.drain_batches()
+        assert len(batches) == 1
+        assert batches[0].records == ()
+        pending = restarted._register_delivery_receipts(batches)
+        for batch, consumer_name, receipt in pending:
+            await restarted._dispatch_message_with_receipt(
+                batch, receipt, consumer_name
+            )
+        assert delivery.await_count == 0
+        restarted.commit_delivered_watermarks()
+        assert (
+            restarted.state.tracked_sessions["s1"].last_byte_offset
+            == session_file.stat().st_size
+        )
+
     @pytest.mark.parametrize("completion", ["notice", "deadline"])
     @pytest.mark.parametrize("current", [True, False])
     def test_completed_skip_retires_tool_fence_with_discarded_receipts(
@@ -1426,8 +1549,9 @@ class TestSettledPrefixWatermarkCommit:
             await restarted._process_session_file("new-id", session_file, [])
         assert restarted._transcript_reader.drain_batches() == ()
 
+    @pytest.mark.parametrize("old_watermark", [0, 10_000])
     async def test_generation_replacement_retires_old_receipts_and_parser_state(
-        self, tmp_path
+        self, tmp_path, old_watermark: int
     ) -> None:
         session_file = tmp_path / "claude-session.jsonl"
         session_file.write_text(
@@ -1465,6 +1589,9 @@ class TestSettledPrefixWatermarkCommit:
             receipt.close()
         assert "s1" in monitor._delivery_receipts
         assert "s1" in monitor._pending_tools
+        monitor.state.tracked_sessions["s1"].last_byte_offset = old_watermark
+        monitor.state._dirty = True
+        assert monitor.state.save_if_dirty()
 
         replacement = tmp_path / "replacement.jsonl"
         replacement.write_text(
@@ -1491,7 +1618,27 @@ class TestSettledPrefixWatermarkCommit:
         assert "s1" not in monitor._pending_tools
         assert "s1" not in monitor._transcript_reader._tool_delivery_fences
         assert "s1" not in monitor._transcript_reader._protocol_parser_states
-        assert monitor._transcript_reader.drain_batches() == ()
+        replacement_batches = monitor._transcript_reader.drain_batches()
+        assert len(replacement_batches) == 1
+        assert replacement_batches[0].records == ()
+        assert replacement_batches[0].byte_checkpoint == session_file.stat().st_size
+        replacement_pending = monitor._register_delivery_receipts(replacement_batches)
+        for batch, consumer_name, receipt in replacement_pending:
+            await monitor._dispatch_message_with_receipt(batch, receipt, consumer_name)
+        monitor.commit_delivered_watermarks()
+        assert self._offset(monitor, "s1") == session_file.stat().st_size
+
+        restarted = SessionMonitor(
+            projects_path=tmp_path / "projects",
+            state_file=tmp_path / "monitor-state.json",
+        )
+        restarted.set_message_callback(AsyncMock())
+        with patch(
+            "ccgram.transcript_reader._resolve_provider_for_file",
+            return_value=ClaudeProvider(),
+        ):
+            await restarted._process_session_file("s1", session_file, [])
+        assert restarted._transcript_reader.drain_batches() == ()
 
         with session_file.open("a") as transcript:
             transcript.write(
@@ -1512,15 +1659,17 @@ class TestSettledPrefixWatermarkCommit:
             "ccgram.transcript_reader._resolve_provider_for_file",
             return_value=ClaudeProvider(),
         ):
-            await monitor._process_session_file("s1", session_file, next_messages)
-        batches = monitor._transcript_reader.drain_batches()
+            await restarted._process_session_file("s1", session_file, next_messages)
+        batches = restarted._transcript_reader.drain_batches()
         assert len(batches) == 1
         assert [message.text for message in next_messages] == ["next"]
-        pending = monitor._register_delivery_receipts(batches)
+        pending = restarted._register_delivery_receipts(batches)
         for batch, consumer_name, receipt in pending:
-            await monitor._dispatch_message_with_receipt(batch, receipt, consumer_name)
-        monitor.commit_delivered_watermarks()
-        assert self._offset(monitor, "s1") == session_file.stat().st_size
+            await restarted._dispatch_message_with_receipt(
+                batch, receipt, consumer_name
+            )
+        restarted.commit_delivered_watermarks()
+        assert self._offset(restarted, "s1") == session_file.stat().st_size
 
     async def test_gemini_jsonl_adoption_replays_only_uncommitted_source_range(
         self, tmp_path
@@ -2766,6 +2915,10 @@ class TestCheckForUpdates:
         )
         monitor.state.update_session(tracked)
         monitor._file_mtimes["sess-1"] = session_file.stat().st_mtime
+        monitor._transcript_reader._protocol_parser_states["sess-1"] = (
+            "claude",
+            TranscriptParserState(),
+        )
 
         current_map = {
             "@0": {"session_id": "sess-1", "cwd": resolved, "window_name": "proj"},
