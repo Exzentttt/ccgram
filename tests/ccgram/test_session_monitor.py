@@ -1258,8 +1258,9 @@ class TestSettledPrefixWatermarkCommit:
         call_batches = monitor._transcript_reader.drain_batches()
         assert call_batches
         assert monitor._pending_tools["s1"] == {"tool-1": "Read"}
-        parser_state = monitor._transcript_reader._protocol_parser_states["s1"][1]
-        assert parser_state.pending_tools == {"tool-1": "Read"}
+        assert monitor._transcript_reader._protocol_parser_states["s1"][
+            1
+        ].pending_tools == {"tool-1": "Read"}
 
         with session_file.open("a") as transcript:
             transcript.write(json.dumps(tool_result) + "\n")
@@ -1285,10 +1286,8 @@ class TestSettledPrefixWatermarkCommit:
         assert self._offset(monitor, "s1") == skipped_offset
         assert "s1" not in monitor._pending_tools
         assert "s1" not in monitor._transcript_reader._tool_delivery_fences
-        assert parser_state.pending_tools == {}
-        assert (
-            monitor._transcript_reader._protocol_parser_states["s1"][1] is parser_state
-        )
+        assert "s1" not in monitor._transcript_reader._protocol_parser_states
+        assert "s1" in monitor._transcript_reader._parser_rebuild_pending
 
         with session_file.open("a") as transcript:
             transcript.write(json.dumps(fresh_output) + "\n")
@@ -1301,6 +1300,11 @@ class TestSettledPrefixWatermarkCommit:
         fresh_batches = monitor._transcript_reader.drain_batches()
         assert len(fresh_batches) == 1
         assert [message.text for message in messages] == ["after skip"]
+        assert "s1" not in monitor._transcript_reader._parser_rebuild_pending
+        assert (
+            monitor._transcript_reader._protocol_parser_states["s1"][1].pending_tools
+            == {}
+        )
         pending = monitor._register_delivery_receipts(fresh_batches)
         for batch, consumer_name, receipt in pending:
             await monitor._dispatch_message_with_receipt(batch, receipt, consumer_name)
@@ -1317,6 +1321,123 @@ class TestSettledPrefixWatermarkCommit:
         ):
             await restarted._process_session_file("s1", session_file, [])
         assert restarted._transcript_reader.drain_batches() == ()
+
+    @pytest.mark.parametrize("completion", ["notice", "deadline"])
+    @pytest.mark.parametrize("next_output", ["response_item", "agent_message"])
+    async def test_completed_skip_rebuilds_codex_turn_context(
+        self, tmp_path, completion: str, next_output: str
+    ) -> None:
+        session_file = tmp_path / "codex-session.jsonl"
+        state_file = tmp_path / "monitor-state.json"
+        prior_turn = [
+            {
+                "type": "response_item",
+                "payload": {
+                    "id": "prior-answer",
+                    "type": "message",
+                    "role": "assistant",
+                    "phase": "final_answer",
+                    "content": [{"type": "output_text", "text": "Done"}],
+                },
+            },
+            {
+                "type": "event_msg",
+                "payload": {"type": "task_complete", "last_agent_message": "Done"},
+            },
+        ]
+        skipped_user_turn = {
+            "type": "response_item",
+            "payload": {
+                "id": "skipped-user",
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "next task"}],
+            },
+        }
+        next_entry = (
+            {
+                "type": "response_item",
+                "payload": {
+                    "id": "next-answer",
+                    "type": "message",
+                    "role": "assistant",
+                    "phase": "final_answer",
+                    "content": [{"type": "output_text", "text": "Done"}],
+                },
+            }
+            if next_output == "response_item"
+            else {
+                "type": "event_msg",
+                "payload": {"type": "agent_message", "message": "Done"},
+            }
+        )
+        session_file.write_text("".join(json.dumps(item) + "\n" for item in prior_turn))
+        monitor = SessionMonitor(
+            projects_path=tmp_path / "projects", state_file=state_file
+        )
+        monitor.state.update_session(
+            TrackedSession(session_id="s1", file_path=str(session_file))
+        )
+        delivered: list[NewMessage] = []
+        monitor.set_message_callback(
+            AsyncMock(side_effect=lambda message: delivered.append(message))
+        )
+
+        with patch(
+            "ccgram.transcript_reader._resolve_provider_for_file",
+            return_value=CodexProvider(),
+        ):
+            await monitor._process_session_file("s1", session_file, [])
+        prior_batches = monitor._transcript_reader.drain_batches()
+        assert len(prior_batches) == 1
+        prior_pending = monitor._register_delivery_receipts(prior_batches)
+        for batch, consumer_name, receipt in prior_pending:
+            await monitor._dispatch_message_with_receipt(batch, receipt, consumer_name)
+        monitor.commit_delivered_watermarks()
+        prior_offset = session_file.stat().st_size
+        assert self._offset(monitor, "s1") == prior_offset
+        assert [message.text for message in delivered] == ["Done"]
+
+        with session_file.open("a") as transcript:
+            transcript.write(json.dumps(skipped_user_turn) + "\n")
+        skip_offset = session_file.stat().st_size
+        monitor.state.begin_skip(
+            BacklogSkipIntent(
+                session_id="s1",
+                window_id="window-1",
+                user_id=1,
+                thread_id=2,
+                chat_id=-100,
+                snapshot_offset=skip_offset,
+                range_start=prior_offset,
+            )
+        )
+        monitor.state.pending_skips["s1"].purge_complete = True
+        with patch.object(monitor, "_skip_is_current", return_value=True):
+            if completion == "notice":
+                monitor._skip_notice_receipts["s1"] = self._ready(skip_offset)
+                monitor.commit_delivered_watermarks()
+            else:
+                monitor.state.pending_skips["s1"].created_at = time.time() - 10_000.0
+                monitor._expire_aged_skip_barriers()
+        assert self._offset(monitor, "s1") == skip_offset
+
+        with session_file.open("a") as transcript:
+            transcript.write(json.dumps(next_entry) + "\n")
+        with patch(
+            "ccgram.transcript_reader._resolve_provider_for_file",
+            return_value=CodexProvider(),
+        ):
+            await monitor._process_session_file("s1", session_file, [])
+        next_batches = monitor._transcript_reader.drain_batches()
+        assert len(next_batches) == 1
+        assert len(next_batches[0].records) == 1
+        next_pending = monitor._register_delivery_receipts(next_batches)
+        for batch, consumer_name, receipt in next_pending:
+            await monitor._dispatch_message_with_receipt(batch, receipt, consumer_name)
+        assert [message.text for message in delivered] == ["Done", "Done"]
+        monitor.commit_delivered_watermarks()
+        assert self._offset(monitor, "s1") == session_file.stat().st_size
 
     async def test_cancelled_skip_rewinds_and_rebuilds_tool_context(
         self, tmp_path

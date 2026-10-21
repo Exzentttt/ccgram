@@ -68,10 +68,11 @@ produces a checkpoint-only batch. A tool-call fence stays in place until deliver
 through its result checkpoint settles. Later unrelated output does not hold that
 fence. A completed backlog skip retires pending calls and tool fences for the
 skipped range. Canceled skips leave the durable checkpoint unchanged and rewind
-parsing if their receipts retire. Startup and session identity adoption rebuild
-parser context from committed source bytes. Source replacement retires the old
-generation's receipts and parser context, then emits a checkpoint-only batch at
-the replacement's EOF. Receipt settlement persists that boundary before restart.
+parsing if their receipts retire. Startup, completed skips, and session identity
+adoption rebuild parser context from committed source bytes. Source replacement
+retires the old generation's receipts and parser context. It emits a
+checkpoint-only batch at the replacement's EOF. Receipt settlement persists that
+boundary.
 Skip fences retain their source boundary.
 Mobile replay subscriptions keep their bounded queues and never hold Telegram's
 checkpoint. Telegram does not replay the mobile history ring at startup.

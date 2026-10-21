@@ -441,7 +441,7 @@ class SessionMonitor:
                     barrier_age_seconds=round(now - intent.created_at, 1),
                 )
                 if self.state.complete_skip(session_id):
-                    self._transcript_reader.retire_skipped_tool_state(session_id)
+                    self._transcript_reader.replay_from_watermark(session_id)
                 else:
                     self._cancel_pending_skip(session_id)
             self._discard_session_delivery_state(session_id)
@@ -487,8 +487,9 @@ class SessionMonitor:
                 self._cancel_pending_skip(session_id)
                 continue
             if self.state.complete_skip(session_id):
-                # The skip retires the result receipts this fence was waiting for.
-                self._transcript_reader.retire_skipped_tool_state(session_id)
+                # Rebuild provider context through the skipped boundary before
+                # parsing the next suffix, which may begin a new Codex turn.
+                self._transcript_reader.replay_from_watermark(session_id)
                 self.state.save_if_dirty()
                 self._delivery_receipts.pop(session_id, None)
             else:
