@@ -1,6 +1,6 @@
 # ccgram Architecture
 
-Generated from code state 2026-08-31.
+Updated for the shared session core on 2026-10-21.
 
 ## Herdr compatibility
 
@@ -10,124 +10,61 @@ The Herdr adapter accepts socket protocols 14–22 without warnings and attempts
 
 [agterm](https://github.com/umputun/agterm) is macOS-native. Its adapter drives the `agtermctl` CLI through agterm's local control socket. An agterm session UUID is the neutral `window_id`; agterm persists that UUID across restarts, so no alias reconciliation is required. Discovery defaults to the `ccgram` workspace and can be scoped with `CCGRAM_AGTERM_WORKSPACES`; agterm supports workspace selection for new sessions.
 
+## Mobile session API
+
+The shared `session_protocol/` core owns session discovery, canonical transcript
+records, history, requests, replay, and crash-safe actions. Telegram calls it
+through an in-process adapter; the optional `api/` adapter exposes `ccgram/1`
+over HTTP/WebSocket with device authentication. The core starts even when the
+mobile listener is disabled. Telegram retains its presentation and durable
+delivery receipts, while mobile clients use bounded replay. See the
+[protocol documentation](protocol/README.md) for setup and adapter boundaries.
+
 ## System Overview
 
 ccgram maps each Telegram Forum topic to one terminal-multiplexer target running one agent CLI (Claude Code, Codex, Gemini, Pi, Antigravity, or Shell). Tmux routing remains keyed by window ID (`@0`, `@12`). Herdr routing is keyed only by opaque `herdr-session-v1-…` targets derived from `agent.list`; tab, pane, terminal, workspace, display, and focus values are short-lived locators inside a fresh guarded action, never persisted identity. Every Herdr session displays one pane-qualified topic, independent of sibling count. Missing, malformed, sessionless, and legacy targets fail closed; duplicate canonical targets are quarantined without disabling unrelated sessions; raw locator aliases and display-name recovery are never implicit. A target can change after the guard and before Herdr dispatches, so the adapter records a possible post-guard race rather than claiming atomic delivery. agterm routing is keyed by its durable session UUID. Multiplexer access goes through the `multiplexer/` seam (`Multiplexer` Protocol); tmux is the default backend, while herdr and agterm are selectable with `CCGRAM_MULTIPLEXER=herdr` and `CCGRAM_MULTIPLEXER=agterm`, respectively.
 
 ```mermaid
-graph TB
-    Telegram["Telegram<br>(Forum topics)"]
-    Bot["bot.py<br>(172 lines: factory + lifecycle)"]
-    Bootstrap["bootstrap.py<br>post_init + post_shutdown"]
-    Registry["handlers/registry.py<br>PTB handler wiring"]
-    TC["telegram_client.py<br>TelegramClient Protocol<br>+ PTBTelegramClient adapter"]
-    Handlers["handlers/<br>14 feature subpackages"]
-    TmuxMgr["multiplexer/ seam <br> Multiplexer Protocol <br> (tmux default, herdr, agterm)"]
-    Windows["multiplexer windows <br> (Claude, Codex, Gemini, Pi, Antigravity, Shell)"]
-    Hook["hook.py<br>Claude Code hooks"]
-    Monitor["session_monitor.py<br>poll loop"]
-    State["State files<br>~/.ccgram/"]
-
-    Telegram -- "updates" --> Bot
-    Bot -- "post_init" --> Bootstrap
-    Bot -- "register_all" --> Registry
-    Registry -- "dispatch" --> Handlers
-    Handlers -- "depend on Protocol" --> TC
-    TC -- "PTBTelegramClient" --> Bot
-    Handlers -- "send_keys / capture_pane (via multiplexer proxy)" --> TmuxMgr
-    TmuxMgr --> Windows
-    Windows -- "hook events" --> Hook
-    Hook -- "session_map.json<br>events.jsonl" --> State
-    Monitor -- "reads" --> State
-    Monitor -- "NewMessage / NewWindowEvent" --> Handlers
+flowchart LR
+    TG["Telegram"] --> H["Telegram handlers"]
+    Phone["Mobile client<br/>(remote)"] --> API["api/<br/>HTTP + WebSocket"]
+    H -->|actions and history| Core["SessionService<br/>ActionExecutor"]
+    API --> Core
+    Boot["bootstrap.py"] --> Core
+    Core --> Mux["Multiplexer<br/>tmux / Herdr / agterm"]
+    Mux --> Agents["Existing terminal agents"]
+    classDef core fill:#ecfdf5,stroke:#059669,color:#064e3b
+    classDef ext fill:#eef2ff,stroke:#6366f1,color:#1e1b4b
+    classDef store fill:#fff7ed,stroke:#ea580c,color:#431407
+    class Core core
+    class TG,Phone ext
 ```
 
 ## Module Layers
 
 ```mermaid
-graph TD
-    subgraph entry["Entry Points + Bootstrap"]
-        CLI["cli.py / main.py"]
-        BotPy["bot.py<br>(factory + lifecycle, 172 lines)"]
-        BootstrapPy["bootstrap.py<br>post_init + post_shutdown"]
-        RegistryPy["handlers/registry.py<br>PTB handler wiring"]
-        HookPy["hook.py"]
-    end
-
-    subgraph protocol["Telegram Seam"]
-        TCProto["telegram_client.py<br>TelegramClient Protocol<br>+ PTBTelegramClient adapter<br>+ FakeTelegramClient (tests)"]
-    end
-
-    subgraph handlers["Handler Layer — handlers/"]
-        TopLevel["Top-level: callback_*, cleanup,<br>command_*, file_handler, hook_events,<br>inline, reactions, registry, response_builder,<br>sessions_dashboard, sync_command, upgrade, user_state"]
-        TopicsPkg["topics/<br>topic_orchestration, topic_lifecycle,<br>directory_browser, directory_callbacks,<br>topic_creation_draft, workspace_callbacks,<br>provider_mode_callbacks, window_launch_service,<br>window_callbacks, new_command, worktree"]
-        TextPkg["text/<br>text_handler"]
-        InteractivePkg["interactive/<br>interactive_ui, interactive_callbacks"]
-        StatusPkg["status/<br>status_bubble, status_bar_actions, topic_emoji, rc_probe"]
-        LivePkg["live/<br>live_view, screenshot_callbacks, pane_callbacks"]
-        SendPkg["send/<br>send_command, send_callbacks, send_security"]
-        ToolbarPkg["toolbar/<br>toolbar_keyboard, toolbar_callbacks"]
-        VoicePkg["voice/<br>voice_handler, voice_callbacks"]
-        ShellPkg["shell/<br>shell_commands, shell_capture,<br>shell_context, shell_prompt_orchestrator"]
-        MsgPipePkg["messaging_pipeline/<br>message_queue, message_routing,<br>message_sender, message_task,<br>tool_batch, topic_commands"]
-        RecoveryPkg["recovery/<br>recovery_callbacks (dispatcher),<br>recovery_banner, resume_picker,<br>restore_command, resume_command,<br>transcript_discovery,<br>history, history_callbacks"]
-        CommandsPkg["commands/<br>forward, menu_sync,<br>failure_probe, status_snapshot"]
-        PollingPkg["polling/<br>polling_coordinator,<br>polling_types (pure), polling_state (stateful),<br>polling_runtime (injectable bundle),<br>periodic_tasks,<br>window_tick/{decide, observe, apply}"]
-    end
-
-    subgraph query["Read-Only Query Layer"]
-        WQ["window_query.py<br>read window state"]
-        SQ["session_query.py<br>read session data"]
-    end
-
-    subgraph state["State Management (constructor DI — F2)"]
-        SM["session.py<br>SessionManager<br>(constructs + owns stores)"]
-        TR["thread_router.py<br>(callbacks via __init__)"]
-        WS["window_state_store.py<br>(persistence kernel)"]
-        WSP["window_state_ports/<br>pane/identity/worktree/<br>tool/lifecycle"]
-        SSP["session_state_ports/<br>live_session_state<br>(frozen LiveSessionSnapshot)"]
-        UP["user_preferences.py<br>(callback via __init__)"]
-        SMS["session_map.py<br>SessionMapSync<br>(callback via __init__)"]
-        SR["session_resolver.py"]
-    end
-
-    subgraph infra["Infrastructure"]
-        TmuxMgr2["multiplexer/ seam<br>(tmux / herdr / agterm backends)"]
-        WR["window_resolver.py"]
-        SP["state_persistence.py"]
-    end
-
-    subgraph providers["Provider Abstraction"]
-        Base["providers/base.py<br>AgentProvider protocol<br>ProviderCapabilities"]
-        Claude["providers/claude.py"]
-        Jsonl["providers/_jsonl.py<br>(Codex + Gemini + Pi + Antigravity base)"]
-        Shell["providers/shell.py"]
-    end
-
-    subgraph monitor["Session Monitoring"]
-        SesMon["session_monitor.py"]
-        TReader["transcript_reader.py"]
-        EvReader["event_reader.py"]
-        SLifecycle["session_lifecycle.py"]
-        IdleT["idle_tracker.py"]
-    end
-
-    BotPy --> BootstrapPy
-    BotPy --> RegistryPy
-    RegistryPy --> handlers
-    handlers --> protocol
-    protocol --> BotPy
-    handlers --> query
-    handlers --> WSP
-    query --> WSP
-    WSP --> WS
-    query --> SR
-    handlers --> SM
-    SM --> TR & WS & UP & SMS
-    SM --> SP
-    SesMon --> TReader & EvReader & SLifecycle & IdleT
-    SesMon --> SMS
-    providers --> handlers
+flowchart LR
+    Boot["bootstrap.py<br/>bot.py + registry"] --> H["handlers/<br/>Telegram presentation"]
+    Boot --> Runtime["session_protocol/runtime.py"]
+    Boot --> Monitor["session_monitor.py<br/>transcript_reader.py"]
+    Runtime --> Core["SessionService<br/>ActionExecutor + backend"]
+    H -->|in-process adapter| Core
+    H --> Client["telegram_client.py"]
+    H --> Query["window_query.py<br/>session_query.py"]
+    Query --> State["Window/session state ports<br/>and persisted stores"]
+    Query -->|injected live history| Core
+    Core --> Parts["session_protocol/messages.py<br/>canonical records"]
+    Core --> Hub["session_protocol/events.py<br/>EventHub"]
+    Core --> Mux["multiplexer/<br/>backend seam"]
+    Core --> Providers["providers/<br/>launch + terminal status"]
+    Monitor --> Parts
+    Monitor --> Hub
+    Monitor --> State
+    Monitor --> Providers
+    classDef core fill:#ecfdf5,stroke:#059669,color:#064e3b
+    classDef store fill:#fff7ed,stroke:#ea580c,color:#431407
+    class Runtime,Core,Parts,Hub core
+    class State store
 ```
 
 ## State Flow: Topic → Target → Session
@@ -186,8 +123,6 @@ classDiagram
         <<Protocol>>
         +capabilities: ProviderCapabilities
         +make_launch_args() str
-        +parse_transcript_line(line) dict
-        +parse_transcript_entries(entries) list
         +parse_terminal_status(text) StatusUpdate
         +seed_task_state(wid, sid, path) ← NEW
         +apply_task_entries(wid, sid, entries) ← NEW
@@ -227,24 +162,24 @@ classDiagram
 
 ```mermaid
 sequenceDiagram
-    participant SessionMonitor
-    participant MsgRouting as message_routing.py
-    participant SQ as session_query.py
-    participant WQ as window_query.py
-    participant MsgQueue as message_queue.py
+    participant Monitor as SessionMonitor
+    participant Hub as EventHub
+    participant Adapter as Telegram batch consumer
+    participant Routing as message_routing.py
+    participant Query as session_query.py
+    participant Queue as message_queue.py
     participant Telegram
 
-    SessionMonitor->>MsgRouting: NewMessage(session_id, text)
-    MsgRouting->>SQ: find_users_for_session(session_id)
-    SQ-->>MsgRouting: [(user_id, window_id, thread_id)]
-    loop for each user
-        MsgRouting->>WQ: get_notification_mode(window_id)
-        WQ-->>MsgRouting: "all" | "errors_only" | "muted"
-        alt not filtered
-            MsgRouting->>MsgQueue: enqueue_content_message(...)
-            MsgQueue->>Telegram: rate_limit_send → Bot API
-        end
-    end
+    Note over Monitor,Hub: Register all batch receipts before dispatch
+    Monitor->>Hub: dispatch normalized TranscriptBatch
+    Hub->>Adapter: deliver batch under receipt
+    Adapter->>Routing: rendered NewMessage
+    Routing->>Query: resolve topic recipients and policy
+    Query-->>Routing: recipients
+    Routing->>Queue: enqueue visible messages
+    Queue->>Telegram: rate-limited Bot API send
+    Telegram-->>Queue: acknowledgement
+    Note over Queue,Monitor: Settled receipts permit checkpoint commit
 ```
 
 ## Delivery Queue, Progress, and Watermarks
@@ -296,19 +231,19 @@ graph TD
 ## Session Monitoring Architecture
 
 ```mermaid
-graph TB
-    SM2["session_monitor.py<br>(coordinator)"]
-
-    SM2 --> ER["event_reader.py<br>read_new_events(path, offset)<br>stateless pure I/O"]
-    SM2 --> TR2["transcript_reader.py<br>per-session JSONL parsing<br>file mtime cache"]
-    SM2 --> SL["session_lifecycle.py<br>reconcile() session map changes<br>handle_session_end()"]
-    SM2 --> IT["idle_tracker.py<br>per-session activity timestamps"]
-    SM2 --> DC["delivery_contract.py<br>receipt/outcome contract"]
-    MQ["messaging_pipeline/message_queue.py<br>ordered delivery"] --> DC
-
-    TR2 -- "seed_task_state()<br>apply_task_entries()<br>(via provider protocol)" --> Claude2["ClaudeProvider<br>clause_task_state"]
-
-    SM2 -- "load_session_map()<br>prune_session_map()" --> SMS2["session_map_sync"]
+flowchart TB
+    SM2["session_monitor.py<br/>coordinator"] --> ER["event_reader.py<br/>hook log I/O"]
+    SM2 --> TR2["transcript_reader.py<br/>delivery cursors + rendering"]
+    SM2 --> SL["session_lifecycle.py<br/>session-map reconciliation"]
+    SM2 --> IT["idle_tracker.py<br/>activity timestamps"]
+    SM2 --> Hub["Shared EventHub<br/>durable batch dispatch"]
+    SM2 --> DC["delivery_contract.py<br/>receipt settlement"]
+    MQ["message_queue.py<br/>ordered Telegram delivery"] --> DC
+    TR2 --> Parts["session_protocol/messages.py<br/>parse_records"]
+    TR2 -->|task observations| Claude2["ClaudeProvider<br/>claude_task_state"]
+    SM2 --> SMS2["session_map_sync"]
+    classDef core fill:#ecfdf5,stroke:#059669,color:#064e3b
+    class Hub,Parts core
 ```
 
 ## Key Design Decisions
@@ -339,7 +274,7 @@ graph TB
 | `session_state_ports/` live-session read contract | Volatile live-session reads (task snapshot, wait header, session-id, last-activity) go through `session_state_ports/live_session_state.py`. Direct handler imports of `get_claude_task_snapshot`, `get_claude_wait_header`, or `claude_task_state.has_snapshot` are banned. Write authority stays in `session_lifecycle`. Gate: `test_session_state_ports_audit.py`                                                                                   |
 | State-file contracts in `hooks/state_files.py`    | `EventLogRecord`/`SessionMapEntry` are the canonical record types for `events.jsonl` and `session_map.json`. All production writes use `serialize_*`; all reads use `parse_*`. File I/O and locking stay in `hook.py`/`session_map.py`. `state_files.py` is stdlib-only                                                                                                                                                                               |
 | Topic-creation seam split                         | `directory_callbacks.py` is a thin dispatcher; `topic_creation_draft.py` owns the 14 flow-state keys; `workspace_callbacks.py` handles workspace picker; `provider_mode_callbacks.py` handles provider/mode selection; `window_launch_service.py` owns window creation, race guard, thread bind, and pending-text forwarding                                                                                                                          |
-| Transcript parser delegation                      | `transcript_parser.parse_entries` delegates to small per-type handlers (`_handle_assistant_message`, `_handle_tool_use_entry`, etc.); public API unchanged. Characterization tests cover all 12 entry types before refactor                                                                                                                                                                                                                           |
+| Shared transcript normalization                      | `session_protocol/messages.py` normalizes provider records for history and live delivery. Telegram renders canonical batches through `transcript_reader.py`; the shared event hub retains receipt-based checkpoints. The old provider parser APIs and `transcript_parser.py` are removed. See [protocol implementation](protocol/implementation.md).                                                                                                                                                                                                                           |
 | Recovery split                                    | `recovery_callbacks.py` is a thin dispatcher; `recovery_banner.py` owns dead-window banner UX; `resume_picker.py` owns the resume picker + transcript scan. `recovery/__init__.py` re-exports the public surface                                                                                                                                                                                                                                      |
 | Commands subpackage                               | `handlers/commands/` mirrors the `shell/` pattern: `forward.py`, `menu_sync.py`, `panel.py`, `failure_probe.py`, `status_snapshot.py`. `panel.py` renders topic-specific command inline keyboards; Telegram’s native `/` menu remains shared across topics. `commands/__init__.py` hosts `commands_command` + `toolbar_command`                                                                                                                                                                                                                                                        |
 | Lazy-import contract                              | In-function `Import`/`ImportFrom` must carry `# Lazy: <reason>` (or live inside `if TYPE_CHECKING:` / `_reset_*_for_testing`). `scripts/lint_lazy_imports.py` runs in `make lint`; cycle regressions caught by `tests/integration/test_import_no_cycles.py`                                                                                                                                                                                           |
