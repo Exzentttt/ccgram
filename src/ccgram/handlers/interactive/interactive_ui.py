@@ -291,9 +291,12 @@ def get_interactive_msg_id(
     return _interactive_msgs.get(_interactive_key(user_id, thread_id, chat_id))
 
 
+type _NumberedMenuBlock = tuple[int, int, tuple[tuple[str, str], ...], frozenset[int]]
+
+
 def _numbered_menu_blocks(
     lines: list[str],
-) -> list[tuple[int, int, tuple[tuple[str, str], ...]]]:
+) -> list[_NumberedMenuBlock]:
     """Find contiguous sequential numbered menu blocks and their line ranges.
 
     Lines indented past the option number are normally consumed as its
@@ -305,7 +308,7 @@ def _numbered_menu_blocks(
     ranking only disambiguates between candidate blocks. Every numbered start is
     considered so a description cannot hide a later, indented live menu.
     """
-    blocks: list[tuple[int, int, tuple[tuple[str, str], ...]]] = []
+    blocks: list[_NumberedMenuBlock] = []
     for start, line in enumerate(lines):
         first = _NUMBERED_OPTION_RE.fullmatch(line)
         if first is None or first.group(1) != "1":
@@ -313,6 +316,7 @@ def _numbered_menu_blocks(
 
         index = start
         choices: list[tuple[str, str]] = []
+        option_lines: set[int] = set()
         expected = 1
         while index < len(lines):
             option = _NUMBERED_OPTION_RE.fullmatch(lines[index])
@@ -335,11 +339,12 @@ def _numbered_menu_blocks(
             if int(number) != expected:
                 break
             choices.append((number, f"{number}. {label}"))
+            option_lines.add(index)
             expected += 1
             index += 1
 
         if len(choices) >= _MIN_NUMBERED_DIRECT_CHOICES:
-            blocks.append((start, index - 1, tuple(choices)))
+            blocks.append((start, index - 1, tuple(choices), frozenset(option_lines)))
     return blocks
 
 
@@ -347,8 +352,9 @@ def parse_direct_choices(content: str) -> tuple[tuple[str, str], ...]:
     """Extract direct choices only from the active single-select menu.
 
     Numbered options must form a contiguous sequential menu with two through
-    eight choices. The candidate nearest a cursor marker or action footer wins;
-    ties are ambiguous and deliberately retain the navigation keyboard. This
+    eight choices. A cursor must belong to the candidate's accepted options;
+    otherwise a unique, non-overlapping candidate nearest the action footer wins.
+    Ambiguity deliberately retains the navigation keyboard. This
     prevents unrelated numbered prose elsewhere in a terminal capture from
     becoming one-tap input. Explicit multi-select prompts never get buttons.
     """
@@ -362,29 +368,56 @@ def parse_direct_choices(content: str) -> tuple[tuple[str, str], ...]:
 
     lines = content.splitlines()
     blocks = _numbered_menu_blocks(lines)
-    # Anchors must themselves be menu-shaped: a cursor ON an option line, or
-    # a selection footer. A bare arrow, blockquote marker, pager hint, or
-    # editor hint in surrounding prose must not adopt a numbered list.
+    # A nearby cursor is not evidence for a nested description list: it must
+    # occur on an option the candidate actually accepted.
+    cursor_lines = {
+        index for index, line in enumerate(lines) if _CURSOR_OPTION_RE.match(line)
+    }
+    if cursor_lines:
+        matching = [
+            choices
+            for _, _, choices, option_lines in blocks
+            if option_lines & cursor_lines
+        ]
+        if len(matching) == 1 and len(matching[0]) <= _MAX_DIRECT_CHOICES:
+            return matching[0]
+        return ()
+
     anchors = [
         index
         for index, line in enumerate(lines)
-        if _CURSOR_OPTION_RE.match(line) or _DIRECT_CHOICE_ACTION_RE.search(line)
+        if _DIRECT_CHOICE_ACTION_RE.search(line)
     ]
     if anchors:
         ranked = sorted(
             (
-                min(min(abs(anchor - start), abs(anchor - end)) for anchor in anchors),
-                choices,
-            )
-            for start, end, choices in blocks
+                (
+                    min(
+                        min(abs(anchor - block[0]), abs(anchor - block[1]))
+                        for anchor in anchors
+                    ),
+                    block,
+                )
+                for block in blocks
+            ),
+            key=lambda candidate: candidate[0],
         )
         if ranked:
-            nearest_distance, nearest_choices = ranked[0]
+            nearest_distance, nearest = ranked[0]
+            start, end, nearest_choices, _ = nearest
+            # A footer alone cannot prove which overlapping list is the menu.
+            overlapping = any(
+                other_start <= end and start <= other_end
+                for other_start, other_end, _, _ in blocks
+                if other_start != start
+            )
             if (
-                len(nearest_choices) <= _MAX_DIRECT_CHOICES
+                not overlapping
+                and len(nearest_choices) <= _MAX_DIRECT_CHOICES
                 and sum(distance == nearest_distance for distance, _ in ranked) == 1
             ):
                 return nearest_choices
+            return ()
 
     words = re.findall(r"(?m)^\s*(?:[←→❯>]\s*)?(Yes|No)\s*$", content, re.IGNORECASE)
     if {word.lower() for word in words} == {"yes", "no"} and len(

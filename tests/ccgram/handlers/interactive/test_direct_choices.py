@@ -246,6 +246,50 @@ class TestParseDirectChoices:
         if selected == 1:
             assert choices == live_choices
 
+    @pytest.mark.parametrize("selected", [1, 2, 3])
+    @pytest.mark.parametrize(
+        "cursor,footer",
+        [
+            ("→", "↑↓ navigate • Enter select • Esc cancel • number quick-select"),
+            ("❯", "Enter to select · ↑/↓ to navigate · Esc to cancel"),
+        ],
+    )
+    def test_cursor_selected_description_lists_never_become_choices(
+        self, selected: int, cursor: str, footer: str
+    ) -> None:
+        rows = ["Which target?"]
+        for number, label in ((1, "Alpha"), (2, "Beta"), (3, "Gamma")):
+            marker = cursor + " " if selected == number else "  "
+            rows.append(f"{marker}{number}. {label}")
+            if selected == number:
+                rows.extend(
+                    ("      1. Step one", "      2. Step two", "      3. Step three")
+                )
+        rows.extend(("", footer))
+        assert parse_direct_choices("\n".join(rows)) == (
+            ("1", "1. Alpha"),
+            ("2", "2. Beta"),
+            ("3", "3. Gamma"),
+        )
+
+    def test_overlapping_blocks_sharing_a_cursor_keep_navigation(self) -> None:
+        assert (
+            parse_direct_choices(
+                "  1. Alpha\n  2. Beta\n      1. Step one\n      2. Step two\n"
+                "→ 3. Gamma\n↑↓ navigate • Enter select • Esc cancel"
+            )
+            == ()
+        )
+
+    def test_overlapping_cursorless_blocks_keep_navigation(self) -> None:
+        assert (
+            parse_direct_choices(
+                "1. Alpha\n   Description\n   1. Step one\n   2. Step two\n"
+                "2. Beta\nEnter to select"
+            )
+            == ()
+        )
+
     def test_checkmark_in_header_does_not_mark_numbered_options(self) -> None:
         assert parse_direct_choices(
             "✔ Recommended\n❯ 1. Alpha\n  2. Beta\nEnter to select"
