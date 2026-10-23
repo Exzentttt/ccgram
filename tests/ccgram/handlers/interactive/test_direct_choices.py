@@ -229,6 +229,23 @@ class TestParseDirectChoices:
             == ()
         )
 
+    @pytest.mark.parametrize("selected", [1, 2])
+    @pytest.mark.parametrize("indent", [1, 2, 4])
+    def test_numbered_prose_never_labels_an_indented_cursor_menu(
+        self, selected: int, indent: int
+    ) -> None:
+        menu = "\n".join(
+            f"{' ' * indent}{'❯ ' if number == selected else '  '}{number}. {label}"
+            for number, label in ((1, "Yes"), (2, "No"))
+        )
+        choices = parse_direct_choices(
+            f"Steps:\n1. Read file\n2. Edit file\n{menu}\nEnter to select"
+        )
+        live_choices = (("1", "1. Yes"), ("2", "2. No"))
+        assert choices in ((), live_choices)
+        if selected == 1:
+            assert choices == live_choices
+
     def test_checkmark_in_header_does_not_mark_numbered_options(self) -> None:
         assert parse_direct_choices(
             "✔ Recommended\n❯ 1. Alpha\n  2. Beta\nEnter to select"

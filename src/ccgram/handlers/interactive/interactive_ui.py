@@ -109,8 +109,8 @@ _MAX_CODEX_NORMALIZED_OPTION_INDENT = 2
 _CURSOR_PREFIX = r"(?:[←→❯›>]\s*)?"
 # A cursor marker on an option line (the selected entry of a live menu).
 _CURSOR_OPTION_RE = re.compile(r"^\s*[←→❯›>]\s*\d+\.")
-# These line-start action hints mirror providers/codex_format.py and the
-# shared selection-footer table in terminal_parser.py. Pi's "Enter select"
+# These line-start hints are a subset of the provider selection footers:
+# "Enter to continue" is excluded because it can follow prose. Pi's "Enter select"
 # wording is embedded mid-line in its status bar; its selected option cursor
 # is the anchor, so generic mid-line footer matches would risk adopting prose.
 _DIRECT_CHOICE_ACTION_RE = re.compile(
@@ -302,17 +302,16 @@ def _numbered_menu_blocks(
     sequential option indented by at most two spaces after a column-zero first
     option, matching Codex's inline-option normalization. Unrelated numbered
     prose elsewhere is kept out by the anchors in ``parse_direct_choices``;
-    ranking only disambiguates between candidate blocks.
+    ranking only disambiguates between candidate blocks. Every numbered start is
+    considered so a description cannot hide a later, indented live menu.
     """
     blocks: list[tuple[int, int, tuple[tuple[str, str], ...]]] = []
-    index = 0
-    while index < len(lines):
-        first = _NUMBERED_OPTION_RE.fullmatch(lines[index])
+    for start, line in enumerate(lines):
+        first = _NUMBERED_OPTION_RE.fullmatch(line)
         if first is None or first.group(1) != "1":
-            index += 1
             continue
 
-        start = index
+        index = start
         choices: list[tuple[str, str]] = []
         expected = 1
         while index < len(lines):
@@ -341,8 +340,6 @@ def _numbered_menu_blocks(
 
         if len(choices) >= _MIN_NUMBERED_DIRECT_CHOICES:
             blocks.append((start, index - 1, tuple(choices)))
-        if index == start:
-            index += 1
     return blocks
 
 
