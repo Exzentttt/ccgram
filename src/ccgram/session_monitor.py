@@ -1213,15 +1213,20 @@ class SessionMonitor:
     ) -> None:
         """Process a single session file (delegates to TranscriptReader)."""
         if self.state.get_session(session_id) is None:
-            for old_id, old_session in self.state.tracked_sessions.items():
-                if not _same_resolved_path(Path(old_session.file_path), file_path):
-                    continue
-                # Finish the old queued tail before adopting its watermark.
-                # Failed/revoked delivery still falls back to at-least-once replay.
+            predecessors = [
+                old_id
+                for old_id, old_session in self.state.tracked_sessions.items()
+                if _same_resolved_path(Path(old_session.file_path), file_path)
+            ]
+            if predecessors:
+                # ACK can arrive after the prior cycle's commit. Adopt only
+                # after folding it, or wait while its queued tail is still live.
+                await self.commit_delivered_watermarks()
                 if any(
                     not receipt.failed
                     and not receipt.revoked
                     and receipt.has_pending_tasks
+                    for old_id in predecessors
                     for receipt in self._delivery_receipts.get(old_id, ())
                 ):
                     return

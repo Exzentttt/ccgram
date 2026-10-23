@@ -412,10 +412,9 @@ async def test_refresh_waits_for_old_queued_tail_without_blocking_other_sources(
     assert case.tracked.last_byte_offset == 0
     for _sid, _text, receipt in queued:
         receipt.settle(DeliveryOutcome.DELIVERED)
-    await case.monitor.commit_delivered_watermarks()
-    assert case.tracked.last_byte_offset == old_eof
-
+    # ACK may arrive after the prior cycle's commit and before adoption.
     await case.monitor.check_for_updates(refreshed)
+    assert case.tracked.last_byte_offset == old_eof
     await case.dispatch_buffered()
     await case.monitor.commit_delivered_watermarks()
     adopted = case.monitor.state.get_session("refreshed")
