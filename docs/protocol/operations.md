@@ -102,16 +102,32 @@ writers. For work and personal groups, use the
 
 ## Status refresh and native probes
 
-Native agent status is optional enrichment. If its probe raises unexpectedly,
-ccgram logs a rate-limited warning and continues the refresh with screen-derived
-status when available. A failed Telegram probe does not stop other window ticks;
-a failed shared-core probe does not discard other targets or stop the runtime poll.
-The next refresh retries the probe.
+Native agent status is optional enrichment. Telegram status polling and the
+shared core use the same cache during bulk refresh. The core refreshes targets
+once per second. Event-stream backends use pushed status and probe on a cold
+miss. Backends without a push stream cache an empty result for five seconds.
+They do not cache positive results. This keeps positive transitions visible on
+the next probe.
 
-The Herdr and Agterm backends already return no native status for expected
-transport or response errors. This hardening covers unexpected raised errors; it
-does not indicate a reproduced socket failure. If the warning persists, check the
-multiplexer health and the error details in the ccgram log.
+The Herdr and Agterm backends return `None` for expected transport or response
+errors. On a backend without a push stream, this value uses the five-second
+negative cache. Native `unknown` is a separate value. It is not negative or
+inactive. Raised probe errors are not cached. ccgram logs a rate-limited warning
+and retries on the next refresh. A failed Telegram probe does not stop other
+window ticks. A failed shared-core probe does not discard other targets or stop
+the runtime poll. This hardening covers unexpected raised errors. It does not
+indicate a reproduced socket failure.
+
+This reduces repeated native-status probes when no status is available. It does
+not reduce the cost of a complete refresh. Each refresh still enumerates targets,
+reads foreground and panes, checks prompt/request state, and observes transcripts.
+A positive status from a backend without a push stream is not cached. Another
+reader can probe again on its next refresh. The five-second cache is only for
+optional background status enrichment. Direct `inspect()` calls used by action
+revalidation and hook/request validation bypass this cache. Identity lookup,
+prompt/request detection, and terminal-input guards continue to read fresh state.
+If a warning persists, check multiplexer health and the error details in the
+ccgram log.
 
 ## Remote input and approval modes
 

@@ -3,12 +3,14 @@ from dataclasses import replace
 import subprocess
 from tempfile import TemporaryFile
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock, call
+from unittest.mock import AsyncMock, MagicMock, call, patch
 from uuid import uuid4
 
 import pytest
 from libtmux.exc import LibTmuxException
 
+from ccgram.handlers.polling.window_tick.observe import _native_agent_status
+from ccgram.multiplexer import agent_status_cache
 from ccgram.multiplexer.base import (
     AgentStatus,
     ForegroundInfo,
@@ -362,11 +364,69 @@ async def test_protocol_runtime_refresh_recovers_after_native_probe_failure(
 
 
 @pytest.fixture
+def clean_agent_status_cache():
+    agent_status_cache.reset()
+    yield
+    agent_status_cache.reset()
+
+
+async def test_runtime_refresh_and_telegram_share_optional_negative_probe(
+    mux, store, monkeypatch, clean_agent_status_cache
+):
+    now = [0.0]
+    monkeypatch.setattr(agent_status_cache, "_clock", lambda: now[0])
+    mux.capabilities.native_agent_status = True
+    mux.capabilities.supports_event_stream = False
+    mux.agent_status.return_value = None
+    service = LocalSessionService(MultiplexerSessionBackend(mux, "/tmp"), store)
+    sleep = AsyncMock(side_effect=[None, asyncio.CancelledError])
+    monkeypatch.setattr("ccgram.session_protocol.runtime.asyncio.sleep", sleep)
+
+    with TemporaryFile() as lock:
+        runtime = ProtocolRuntime(store, service, lock)
+        with pytest.raises(asyncio.CancelledError):
+            await runtime.poll("")
+
+    with patch("ccgram.handlers.polling.window_tick.observe.tmux_manager", mux):
+        assert await _native_agent_status("@1") is None
+    assert mux.agent_status.await_count == 1
+
+    # A backend's None can include an expected transport failure. Optional
+    # enrichment may stay negative for at most five seconds, then must recover.
+    now[0] = 5.0
+    mux.agent_status.return_value = AgentStatus("working", custom_status="fresh")
+    await service.refresh()
+    assert next(iter(service._snapshots.values())).status.state == "working"
+    with patch("ccgram.handlers.polling.window_tick.observe.tmux_manager", mux):
+        status = await _native_agent_status("@1")
+    assert status is not None and status.display_label == "fresh"
+    assert mux.agent_status.await_count == 3
+
+
+async def test_active_inspect_bypasses_bulk_negative_status_cache(
+    mux, clean_agent_status_cache
+):
+    mux.capabilities.native_agent_status = True
+    mux.capabilities.supports_event_stream = False
+    mux.agent_status.side_effect = [None, AgentStatus("working")]
+    backend = MultiplexerSessionBackend(mux, "/tmp")
+
+    await backend.targets()
+    inspected = await backend.inspect("@1")
+
+    assert inspected.status.state == "working"
+    assert mux.agent_status.await_count == 2
+
+
+@pytest.fixture
 def mux(monkeypatch):
     monkeypatch.setattr("ccgram.config.config.prompt_mode", "wrap")
     mux = AsyncMock(spec=Multiplexer)
     mux.capabilities = SimpleNamespace(
-        native_worktrees=False, native_topic_targets=False
+        native_worktrees=False,
+        native_topic_targets=False,
+        native_agent_status=False,
+        supports_event_stream=False,
     )
     mux.list_windows_for_reconciliation.return_value = [
         WindowRef("@1", "project", "/tmp")
