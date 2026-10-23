@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import socket
 from subprocess import TimeoutExpired
 from dataclasses import dataclass, replace
@@ -12,11 +13,13 @@ from pathlib import Path
 from typing import Any, Literal, Protocol
 
 from ..command_catalog import CommandCatalog
+from ..multiplexer import agent_status_cache
 from ..multiplexer.base import Multiplexer, WindowRef
 from ..providers import get_provider_for_window, has_yolo_mode, resolve_launch_command
 from ..providers.process_detection import classify_provider_from_argv
 from ..providers.shell_infra import KNOWN_SHELLS, match_prompt
 from ..window_state_ports import identity_state
+from ..utils import log_throttled
 from ..worktrees import (
     check_worktree_eligibility,
     create_worktree,
@@ -27,6 +30,8 @@ from ..worktrees import (
     WorktreeError,
 )
 from .models import ProtocolError, Status, utc_now
+
+logger = logging.getLogger(__name__)
 
 _CREATION_UNCONFIRMED = (
     "Could not confirm session creation; inspect the terminal before retrying"
@@ -154,7 +159,7 @@ class MultiplexerSessionBackend:
                 window.topic_eligible
                 or identity_state.get_identity(window.window_id) is not None
             ):
-                result.append(await self._target(window))
+                result.append(await self._target(window, cache_optional_status=True))
         return result
 
     async def inspect(self, target_id: str) -> Target:
@@ -168,7 +173,9 @@ class MultiplexerSessionBackend:
             raise ProtocolError(404, "not_found", "Session target no longer exists")
         return await self._target(window)
 
-    async def _target(self, window: WindowRef) -> Target:
+    async def _target(
+        self, window: WindowRef, *, cache_optional_status: bool = False
+    ) -> Target:
         identity = identity_state.get_identity(window.window_id)
         fg = await self.mux.foreground(window.window_id)
         provider_name = classify_provider_from_argv(fg.argv) if fg else ""
@@ -218,7 +225,29 @@ class MultiplexerSessionBackend:
             marker = match_prompt(lines[-1]) if lines else None
             if marker is None or marker.trailing_text.strip():
                 resume_provider = ""
-        native = await self.mux.agent_status(window.window_id)
+        try:
+            if cache_optional_status and self.mux.capabilities.native_agent_status:
+                native = await agent_status_cache.get_status_or_probe(
+                    window.window_id,
+                    lambda: self.mux.agent_status(window.window_id),
+                    # Push coverage is Telegram-bound, not guaranteed for every
+                    # target returned by the shared core.
+                    cache_positive=False,
+                )
+            else:
+                native = await self.mux.agent_status(window.window_id)
+        except Exception as exc:  # noqa: BLE001  # optional enrichment is logged and discarded
+            # Native status is optional; keep building this target and let the
+            # next refresh retry the probe.
+            log_throttled(
+                logger,
+                f"session-protocol-agent-status:{window.window_id}",
+                "Native agent-status probe failed for window %s: %s",
+                window.window_id,
+                exc,
+                level="warning",
+            )
+            native = None
         now = utc_now()
         status = Status("unknown", "", "screen", now)
         if native and native.state in {
