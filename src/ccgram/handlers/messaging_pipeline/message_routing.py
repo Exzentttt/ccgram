@@ -166,8 +166,10 @@ async def enqueue_backlog_skip_notice(client: TelegramClient, intent: object) ->
         user_id=int(getattr(intent, "user_id")),
         window_id=str(getattr(intent, "window_id")),
         parts=[
-            f"⏭ Skipped {count} queued transcript item(s) for live view "
-            f"(bytes {start}–{snapshot}). Raw transcript retained."
+            f"⏭ Skip requested for {count} queued transcript item(s) "
+            f"(bytes {start}–{snapshot}). Raw transcript retained. "
+            "The range is omitted only after this notice is acknowledged and "
+            "the skip is committed. If the skip expires first, the range replays."
         ],
         thread_id=getattr(intent, "thread_id"),
         chat_id=int(getattr(intent, "chat_id")),

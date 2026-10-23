@@ -2,7 +2,7 @@
 
 ## Message Queue
 
-Per-user FIFO queue + worker for all send tasks. Receive order preserved; status messages always follow content; multi-user concurrent processing without interference.
+Per-user queue + worker. Ordinary queued tasks preserve FIFO and content-before-status boundaries. Backlog skip notices pass queued ordinary work, remain FIFO among themselves, and never preempt an in-flight send. All tasks share the existing rate limiter; multi-user processing remains concurrent.
 
 Task types (`ContentTask`, `StatusTask`, `ToolResultTask`) live in `message_task.py` — a dependency-free sum type imported by `message_queue.py`, `tool_batch.py`, and `status_bubble.py` without circular imports. Inbound routing (SessionMonitor → Telegram topics) lives in `message_routing.py`.
 

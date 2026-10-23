@@ -478,7 +478,7 @@ async def stop_delivery_runtime() -> None:
     if monitor_to_commit is not None:
         # A successful bounded drain can now advance receipts; cancellation or
         # terminal delivery failures leave them unacknowledged for replay.
-        monitor_to_commit.commit_delivered_watermarks()
+        await monitor_to_commit.commit_delivered_watermarks()
 
     # Lazy: tracker is only needed to discard ephemeral input correlations at shutdown.
     from .handlers.telegram_origin import clear_pending_telegram_injections

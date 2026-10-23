@@ -107,6 +107,11 @@ def _whisper_timeout_s() -> float:
 class Config:
     """Application configuration loaded from environment variables."""
 
+    @property
+    def replay_cap_bytes(self) -> int:
+        """Return the opt-in transcript replay cap in bytes."""
+        return _replay_cap_bytes()
+
     def __init__(self) -> None:  # noqa: PLR0915
         self.config_dir = ccgram_dir()
         self.config_dir.mkdir(parents=True, exist_ok=True)

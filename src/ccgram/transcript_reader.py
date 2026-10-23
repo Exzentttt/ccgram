@@ -768,10 +768,45 @@ class TranscriptReader:
             if existing != target:
                 continue
 
+            try:
+                target_stat = file_path.stat()
+            except OSError:
+                target_stat = None
+            preserve_retry_floor = bool(
+                old_session.replay_cap_retry_after
+                and target_stat is not None
+                and old_session.replay_cap_retry_device == target_stat.st_dev
+                and old_session.replay_cap_retry_inode == target_stat.st_ino
+                and target_stat.st_size >= old_session.replay_cap_retry_after
+            )
             tracked = TrackedSession(
                 session_id=session_id,
                 file_path=str(file_path),
                 last_byte_offset=old_session.last_byte_offset,
+                replay_cap_retry_after=(
+                    old_session.replay_cap_retry_after if preserve_retry_floor else 0
+                ),
+                replay_cap_retry_device=(
+                    old_session.replay_cap_retry_device
+                    if preserve_retry_floor
+                    else None
+                ),
+                replay_cap_retry_inode=(
+                    old_session.replay_cap_retry_inode if preserve_retry_floor else None
+                ),
+                replay_cap_retry_range_start=(
+                    old_session.replay_cap_retry_range_start
+                    if preserve_retry_floor
+                    else 0
+                ),
+                replay_cap_retry_sha256=(
+                    old_session.replay_cap_retry_sha256 if preserve_retry_floor else ""
+                ),
+                replay_cap_retry_verified=(
+                    old_session.replay_cap_retry_verified
+                    if preserve_retry_floor
+                    else False
+                ),
             )
             # Session IDs can be refreshed for the same transcript. A pending
             # skip is tied to the old identity and must not follow it silently.

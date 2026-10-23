@@ -28,7 +28,7 @@ from typing import Any
 
 from telegram.error import TelegramError
 
-from .config import _replay_cap_bytes, config
+from .config import config
 from .delivery_contract import (
     DeliveryReceipt,
     activate_delivery_receipt,
@@ -296,16 +296,41 @@ class SessionMonitor:
 
     def _discard_session_delivery_state(self, session_id: str) -> None:
         """Drop receipts tied to a session identity that no longer exists."""
+        notice_receipt = self._skip_notice_receipts.get(session_id)
+        if notice_receipt is not None:
+            notice_receipt.fail()
+            self._skip_notice_receipts.pop(session_id, None)
         self._delivery_receipts.pop(session_id, None)
-        self._skip_notice_receipts.pop(session_id, None)
         self._clear_skip_retry(session_id)
 
-    def _cancel_pending_skip(self, session_id: str) -> None:
+    def _cancel_pending_skip(
+        self,
+        session_id: str,
+        *,
+        expected_intent: BacklogSkipIntent | None = None,
+        expected_receipt: DeliveryReceipt | None = None,
+    ) -> bool:
         """Cancel a barrier and restore source work to its durable watermark."""
+        if (
+            expected_intent is not None
+            and self.state.pending_skips.get(session_id) is not expected_intent
+        ):
+            return False
+        if (
+            expected_receipt is not None
+            and self._skip_notice_receipts.get(session_id) is not expected_receipt
+        ):
+            return False
+        notice_receipt = self._skip_notice_receipts.get(session_id)
+        if notice_receipt is not None:
+            notice_receipt.fail()
+            self._skip_notice_receipts.pop(session_id, None)
         self.state.cancel_skip(session_id)
         self._transcript_reader.replay_from_watermark(session_id)
         self.state.save_if_dirty()
-        self._discard_session_delivery_state(session_id)
+        self._delivery_receipts.pop(session_id, None)
+        self._clear_skip_retry(session_id)
+        return True
 
     def set_message_callback(
         self, callback: Callable[[NewMessage], Awaitable[None]]
@@ -370,16 +395,13 @@ class SessionMonitor:
             return None
         recipients = self._skip_recipients(session_id)
         requested_recipient = (user_id, thread_id, chat_id, window_id)
-        if len(recipients) > 1 or (
-            recipients
-            and not any(
-                recipient[0] == requested_recipient[0]
-                and recipient[2] == requested_recipient[1]
-                and recipient[3] == requested_recipient[2]
-                and canonical_window_id(recipient[1])
-                == canonical_window_id(requested_recipient[3])
-                for recipient in recipients
-            )
+        if len(recipients) != 1 or not any(
+            recipient[0] == requested_recipient[0]
+            and recipient[2] == requested_recipient[1]
+            and recipient[3] == requested_recipient[2]
+            and canonical_window_id(recipient[1])
+            == canonical_window_id(requested_recipient[3])
+            for recipient in recipients
         ):
             logger.warning(
                 "Refusing backlog skip for a shared or mismatched recipient set",
@@ -392,31 +414,29 @@ class SessionMonitor:
         source_signature = (
             _source_stat_signature(source_stat) if source_stat is not None else None
         )
+        provider = _resolve_provider_for_file(window_id, source_path)
         if (
             source_stat is None
             or (expected_source is not None and source_signature != expected_source)
             or source_stat.st_size < session.last_byte_offset
+            or (
+                provider.capabilities.supports_incremental_read
+                and _source_has_complete_incremental_tail(source_path, source_signature)
+                is not True
+            )
         ):
             logger.debug(
-                "Deferring backlog skip because the transcript source is unstable",
+                "Deferring backlog skip because the transcript source is unstable or incomplete",
                 session_id=session_id,
             )
             return None
         snapshot_offset = source_stat.st_size
-        provider = _resolve_provider_for_file(window_id, source_path)
-        if provider.capabilities.supports_incremental_read:
-            tail_is_complete = _source_has_complete_incremental_tail(
-                source_path, source_signature
-            )
-            if tail_is_complete is not True:
-                logger.debug(
-                    "Deferring backlog skip because the incremental transcript has no stable complete-record boundary",
-                    session_id=session_id,
-                )
-                return None
-        source_range_sha256 = _source_range_sha256(
+        # Delivery can advance the live watermark while the hash yields.
+        range_start = session.last_byte_offset
+        source_range_sha256 = await asyncio.to_thread(
+            _source_range_sha256,
             source_path,
-            session.last_byte_offset,
+            range_start,
             snapshot_offset,
             device=source_stat.st_dev,
             inode=source_stat.st_ino,
@@ -439,7 +459,7 @@ class SessionMonitor:
             thread_id=thread_id,
             chat_id=chat_id,
             snapshot_offset=snapshot_offset,
-            range_start=session.last_byte_offset,
+            range_start=range_start,
             created_at=time.time(),
             source_path=str(source_path),
             source_device=source_stat.st_dev,
@@ -447,6 +467,14 @@ class SessionMonitor:
             source_range_sha256=source_range_sha256,
             automatic=automatic,
         )
+        # Hashing yielded to the loop: another request, rebind, or source update
+        # may have won the barrier or changed the registered source meanwhile.
+        if (
+            session_id in self.state.pending_skips
+            or self.state.get_session(session_id) is not session
+            or self._skip_is_current(intent, strict=True) is not True
+        ):
+            return None
         # The durable barrier is written before destructive queue retirement.
         self.state.begin_skip(intent)
         if not self.state.save_if_dirty():
@@ -474,9 +502,14 @@ class SessionMonitor:
         ]
 
     def _skip_source_is_current(
-        self, intent: BacklogSkipIntent, *, verify_content: bool = False
-    ) -> bool:
-        """Keep barriers tied to the frozen path, generation, and optional content."""
+        self, intent: BacklogSkipIntent, *, strict: bool = False
+    ) -> bool | None:
+        """Keep barriers tied to the frozen path and source generation.
+
+        Source identity reads are cheap and synchronous. In strict mode an
+        unavailable path/stat is unknown; a confirmed identity mismatch is
+        false.
+        """
         if not intent.source_path:
             # Legacy barriers cannot be committed against an unknown source.
             return False
@@ -510,25 +543,13 @@ class SessionMonitor:
                     )
                 break
             current = source_path.stat()
-        except OSError, ValueError:
-            return False
-        source_is_current = (
+        except OSError, RuntimeError, ValueError:
+            return None if strict else False
+        return (
             source_matches
             and current.st_dev == intent.source_device
             and current.st_ino == intent.source_inode
             and current.st_size >= intent.snapshot_offset
-        )
-        if not source_is_current or not verify_content:
-            return source_is_current
-        return bool(intent.source_range_sha256) and (
-            _source_range_sha256(
-                source_path,
-                intent.range_start,
-                intent.snapshot_offset,
-                device=intent.source_device,
-                inode=intent.source_inode,
-            )
-            == intent.source_range_sha256
         )
 
     def _skip_is_current(
@@ -536,18 +557,15 @@ class SessionMonitor:
         intent: BacklogSkipIntent,
         *,
         strict: bool = False,
-        verify_content: bool = False,
     ) -> bool | None:
-        """True when the barrier source and registered recipient are current.
+        """Return the synchronous source/recipient verdict for one barrier.
 
-        ``strict=False`` (default) collapses a missing or erroring validator
-        to False, for callers that only need a "still valid" gate.
-        ``strict=True`` surfaces that failure as None instead, so a caller
-        that must not act on an unknown verdict can defer to a later pass.
-        ``verify_content=True`` checks the frozen-range digest at skip commit.
+        Strict callers distinguish a temporary validation failure (``None``)
+        from a confirmed mismatch (``False``).
         """
-        if not self._skip_source_is_current(intent, verify_content=verify_content):
-            return False
+        source_is_current = self._skip_source_is_current(intent, strict=strict)
+        if source_is_current is not True:
+            return source_is_current
         recipients = self._skip_recipients(intent.session_id)
         if len(recipients) != 1:
             return False
@@ -569,6 +587,98 @@ class SessionMonitor:
                 "Failed to validate backlog skip for %s", intent.session_id
             )
             return None if strict else False
+
+    def has_shared_backlog_source(self, window_id: str) -> bool:
+        """Return whether more than one topic is routed to this source."""
+        session_id = session_lifecycle.resolve_session_id(window_id)
+        return bool(session_id and len(self._skip_recipients(session_id)) > 1)
+
+    async def _verify_skip_content(self, intent: BacklogSkipIntent) -> bool | None:
+        """Revalidate an acknowledged barrier and verify its frozen range off-loop."""
+        current = self._skip_is_current(intent, strict=True)
+        if current is not True:
+            return current
+        if intent.source_device is None or intent.source_inode is None:
+            return False
+        try:
+            digest = await asyncio.to_thread(
+                _source_range_sha256,
+                Path(intent.source_path),
+                intent.range_start,
+                intent.snapshot_offset,
+                device=intent.source_device,
+                inode=intent.source_inode,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception(
+                "Could not verify frozen backlog range for %s", intent.session_id
+            )
+            digest = None
+        current = self._skip_is_current(intent, strict=True)
+        if current is not True:
+            return current
+        if digest is None:
+            return None
+        return digest == intent.source_range_sha256
+
+    def _clear_replay_cap_retry_floor(self, tracked: TrackedSession) -> None:
+        """Discard replay-cap suppression when its source generation is invalid."""
+        tracked.replay_cap_retry_after = 0
+        tracked.replay_cap_retry_device = None
+        tracked.replay_cap_retry_inode = None
+        tracked.replay_cap_retry_range_start = 0
+        tracked.replay_cap_retry_sha256 = ""
+        tracked.replay_cap_retry_verified = False
+        self.state.update_session(tracked)
+
+    async def _replay_cap_retry_generation_is_current(
+        self,
+        session_id: str,
+        tracked: TrackedSession,
+        file_path: Path,
+        source_stat: Any,
+    ) -> bool | None:
+        """Validate persisted retry suppression against the stable source range."""
+        if not tracked.replay_cap_retry_after:
+            return True
+        retry_generation = (
+            tracked.replay_cap_retry_device,
+            tracked.replay_cap_retry_inode,
+        )
+        if (
+            retry_generation != (source_stat.st_dev, source_stat.st_ino)
+            or source_stat.st_size < tracked.replay_cap_retry_after
+            or not tracked.replay_cap_retry_sha256
+        ):
+            self._clear_replay_cap_retry_floor(tracked)
+            return False
+        if tracked.replay_cap_retry_verified:
+            return True
+        try:
+            retry_digest = await asyncio.to_thread(
+                _source_range_sha256,
+                file_path,
+                tracked.replay_cap_retry_range_start,
+                tracked.replay_cap_retry_after,
+                device=source_stat.st_dev,
+                inode=source_stat.st_ino,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception(
+                "Could not verify replay-cap retry generation for %s", session_id
+            )
+            return None
+        if retry_digest is None:
+            return None
+        if retry_digest != tracked.replay_cap_retry_sha256:
+            self._clear_replay_cap_retry_floor(tracked)
+            return False
+        tracked.replay_cap_retry_verified = True
+        return True
 
     async def _maybe_skip_replay_cap(
         self,
@@ -599,9 +709,10 @@ class SessionMonitor:
         before = _stable_source_stat(file_path)
         if before is None:
             return
-        if before.st_size < tracked.replay_cap_retry_after:
-            tracked.replay_cap_retry_after = 0
-            self.state.update_session(tracked)
+        retry_current = await self._replay_cap_retry_generation_is_current(
+            session_id, tracked, file_path, before
+        )
+        if retry_current is not True:
             return
         if (
             before.st_size
@@ -627,8 +738,7 @@ class SessionMonitor:
             check_marker=provider.capabilities.supports_incremental_read,
         )
         if generation_changed:
-            tracked.replay_cap_retry_after = 0
-            self.state.update_session(tracked)
+            self._clear_replay_cap_retry_floor(tracked)
         after = _stable_source_stat(file_path)
         signature = _source_stat_signature(after) if after is not None else None
         if (
@@ -671,82 +781,121 @@ class SessionMonitor:
         self._skip_retry_attempts.pop(session_id, None)
         self._skip_retry_at.pop(session_id, None)
 
+    def _pending_skip_current(self, intent: BacklogSkipIntent) -> bool | None:
+        """Validate one exact pending intent, cancelling only confirmed mismatches."""
+        session_id = intent.session_id
+        if self.state.pending_skips.get(session_id) is not intent:
+            return None
+        current = self._skip_is_current(intent, strict=True)
+        if current is False:
+            logger.warning("Cancelling stale backlog skip for %s", session_id)
+            self._cancel_pending_skip(session_id, expected_intent=intent)
+            return False
+        if current is None:
+            self._schedule_skip_retry(session_id)
+            return None
+        return True
+
     async def _prepare_pending_skip(self, intent: BacklogSkipIntent) -> bool | None:
         """Retire frozen source work before a skip notice may be sent."""
-        if not self._skip_is_current(intent):
-            logger.warning("Cancelling stale backlog skip for %s", intent.session_id)
-            self._cancel_pending_skip(intent.session_id)
-            return None
-        if intent.purge_complete:
-            return True
+        session_id = intent.session_id
+        current = self._pending_skip_current(intent)
+        if current is not True:
+            return current
         callback = self._skip_purge_callback
-        if callback is None or not self._skip_retry_due(intent.session_id):
-            return False
+        if (
+            intent.purge_complete
+            or callback is None
+            or not self._skip_retry_due(session_id)
+        ):
+            return intent.purge_complete
         try:
             skipped = await callback(intent)
         except asyncio.CancelledError:
             raise
         except Exception:
-            logger.exception("Failed to purge backlog for %s", intent.session_id)
-            self._schedule_skip_retry(intent.session_id)
+            logger.exception("Failed to purge backlog for %s", session_id)
+            if self.state.pending_skips.get(session_id) is intent:
+                self._schedule_skip_retry(session_id)
             return False
+        current = self._pending_skip_current(intent)
+        if current is not True:
+            return current
         if skipped is None:
-            logger.warning("Cancelling stale backlog skip for %s", intent.session_id)
-            self._cancel_pending_skip(intent.session_id)
+            logger.warning("Cancelling stale backlog skip for %s", session_id)
+            self._cancel_pending_skip(session_id, expected_intent=intent)
             return None
-        if not self._skip_is_current(intent):
-            logger.warning("Cancelling stale backlog skip for %s", intent.session_id)
-            self._cancel_pending_skip(intent.session_id)
-            return None
-        self.state.update_skip_count(intent.session_id, skipped)
+        self.state.update_skip_count(session_id, skipped)
         if not self.state.save_if_dirty():
             intent.purge_complete = False
-            self._schedule_skip_retry(intent.session_id)
+            self._schedule_skip_retry(session_id)
             return False
-        self._clear_skip_retry(intent.session_id)
+        self._clear_skip_retry(session_id)
         return True
 
     async def _enqueue_pending_skip_notice(self, intent: BacklogSkipIntent) -> bool:
         """Create one receipt-tracked visible notice for a persisted barrier."""
-        if not self._skip_is_current(intent):
-            self._cancel_pending_skip(intent.session_id)
+        session_id = intent.session_id
+        if self._skip_barrier_expired(intent):
             return False
-        if intent.session_id in self._skip_notice_receipts or not self._skip_retry_due(
-            intent.session_id
-        ):
+        if self._pending_skip_current(intent) is not True:
             return False
         callback = self._skip_notice_callback
-        if callback is None:
+        if (
+            callback is None
+            or session_id in self._skip_notice_receipts
+            or not self._skip_retry_due(session_id)
+        ):
             return False
         receipt = new_delivery_receipt(checkpoint=intent.snapshot_offset)
+        self._skip_notice_receipts[session_id] = receipt
         token = activate_delivery_receipt(receipt)
         try:
             await callback(intent)
         except asyncio.CancelledError:
             receipt.fail()
+            if self._skip_notice_receipts.get(session_id) is receipt:
+                self._skip_notice_receipts.pop(session_id, None)
             raise
         except Exception:
             receipt.fail()
-            logger.exception(
-                "Failed to enqueue backlog skip notice for %s", intent.session_id
-            )
-            self._schedule_skip_retry(intent.session_id)
+            if self._skip_notice_receipts.get(session_id) is receipt:
+                self._skip_notice_receipts.pop(session_id, None)
+            logger.exception("Failed to enqueue backlog skip notice for %s", session_id)
+            if self.state.pending_skips.get(session_id) is intent:
+                self._schedule_skip_retry(session_id)
         finally:
             deactivate_delivery_receipt(token)
             receipt.close()
-        if receipt.failed:
+        if (
+            self.state.pending_skips.get(session_id) is not intent
+            or self._skip_notice_receipts.get(session_id) is not receipt
+        ):
+            receipt.fail()
             return False
-        self._clear_skip_retry(intent.session_id)
-        self._skip_notice_receipts[intent.session_id] = receipt
+        current = self._pending_skip_current(intent)
+        if current is not True:
+            return False
+        if receipt.failed:
+            if self._skip_notice_receipts.get(session_id) is receipt:
+                self._skip_notice_receipts.pop(session_id, None)
+            self._schedule_skip_retry(session_id)
+            return False
+        self._clear_skip_retry(session_id)
         return True
 
-    def _expire_aged_skip_barriers(self) -> None:
-        """Cancel aged barriers so an unacknowledged range replays.
+    def _skip_barrier_expired(
+        self, intent: BacklogSkipIntent, *, now: float | None = None
+    ) -> bool:
+        """Return whether an established barrier exceeded its deadline."""
+        return bool(
+            intent.created_at
+            and (time.time() if now is None else now) - intent.created_at
+            > config.skip_barrier_deadline_s
+        )
 
-        A deadline never acknowledges a skip. If the visible notice has not
-        reached Telegram, cancel the persisted barrier and resume from the
-        delivered watermark; this favors replay over permanent source silence.
-        """
+    def _expire_aged_skip_barriers(self) -> None:
+        """Cancel aged, uncommitted barriers so their frozen ranges replay."""
         if not self.state.pending_skips:
             return
         now = time.time()
@@ -756,10 +905,10 @@ class SessionMonitor:
                 # through the mutator so the stamp actually persists.
                 self.state.stamp_skip_clock(session_id, now)
                 continue
-            if now - intent.created_at <= config.skip_barrier_deadline_s:
+            if not self._skip_barrier_expired(intent, now=now):
                 continue
             logger.warning(
-                "Backlog skip barrier expired without an acknowledged notice; "
+                "Backlog skip barrier expired before commit; "
                 "cancelling so the range replays",
                 session_id=session_id,
                 barrier_age_seconds=round(now - intent.created_at, 1),
@@ -770,47 +919,71 @@ class SessionMonitor:
                     tracked.replay_cap_retry_after = max(
                         tracked.replay_cap_retry_after, intent.snapshot_offset
                     )
+                    tracked.replay_cap_retry_device = intent.source_device
+                    tracked.replay_cap_retry_inode = intent.source_inode
+                    tracked.replay_cap_retry_range_start = intent.range_start
+                    tracked.replay_cap_retry_sha256 = intent.source_range_sha256
+                    tracked.replay_cap_retry_verified = False
                     self.state.update_session(tracked)
-            self._cancel_pending_skip(session_id)
+            self._cancel_pending_skip(session_id, expected_intent=intent)
         self.state.save_if_dirty()
 
     async def _advance_skip_barriers(self) -> None:
-        """Resume attempts, commit acknowledged skips, then expire unacknowledged ones.
-
-        Resume runs before expiry so a process that slept past the deadline
-        still gets one notice delivery attempt. A notice already acknowledged
-        at the deadline commits before expiry; unacknowledged barriers replay.
-        """
-        await self._resume_pending_skip_notices()
-        self._commit_pending_skips()
+        """Commit ready notices, expire overdue barriers, then resume others."""
+        await self._commit_pending_skips()
         self._expire_aged_skip_barriers()
+        await self._resume_pending_skip_notices()
 
     async def _resume_pending_skip_notices(self) -> None:
         """Resume persisted skip barriers before reading any skipped bytes."""
         for intent in tuple(self.state.pending_skips.values()):
+            if self._skip_barrier_expired(intent):
+                continue
+            if self.state.pending_skips.get(intent.session_id) is not intent:
+                continue
             if not self._skip_retry_due(intent.session_id):
                 continue
             prepared = await self._prepare_pending_skip(intent)
-            if prepared:
+            if prepared and self.state.pending_skips.get(intent.session_id) is intent:
                 await self._enqueue_pending_skip_notice(intent)
 
-    def _commit_pending_skips(self) -> None:
+    async def _commit_pending_skips(self) -> None:
         """Advance only barriers whose visible notices reached Telegram."""
         for session_id, receipt in tuple(self._skip_notice_receipts.items()):
+            if self._skip_notice_receipts.get(session_id) is not receipt:
+                continue
             if receipt.failed:
                 # A failed notice has no acknowledgement boundary. Remove the
-                # failed receipt so the persisted barrier can retry in-process;
-                # the source remains paused until a notice is delivered.
+                # failed receipt so the persisted barrier can retry in-process.
                 self._skip_notice_receipts.pop(session_id, None)
-                self._schedule_skip_retry(session_id)
+                if session_id in self.state.pending_skips:
+                    self._schedule_skip_retry(session_id)
                 continue
-            if not receipt.commit_ready:
+            if not receipt.commit_ready or not self._skip_retry_due(session_id):
                 continue
             intent = self.state.pending_skips.get(session_id)
-            if intent is None or not self._skip_is_current(intent, verify_content=True):
-                # A topic may rebind after the notice was queued or delivered.
-                # Never advance the old source watermark across that boundary.
-                self._cancel_pending_skip(session_id)
+            if intent is None:
+                receipt.fail()
+                if self._skip_notice_receipts.get(session_id) is receipt:
+                    self._skip_notice_receipts.pop(session_id, None)
+                continue
+            current = await self._verify_skip_content(intent)
+            # Verification yielded to the loop. Neither an old intent nor its
+            # receipt may cancel or complete a replacement barrier for this id.
+            if (
+                self.state.pending_skips.get(session_id) is not intent
+                or self._skip_notice_receipts.get(session_id) is not receipt
+            ):
+                continue
+            if current is None:
+                self._schedule_skip_retry(session_id)
+                continue
+            if current is False:
+                self._cancel_pending_skip(
+                    session_id,
+                    expected_intent=intent,
+                    expected_receipt=receipt,
+                )
                 continue
             if self.state.complete_skip(session_id):
                 # Rebuild provider context through the skipped boundary before
@@ -818,12 +991,15 @@ class SessionMonitor:
                 self._transcript_reader.replay_from_watermark(session_id)
                 self.state.save_if_dirty()
                 self._delivery_receipts.pop(session_id, None)
+                if self._skip_notice_receipts.get(session_id) is receipt:
+                    self._skip_notice_receipts.pop(session_id, None)
+                self._clear_skip_retry(session_id)
             else:
-                # The tracked session was removed or re-keyed. Do not retain a
-                # barrier that can no longer be committed or replay safely.
-                self._cancel_pending_skip(session_id)
-            self._skip_notice_receipts.pop(session_id, None)
-            self._clear_skip_retry(session_id)
+                self._cancel_pending_skip(
+                    session_id,
+                    expected_intent=intent,
+                    expected_receipt=receipt,
+                )
 
     def record_hook_activity(self, window_id: str) -> None:
         """Record hook-based activity for a window (resets idle timers)."""
@@ -831,15 +1007,15 @@ class SessionMonitor:
         if session_id:
             self._idle_tracker.record_activity(session_id)
 
-    def commit_delivered_watermarks(self) -> None:
+    async def commit_delivered_watermarks(self) -> None:
         """Persist receipts acknowledged by the delivery boundary.
 
         Called after a normal monitor cycle and after the bounded shutdown
         drain. It intentionally has no queue implementation knowledge.
         """
-        self._commit_watermark_prefixes()
+        await self._commit_watermark_prefixes()
 
-    def _commit_watermark_prefixes(self) -> None:
+    async def _commit_watermark_prefixes(self) -> None:
         """Commit each session's longest settled receipt run (#205).
 
         Waiting for every receipt of a session to close (the previous
@@ -856,7 +1032,7 @@ class SessionMonitor:
         """
         delivered_offsets: dict[str, int] = {}
         consumed: dict[str, int] = {}
-        self._commit_pending_skips()
+        await self._commit_pending_skips()
         for session_id, receipts in self._delivery_receipts.items():
             if (
                 not receipts
@@ -937,7 +1113,7 @@ class SessionMonitor:
         """
         new_messages: list[NewMessage] = []
         sid_to_wid = {v["session_id"]: wid for wid, v in current_map.items()}
-        replay_cap_bytes = _replay_cap_bytes()
+        replay_cap_bytes = config.replay_cap_bytes
 
         direct_sessions: list[tuple[str, Path]] = []
         fallback_session_ids: set[str] = set()
@@ -1466,7 +1642,7 @@ class SessionMonitor:
                         batch, receipt, consumer_name
                     )
 
-                self.commit_delivered_watermarks()
+                await self.commit_delivered_watermarks()
 
             except _LoopError:
                 logger.exception("Monitor loop error")

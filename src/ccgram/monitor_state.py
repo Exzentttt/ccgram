@@ -37,11 +37,19 @@ class TrackedSession:
     parsed_offset: int = -1  # In-memory parse position (-1 = follow watermark)
     # Avoid retrying an expired automatic replay cap against the same EOF.
     replay_cap_retry_after: int = 0
+    replay_cap_retry_device: int | None = None
+    replay_cap_retry_inode: int | None = None
+    replay_cap_retry_range_start: int = 0
+    replay_cap_retry_sha256: str = ""
+    # Validation is repeated after restart; this flag is only a process-local
+    # optimization once the persisted source-generation digest was checked.
+    replay_cap_retry_verified: bool = field(default=False, repr=False, compare=False)
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize durable progress and cap retry state, excluding parse position."""
         d = asdict(self)
         d.pop("parsed_offset", None)
+        d.pop("replay_cap_retry_verified", None)
         return d
 
     @classmethod
@@ -55,6 +63,26 @@ class TrackedSession:
                 data.get("replay_cap_retry_after", 0)
                 if isinstance(data.get("replay_cap_retry_after", 0), int)
                 else 0
+            ),
+            replay_cap_retry_device=(
+                data.get("replay_cap_retry_device")
+                if isinstance(data.get("replay_cap_retry_device"), int)
+                else None
+            ),
+            replay_cap_retry_inode=(
+                data.get("replay_cap_retry_inode")
+                if isinstance(data.get("replay_cap_retry_inode"), int)
+                else None
+            ),
+            replay_cap_retry_range_start=(
+                data.get("replay_cap_retry_range_start", 0)
+                if isinstance(data.get("replay_cap_retry_range_start", 0), int)
+                else 0
+            ),
+            replay_cap_retry_sha256=(
+                data.get("replay_cap_retry_sha256", "")
+                if isinstance(data.get("replay_cap_retry_sha256", ""), str)
+                else ""
             ),
         )
 

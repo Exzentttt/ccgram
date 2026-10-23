@@ -1,5 +1,6 @@
 import asyncio
 from collections.abc import Iterator
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -304,6 +305,33 @@ async def test_terminal_user_message_is_relayed(bot, mock_deps):
     await handle_new_message(_make_msg(text="hello", role="user"), bot)
 
     mock_deps["eq"].assert_called_once()
+
+
+async def test_backlog_skip_notice_is_conditional_and_explains_replay(bot):
+    intent = SimpleNamespace(
+        snapshot_offset=123,
+        range_start=23,
+        skipped_count=4,
+        user_id=100,
+        window_id="@5",
+        thread_id=42,
+        chat_id=-100,
+    )
+    with patch.object(
+        message_routing,
+        "enqueue_content_message",
+        new_callable=AsyncMock,
+        return_value=True,
+    ) as enqueue:
+        await message_routing.enqueue_backlog_skip_notice(bot, intent)
+
+    text = enqueue.call_args.kwargs["parts"][0]
+    assert text == (
+        "⏭ Skip requested for 4 queued transcript item(s) (bytes 23–123). "
+        "Raw transcript retained. The range is omitted only after this notice "
+        "is acknowledged and the skip is committed. If the skip expires first, "
+        "the range replays."
+    )
 
 
 async def test_telegram_echo_is_suppressed_only_for_its_origin_topic(bot, mock_deps):

@@ -269,12 +269,12 @@ async def test_failed_notice_retries_in_process_before_watermark_advances(
     assert intent.skipped_count == 3
     assert purged == [50]
     assert notice_attempts == ["s1"]
-    monitor.commit_delivered_watermarks()
+    await monitor.commit_delivered_watermarks()
     assert monitor.state.get_session("s1").last_byte_offset == 10  # type: ignore[union-attr]
 
     first_notice = monitor._skip_notice_receipts["s1"]
     first_notice.settle(DeliveryOutcome.FAILED)
-    monitor.commit_delivered_watermarks()
+    await monitor.commit_delivered_watermarks()
     assert monitor.state.get_session("s1").last_byte_offset == 10  # type: ignore[union-attr]
     assert "s1" in monitor.state.pending_skips
     assert "s1" not in monitor._skip_notice_receipts
@@ -287,7 +287,7 @@ async def test_failed_notice_retries_in_process_before_watermark_advances(
     await monitor._resume_pending_skip_notices()
     assert notice_attempts == ["s1", "s1"]
     monitor._skip_notice_receipts["s1"].settle(DeliveryOutcome.DELIVERED)
-    monitor.commit_delivered_watermarks()
+    await monitor.commit_delivered_watermarks()
     assert monitor.state.get_session("s1").last_byte_offset == 50  # type: ignore[union-attr]
     assert "s1" not in monitor.state.pending_skips
     assert transcript.read_bytes() == _complete_jsonl_record(50)
@@ -334,7 +334,7 @@ async def test_notice_enqueue_failure_retries_in_process(
     await monitor._resume_pending_skip_notices()
     assert attempts == 2
     monitor._skip_notice_receipts["s1"].settle(DeliveryOutcome.DELIVERED)
-    monitor.commit_delivered_watermarks()
+    await monitor.commit_delivered_watermarks()
     assert monitor.state.get_session("s1").last_byte_offset == 50  # type: ignore[union-attr]
     assert "s1" not in monitor.state.pending_skips
 
@@ -383,7 +383,7 @@ async def test_failed_purge_resumes_after_restart_before_notice(
     assert restarted.state.pending_skips["s1"].purge_complete is True
     assert restarted.state.pending_skips["s1"].skipped_count == 3
     restarted._skip_notice_receipts["s1"].settle(DeliveryOutcome.DELIVERED)
-    restarted.commit_delivered_watermarks()
+    await restarted.commit_delivered_watermarks()
     assert restarted.state.get_session("s1").last_byte_offset == 50  # type: ignore[union-attr]
     assert "s1" not in restarted.state.pending_skips
 
@@ -409,21 +409,25 @@ async def test_rebound_after_notice_delivery_does_not_commit_skip(
     def validate(_intent) -> bool:
         return binding_current
 
+    notice_receipt = None
+
     async def notice(_intent) -> None:
-        nonlocal binding_current
-        receipt = get_active_delivery_receipt()
-        assert receipt is not None
-        receipt.track()
-        binding_current = False
+        nonlocal notice_receipt
+        notice_receipt = get_active_delivery_receipt()
+        assert notice_receipt is not None
+        notice_receipt.track()
 
     monitor.set_skip_callbacks(purge=purge, notice=notice, validate=validate)
     intent = await monitor.request_backlog_skip(1, "@0", 4, 99)
     assert intent is not None
-    monitor._skip_notice_receipts["s1"].settle(DeliveryOutcome.DELIVERED)
-    monitor.commit_delivered_watermarks()
+    binding_current = False
+    assert notice_receipt is not None
+    notice_receipt.settle(DeliveryOutcome.DELIVERED)
+    await monitor.commit_delivered_watermarks()
 
     assert monitor.state.get_session("s1").last_byte_offset == 10  # type: ignore[union-attr]
     assert "s1" not in monitor.state.pending_skips
+    assert notice_receipt.failed
 
 
 async def test_purge_retry_preserves_retired_count_after_state_save_failure(

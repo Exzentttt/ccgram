@@ -10,9 +10,10 @@ import asyncio
 import contextlib
 import random
 import time
+from collections import deque
 from dataclasses import dataclass
 from io import BytesIO
-from typing import assert_never
+from typing import assert_never, cast
 
 import structlog
 from telegram import MessageEntity
@@ -94,6 +95,24 @@ _QUEUE_RETRY_BACKOFF_MAX_SECONDS = 60.0
 _QUEUE_RETRY_JITTER_MAX_SECONDS = 1.0
 _QUEUE_RETRY_BUDGET_SECONDS = 300.0
 _QUEUE_RATE_LIMIT_LOG_COOLDOWN_SECONDS = 30.0
+
+
+class _BacklogNoticeQueue(asyncio.Queue[MessageTask]):
+    """Prioritize skip notices over queued work while preserving both FIFOs."""
+
+    def _put(self, item: MessageTask) -> None:
+        queue = cast(deque[MessageTask], getattr(self, "_queue"))
+        if isinstance(item, ContentTask) and item.is_backlog_notice:
+            index = 0
+            while index < len(queue):
+                queued = queue[index]
+                if not isinstance(queued, ContentTask) or not queued.is_backlog_notice:
+                    break
+                index += 1
+            queue.insert(index, item)
+            return
+        queue.append(item)
+
 
 # Per-user message queues and worker tasks
 _message_queues: dict[int, asyncio.Queue[MessageTask]] = {}
@@ -329,7 +348,7 @@ def get_or_create_queue(
     Also detects dead workers and respawns them so messages are not lost.
     """
     if user_id not in _message_queues:
-        _message_queues[user_id] = asyncio.Queue()
+        _message_queues[user_id] = _BacklogNoticeQueue()
         _queue_locks[user_id] = asyncio.Lock()
 
     # Respawn dead workers (can happen if an uncaught exception killed the task)
@@ -983,11 +1002,19 @@ async def _try_edit_tool_result(
     return success
 
 
-async def _process_content_task(
-    client: TelegramClient, user_id: int, task: ContentTask
-) -> DeliveryOutcome:
-    """Process a content message task and report whether it reached Telegram."""
-    if task.is_backlog_notice and (
+def _backlog_notice_outcome(user_id: int, task: ContentTask) -> DeliveryOutcome | None:
+    """Return a terminal outcome for an invalidated or stale skip notice."""
+    if not task.is_backlog_notice:
+        return None
+    if any(receipt.failed for receipt in task.delivery_receipts):
+        logger.debug(
+            "Dropping invalidated backlog skip notice",
+            user_id=user_id,
+            window_id=task.window_id,
+            thread_id=task.thread_id,
+        )
+        return DeliveryOutcome.INTENTIONALLY_DROPPED
+    if (
         task.chat_id is None
         or thread_router.resolve_window_for_thread(
             user_id, task.thread_id, task.chat_id
@@ -1001,6 +1028,15 @@ async def _process_content_task(
             thread_id=task.thread_id,
         )
         return DeliveryOutcome.FAILED
+    return None
+
+
+async def _process_content_task(
+    client: TelegramClient, user_id: int, task: ContentTask
+) -> DeliveryOutcome:
+    """Process a content message task and report whether it reached Telegram."""
+    if outcome := _backlog_notice_outcome(user_id, task):
+        return outcome
 
     tkey = thread_key(task.thread_id)
     chat_id = task.chat_id or thread_router.resolve_chat_id(user_id, task.thread_id)
