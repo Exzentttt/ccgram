@@ -301,8 +301,9 @@ class SessionMonitor:
         if notice_receipt is not None:
             notice_receipt.fail()
             self._skip_notice_receipts.pop(session_id, None)
-        for receipt in self._delivery_receipts.pop(session_id, ()):
-            receipt.revoke()
+        # Retirement has no replay guarantee. Keep already-produced work live;
+        # only a durably established skip explicitly revokes its source output.
+        self._delivery_receipts.pop(session_id, None)
         self._clear_skip_retry(session_id)
 
     def _cancel_pending_skip(

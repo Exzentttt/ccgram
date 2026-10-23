@@ -450,3 +450,35 @@ class TestTransientRetry:
 
         assert ok is False
         assert bot.send_message.call_count == 2
+
+
+async def test_concurrent_interactive_sends_share_the_inflight_cooldown() -> None:
+    bot = _sending_bot()
+    waiting = asyncio.Event()
+    release = asyncio.Event()
+    rate_entries: list[int] = []
+
+    async def wait_for_slot(chat_id):
+        rate_entries.append(chat_id)
+        waiting.set()
+        await release.wait()
+
+    with (
+        _interactive_env(bot),
+        patch(f"{_UI}.rate_limit_send", side_effect=wait_for_slot),
+    ):
+        first = asyncio.create_task(handle_interactive_ui(bot, 91347, "@0", 42))
+        second = None
+        try:
+            await asyncio.wait_for(waiting.wait(), timeout=2)
+            second = asyncio.create_task(handle_interactive_ui(bot, 91347, "@0", 42))
+            turn = asyncio.Event()
+            asyncio.get_running_loop().call_soon(turn.set)
+            await turn.wait()
+        finally:
+            release.set()
+        assert second is not None
+        results = await asyncio.gather(first, second)
+    assert rate_entries == [-999]
+    assert sorted(results) == [False, True]
+    bot.send_message.assert_awaited_once()

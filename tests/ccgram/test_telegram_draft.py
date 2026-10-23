@@ -1,4 +1,4 @@
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import asyncio
 from datetime import timedelta
@@ -348,3 +348,38 @@ class TestModuleStateHelpers:
         reset_draft_state()
         assert is_draft_unavailable() is False
         assert telegram_draft.draft_unavailable_reason() == ""
+
+
+async def test_coalesced_flush_uses_latest_snapshot_ownership() -> None:
+    from ccgram.delivery_contract import DeliveryReceipt
+
+    bot = _make_bot()
+    stream = DraftStream(bot, chat_id=100)
+    await stream.start("initial")
+    old, current = DeliveryReceipt(), DeliveryReceipt()
+    timer_started = asyncio.Event()
+    release_timer = asyncio.Event()
+
+    async def paused_timer(_delay):
+        timer_started.set()
+        await release_timer.wait()
+
+    try:
+        with patch.object(telegram_draft.asyncio, "sleep", side_effect=paused_timer):
+            stream._retry_not_before = telegram_draft.time.monotonic() + 10
+            await stream.replace("queued old", admit=lambda: not old.revoked)
+            pending = stream._pending_flush
+            assert pending is not None
+            await asyncio.wait_for(timer_started.wait(), timeout=2)
+            old.revoke()
+            await stream.replace("current", admit=lambda: not current.revoked)
+            stream._retry_not_before = 0
+            release_timer.set()
+            await pending
+        assert [call.kwargs["text"] for call in _draft_calls(bot)] == [
+            "initial",
+            "current",
+        ]
+    finally:
+        release_timer.set()
+        await stream.abort()

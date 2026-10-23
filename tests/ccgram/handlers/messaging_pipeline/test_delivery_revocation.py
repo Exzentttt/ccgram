@@ -319,3 +319,52 @@ async def test_tool_batch_rechecks_cached_ownership_after_rate_limit(bot, monkey
     assert delivered is False
     assert current.revoked is False
     assert bot.call_count("send_message") == 0
+
+
+@pytest.mark.parametrize("retry", ["none", "once", "exhausted"])
+async def test_merged_tasks_settle_each_shared_receipt_track(bot, retry):
+    user_id = 82453
+    receipt = DeliveryReceipt(checkpoint=90)
+    receipt.track()
+    receipt.track()
+    receipt.close()
+    queue: asyncio.Queue = asyncio.Queue()
+    mq._message_queues[user_id] = queue
+    mq._queue_locks[user_id] = asyncio.Lock()
+    for text in ("first", "second"):
+        queue.put_nowait(
+            ContentTask(
+                window_id="@0",
+                parts=(text,),
+                thread_id=42,
+                chat_id=-1001,
+                source_session_id="s1",
+                delivery_receipts=(receipt,),
+            )
+        )
+    outcomes = (
+        [RetryAfter(0), SimpleNamespace(message_id=1)]
+        if retry != "none"
+        else [SimpleNamespace(message_id=1)]
+    )
+    worker = asyncio.create_task(mq._message_queue_worker(bot, user_id))
+    try:
+        with (
+            patch.object(mq, "is_window_live", return_value=True),
+            patch.object(mq, "rate_limit_send_formatted_message", side_effect=outcomes),
+            patch.object(mq.asyncio, "sleep", new_callable=AsyncMock),
+            patch.object(mq.random, "uniform", return_value=0),
+            patch.object(
+                mq, "_QUEUE_RETRY_BUDGET_SECONDS", 0 if retry == "exhausted" else 300
+            ),
+        ):
+            await asyncio.wait_for(queue.join(), timeout=2)
+    finally:
+        worker.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await worker
+        mq._message_queues.pop(user_id, None)
+        mq._queue_locks.pop(user_id, None)
+    assert receipt._pending == 0
+    assert receipt.commit_ready is (retry != "exhausted")
+    assert receipt.failed is (retry == "exhausted")

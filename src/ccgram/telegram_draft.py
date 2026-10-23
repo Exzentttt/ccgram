@@ -138,6 +138,7 @@ class DraftStream:
         self._reply_markup = reply_markup
         self._force_legacy = force_legacy
         self._admit = admit
+        self._snapshot_admit = admit
         self._draft_id = secrets.randbelow(2_147_483_646) + 1
         self._message_id: int | None = None
         self._buffer = ""
@@ -169,6 +170,11 @@ class DraftStream:
         """Return the text that fits in one Telegram message."""
         return _truncate(self._buffer)
 
+    def _set_snapshot(self, text: str, admit: Callable[[], bool] | None) -> None:
+        """Keep coalesced content and its current ownership together."""
+        self._buffer = text
+        self._snapshot_admit = self._admit if admit is None else admit
+
     def _is_admitted(self, admit: Callable[[], bool] | None = None) -> bool:
         predicate = self._admit if admit is None else admit
         return predicate is None or predicate()
@@ -181,7 +187,7 @@ class DraftStream:
             raise RuntimeError("DraftStream.start called twice")
         if not initial_text or not self._is_admitted(admit):
             return None
-        self._buffer = initial_text
+        self._set_snapshot(initial_text, admit)
 
         try:
             if (
@@ -204,7 +210,7 @@ class DraftStream:
         self._ensure_open()
         if not self._is_admitted(admit):
             return
-        self._buffer += delta
+        self._set_snapshot(self._buffer + delta, admit)
         await self._push_update(admit=admit)
 
     async def replace(
@@ -218,7 +224,7 @@ class DraftStream:
         self._ensure_open()
         if not self._is_admitted(admit):
             return
-        self._buffer = text
+        self._set_snapshot(text, admit)
         if reply_markup is not _KEEP_MARKUP:
             self._reply_markup = reply_markup
         await self._push_update(admit=admit)
@@ -239,7 +245,7 @@ class DraftStream:
         self._ensure_open()
         if not self._is_admitted(admit):
             return False
-        self._buffer = text
+        self._set_snapshot(text, admit)
         if reply_markup is not _KEEP_MARKUP:
             self._reply_markup = reply_markup
         await self._cancel_pending_flush()
@@ -287,7 +293,7 @@ class DraftStream:
             self._closed = True
             return
         if final_text is not None:
-            self._buffer = final_text
+            self._set_snapshot(final_text, admit)
         if reply_markup is not _KEEP_MARKUP:
             self._reply_markup = reply_markup
 
@@ -409,48 +415,50 @@ class DraftStream:
                 self._retry_not_before - now,
             )
             if remaining > 0:
-                self._schedule_pending_flush(remaining, admit=admit)
+                self._schedule_pending_flush(remaining)
                 return
             retry_delay = await self._send_stream_snapshot(admit=admit)
-        if retry_delay is not None and self._is_admitted(admit):
-            self._schedule_pending_flush(retry_delay, admit=admit)
+        if retry_delay is not None and self._is_admitted(self._snapshot_admit):
+            self._schedule_pending_flush(retry_delay)
 
-    def _schedule_pending_flush(
-        self, delay: float, *, admit: Callable[[], bool] | None = None
-    ) -> None:
-        if not self._is_admitted(admit):
+    def _schedule_pending_flush(self, delay: float) -> None:
+        if not self._is_admitted(self._snapshot_admit):
             return
         if self._pending_flush is not None and not self._pending_flush.done():
             return
         self._pending_flush = asyncio.create_task(
-            self._flush_pending_after(delay, admit=admit),
+            self._flush_pending_after(delay),
             name=f"telegram-draft-flush:{self._chat_id}:{self._draft_id}",
         )
 
-    async def _flush_pending_after(
-        self, delay: float, *, admit: Callable[[], bool] | None = None
-    ) -> None:
+    async def _flush_pending_after(self, delay: float) -> None:
         retry_delay: float | None = None
         try:
             await asyncio.sleep(delay)
-            if not self._is_admitted(admit):
+            if not self._is_admitted(self._snapshot_admit):
                 return
             async with self._update_lock:
                 if (
                     self._closed
                     or self._mode != DRAFT_STREAMING
-                    or not self._is_admitted(admit)
+                    or not self._is_admitted(self._snapshot_admit)
                 ):
                     return
-                retry_delay = await self._send_stream_snapshot(admit=admit)
+                retry_delay = await self._send_stream_snapshot(
+                    admit=self._snapshot_admit
+                )
         except asyncio.CancelledError:
             raise
         except TelegramError as exc:
             logger.warning("DraftStream trailing update failed: %s", exc)
         finally:
             self._pending_flush = None
-        if retry_delay is not None and not self._closed and self._is_admitted(admit):
-            self._schedule_pending_flush(retry_delay, admit=admit)
+        if (
+            retry_delay is not None
+            and not self._closed
+            and self._is_admitted(self._snapshot_admit)
+        ):
+            self._schedule_pending_flush(retry_delay)
 
     async def _cancel_pending_flush(self) -> None:
         task = self._pending_flush

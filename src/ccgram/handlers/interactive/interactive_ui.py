@@ -694,6 +694,17 @@ async def pane_has_interactive_prompt(
     return status is not None and status.is_interactive
 
 
+def _admit_reserved_send(
+    ikey: InteractiveKey, reserved_at: float, admit: Callable[[], bool] | None
+) -> bool:
+    """Release only this attempt's cooldown when its ownership was withdrawn."""
+    if admit is None or admit():
+        return True
+    if _send_cooldowns.get(ikey) == reserved_at:
+        _send_cooldowns.pop(ikey, None)
+    return False
+
+
 async def handle_interactive_ui(
     client: TelegramClient,
     user_id: int,
@@ -778,11 +789,12 @@ async def handle_interactive_ui(
     logger.info(
         "Sending interactive UI to user %d for window_id %s", user_id, window_id
     )
+    # Reserve the cooldown before yielding so competing producers see it.
+    _send_cooldowns[ikey] = now
     # Send as plain text — terminal content should not be formatted.
     await rate_limit_send(resolved_chat_id)
-    if admit is not None and not admit():
+    if not _admit_reserved_send(ikey, now, admit):
         return False
-    _send_cooldowns[ikey] = now
     sent = await _send_interactive_with_retry(
         client,
         chat_id=resolved_chat_id,

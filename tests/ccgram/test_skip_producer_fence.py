@@ -313,22 +313,6 @@ async def test_failed_skip_persistence_does_not_fence_valid_work(
         assert len(batches[0].records) == 2
 
 
-async def test_source_retirement_revokes_already_registered_deliveries(
-    source_case,
-) -> None:
-    case = source_case
-    await case.monitor.check_for_updates(case.current_map)
-    pending = case.monitor._register_delivery_receipts(
-        case.monitor._transcript_reader.drain_batches()
-    )
-    assert pending
-    case.monitor._transcript_reader.clear_session("s1")
-    assert all(receipt.revoked for _, _, receipt in pending)
-    assert all(not receipt.failed for _, _, receipt in pending)
-    await _dispatch_pending(case.monitor, pending)
-    assert case.projected == []
-
-
 async def test_automatic_cap_defers_when_its_generation_probe_is_revoked(
     source_case, monkeypatch
 ) -> None:
@@ -365,3 +349,21 @@ async def test_automatic_cap_defers_when_its_generation_probe_is_revoked(
 
     assert not case.monitor.state.pending_skips
     assert case.tracked.last_byte_offset == 0
+
+
+async def test_transcript_replacement_keeps_registered_undelivered_tail(
+    source_case,
+) -> None:
+    case = source_case
+    await case.monitor.check_for_updates(case.current_map)
+    pending = case.monitor._register_delivery_receipts(
+        case.monitor._transcript_reader.drain_batches()
+    )
+    assert pending
+    replacement = case.transcript.with_name("replacement.jsonl")
+    replacement.write_bytes(_assistant_line("replacement history"))
+    replacement.replace(case.transcript)
+    await case.monitor.check_for_updates(case.current_map)
+    await _dispatch_pending(case.monitor, pending)
+    assert case.texts("s1") == ["old one", "old two"]
+    assert all(not receipt.revoked for _, _, receipt in pending)
