@@ -104,23 +104,40 @@ INTERACTIVE_INSTRUCTION_LINE = (
 _TELEGRAM_MAX_TEXT = 4096
 _MAX_DIRECT_CHOICES = 8
 _MIN_NUMBERED_DIRECT_CHOICES = 2
-_CURSOR_PREFIX = r"(?:[←→❯>]\s*)?"
+_MIN_MULTI_SELECT_CHECKBOX_OPTIONS = 2
+_MAX_CODEX_NORMALIZED_OPTION_INDENT = 2
+_CURSOR_PREFIX = r"(?:[←→❯›>]\s*)?"
 # A cursor marker on an option line (the selected entry of a live menu).
-_CURSOR_OPTION_RE = re.compile(r"^\s*[←→❯>]\s*\d+\.")
-# Selection footers carry a menu verb; pager or editor hints ("Enter to
-# continue", "ctrl-g to edit") must not anchor numbered prose as a menu.
-# The verb set mirrors the footer vocabulary in providers/codex_format.py
-# and providers/gemini.py, minus the pager verb "continue".
+_CURSOR_OPTION_RE = re.compile(r"^\s*[←→❯›>]\s*\d+\.")
+# These line-start action hints mirror providers/codex_format.py and the
+# shared selection-footer table in terminal_parser.py. Pi's "Enter select"
+# wording is embedded mid-line in its status bar; its selected option cursor
+# is the anchor, so generic mid-line footer matches would risk adopting prose.
 _DIRECT_CHOICE_ACTION_RE = re.compile(
     r"(?i)^\s*(?:(?:press )?enter to (?:select|confirm|submit)"
-    r"|enter select|esc to (?:cancel|exit))"
+    r"|esc to (?:cancel|exit))"
 )
 _NUMBERED_OPTION_RE = re.compile(r"^\s*" + _CURSOR_PREFIX + r"(\d+)\.\s+(.+?)\s*$")
-# A checkbox on an option line, in any position, marks a real multi-select;
-# a bare checkbox elsewhere is decoration (Claude Code renders the question
-# header as "☐ <header>" even for single-select).
+# Numbered checkbox markers are limited to the option slot (before/after the
+# number) or an explicit trailing checkbox. The vocabulary comes from the
+# request guard and terminal-parser checkbox patterns, not a Claude glyph guess.
+_CHECKBOX_MARKER = r"(?:[☐☑☒✔]|\[[ xX]\])"
 _OPTION_CHECKBOX_RE = re.compile(
-    r"(?m)^\s*" + _CURSOR_PREFIX + r"(?:[☐☑]\s*\d+\.|\d+\..*[☐☑])"
+    r"(?m)^\s*"
+    + _CURSOR_PREFIX
+    + r"(?:"
+    + _CHECKBOX_MARKER
+    + r"\s*\d+\."
+    + r"|\d+\.\s*"
+    + _CHECKBOX_MARKER
+    + r"(?=\s|$)"
+    + r"|\d+\..*\s(?:[☐☑☒]|\[[ xX]\])\s*$"
+    + r")"
+)
+# Claude's single-select header can contain one decorative checkbox. Two or
+# more checkbox-prefixed rows are explicit unnumbered checkbox options.
+_UNNUMBERED_CHECKBOX_OPTION_RE = re.compile(
+    r"(?m)^\s*" + _CURSOR_PREFIX + _CHECKBOX_MARKER + r"\s+\S"
 )
 _MULTI_SELECT_RE = re.compile(
     r"(?i)\b(?:select|choose|pick)\b[^\n]*(?:all|multiple|more than one)\b"
@@ -279,12 +296,13 @@ def _numbered_menu_blocks(
 ) -> list[tuple[int, int, tuple[tuple[str, str], ...]]]:
     """Find contiguous sequential numbered menu blocks and their line ranges.
 
-    Lines indented past the option number are consumed as its description,
-    including numbered prose inside a description: Claude Code and Pi both
-    indent option descriptions this way. Unrelated numbered prose elsewhere
-    in the capture is kept out of the buttons by the anchors in
-    ``parse_direct_choices`` (a cursor-prefixed option or a selection
-    footer); the ranking there only disambiguates between candidate blocks.
+    Lines indented past the option number are normally consumed as its
+    description, including numbered prose inside descriptions: Claude Code
+    and Pi both indent option descriptions this way. The exception is a
+    sequential option indented by at most two spaces after a column-zero first
+    option, matching Codex's inline-option normalization. Unrelated numbered
+    prose elsewhere is kept out by the anchors in ``parse_direct_choices``;
+    ranking only disambiguates between candidate blocks.
     """
     blocks: list[tuple[int, int, tuple[tuple[str, str], ...]]] = []
     index = 0
@@ -298,12 +316,20 @@ def _numbered_menu_blocks(
         choices: list[tuple[str, str]] = []
         expected = 1
         while index < len(lines):
+            option = _NUMBERED_OPTION_RE.fullmatch(lines[index])
             if lines[index].strip() and lines[index].startswith(
                 " " * (first.start(1) + 1)
             ):
-                index += 1
-                continue
-            option = _NUMBERED_OPTION_RE.fullmatch(lines[index])
+                indent = len(lines[index]) - len(lines[index].lstrip(" "))
+                is_shallow_sequential_option = (
+                    first.start(1) == 0
+                    and option is not None
+                    and option.group(1) == str(expected)
+                    and indent <= _MAX_CODEX_NORMALIZED_OPTION_INDENT
+                )
+                if not is_shallow_sequential_option:
+                    index += 1
+                    continue
             if option is None:
                 break
             number, label = option.groups()
@@ -329,7 +355,12 @@ def parse_direct_choices(content: str) -> tuple[tuple[str, str], ...]:
     prevents unrelated numbered prose elsewhere in a terminal capture from
     becoming one-tap input. Explicit multi-select prompts never get buttons.
     """
-    if _OPTION_CHECKBOX_RE.search(content) or _MULTI_SELECT_RE.search(content):
+    if (
+        _OPTION_CHECKBOX_RE.search(content)
+        or len(_UNNUMBERED_CHECKBOX_OPTION_RE.findall(content))
+        >= _MIN_MULTI_SELECT_CHECKBOX_OPTIONS
+        or _MULTI_SELECT_RE.search(content)
+    ):
         return ()
 
     lines = content.splitlines()

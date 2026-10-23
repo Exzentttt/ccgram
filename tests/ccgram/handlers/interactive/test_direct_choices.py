@@ -23,6 +23,8 @@ from ccgram.handlers.interactive.interactive_ui import (
     is_current_interactive_prompt,
     parse_direct_choices,
 )
+from ccgram.providers.claude import ClaudeProvider
+from ccgram.providers.codex import CodexProvider
 
 
 def _button_data(keyboard) -> list[str]:
@@ -39,7 +41,7 @@ class TestParseDirectChoices:
         # Current Claude Code renders the AskUserQuestion header as
         # "☐ <header>" even for single-select: the checkbox is decorative
         # and must not trip the multi-select guard.
-        choices = parse_direct_choices(
+        capture = (
             " ☐ Next step\n"
             "│ What would you like to do next?\n"
             "❯ 1. Just testing the flow\n"
@@ -51,6 +53,9 @@ class TestParseDirectChoices:
             "  4. Type something.\n"
             "Enter to select · ↑/↓ to navigate · Esc to cancel"
         )
+        status = ClaudeProvider().parse_terminal_status(capture)
+        assert status is not None and status.is_interactive
+        choices = parse_direct_choices(status.raw_text)
         assert choices == (
             ("1", "1. Just testing the flow"),
             ("2", "2. Build a ccgram repro"),
@@ -82,16 +87,59 @@ class TestParseDirectChoices:
             == ()
         )
 
-    def test_codex_confirm_footer_anchors_cursorless_menu(self) -> None:
-        # Codex approval menus have no cursor in the pane (cursors are
-        # stripped by normalization); the confirm/esc footer is their only
-        # anchor, and those verbs are menu verbs, not pager verbs.
+    def test_confirm_footer_anchors_cursorless_menu(self) -> None:
+        # This cursorless input exercises the confirm-footer path; it does not
+        # model Codex cursor rendering or normalization.
         assert parse_direct_choices(
             "1. Allow once\n"
             "2. Allow for this session\n"
             "3. Deny\n"
             "Press enter to confirm or esc to cancel"
         ) == (
+            ("1", "1. Allow once"),
+            ("2", "2. Allow for this session"),
+            ("3", "3. Deny"),
+        )
+
+    def test_codex_inline_cursor_options_survive_provider_normalization(self) -> None:
+        # This is the Codex edit-approval capture also used by
+        # test_jsonl_providers.py; normalization must keep its real cursor.
+        pane = (
+            "Do you want to make this edit to src/ccgram/bot.py?\n"
+            "947    936 -    await register_commands(application.bot, provider=get_provider())"
+            "    948 +    await register_commands(application.bot, providers=_menu_providers())\n"
+            "953          try:\n"
+            "942 -            await register_commands(context.bot, provider=get_provider())"
+            "    954 +    await register_commands(context.bot, providers=_menu_providers())\n"
+            "› 1. Yes, proceed (y)  2. Yes, and don't ask again for these files (a)"
+            "  3. No, and tell Codex what to do differently (esc)\n"
+            "Press enter to confirm or esc to cancel\n"
+        )
+        status = CodexProvider().parse_terminal_status(pane)
+        assert status is not None and status.is_interactive
+        assert "› 1. Yes, proceed (y)" in status.raw_text
+        assert parse_direct_choices(status.raw_text) == (
+            ("1", "1. Yes, proceed (y)"),
+            ("2", "2. Yes, and don't ask again for these files (a)"),
+            ("3", "3. No, and tell Codex what to do differently (esc)"),
+        )
+
+    def test_codex_normalized_indented_options_are_not_descriptions(self) -> None:
+        # The provider normalizes inline options to an unindented first item
+        # followed by two-space-indented items; that spacing is not prose.
+        pane = (
+            "› Choose an action\n"
+            "1. Allow once  2. Allow for this session  3. Deny\n"
+            "Press enter to confirm\n"
+        )
+        status = CodexProvider().parse_terminal_status(pane)
+        assert status is not None and status.is_interactive
+        assert status.raw_text.splitlines()[1:4] == [
+            "1. Allow once",
+            "  2. Allow for this session",
+            "  3. Deny",
+        ]
+        assert parse_direct_choices(status.raw_text) == (
             ("1", "1. Allow once"),
             ("2", "2. Allow for this session"),
             ("3", "3. Deny"),
@@ -123,6 +171,18 @@ class TestParseDirectChoices:
             == ()
         )
 
+    def test_pi_midline_footer_does_not_anchor_numbered_prose(self) -> None:
+        # Pi's actual Enter-select footer is mid-line; its provider also
+        # requires a selected-option cursor, which is the real menu anchor.
+        assert (
+            parse_direct_choices(
+                "1. Review the parser\n"
+                "2. Add regression tests\n"
+                "↑↓ navigate • Enter select • Esc cancel • number quick-select"
+            )
+            == ()
+        )
+
     def test_trailing_checkbox_options_reject_multi_select(self) -> None:
         # A multi-select can render the checkbox after the number; those
         # option lines still match the numbered-option regex, so only the
@@ -133,6 +193,46 @@ class TestParseDirectChoices:
             )
             == ()
         )
+
+    @pytest.mark.parametrize(
+        "content",
+        [
+            pytest.param(
+                "Pick several:\n❯ 1. [ ] Alpha\n  2. [x] Beta\nEnter to select",
+                id="request-checkbox-markers",
+            ),
+            pytest.param(
+                "Pick several:\n❯ 1. ✔ Alpha\n  2. ☒ Beta\nEnter to select",
+                id="terminal-checkbox-markers",
+            ),
+        ],
+    )
+    def test_known_checkbox_option_markers_reject_direct_choices(
+        self, content: str
+    ) -> None:
+        # These token positions use markers already recognized by the request
+        # guard or terminal parser; this does not assert a Claude rendering.
+        assert parse_direct_choices(content) == ()
+
+    def test_unnumbered_checkbox_options_reject_numbered_prose(self) -> None:
+        # Claude's provider fixture uses checkbox-prefixed option rows. Keep
+        # nearby numbered prose from becoming buttons for that prompt.
+        assert (
+            parse_direct_choices(
+                "Which targets?\n"
+                "1. Review staging\n"
+                "2. Review production\n"
+                "☐ First option\n"
+                "☐ Second option\n"
+                "Enter to select"
+            )
+            == ()
+        )
+
+    def test_checkmark_in_header_does_not_mark_numbered_options(self) -> None:
+        assert parse_direct_choices(
+            "✔ Recommended\n❯ 1. Alpha\n  2. Beta\nEnter to select"
+        ) == (("1", "1. Alpha"), ("2", "2. Beta"))
 
     def test_parses_bounded_numbered_single_select_options(self) -> None:
         choices = parse_direct_choices(
