@@ -403,6 +403,25 @@ async def test_runtime_refresh_and_telegram_share_optional_negative_probe(
     assert mux.agent_status.await_count == 3
 
 
+@pytest.mark.parametrize("cached_positive", [False, True])
+async def test_bulk_event_stream_status_stays_live_without_target_pushes(
+    mux, clean_agent_status_cache, cached_positive
+):
+    mux.capabilities.native_agent_status = True
+    mux.capabilities.supports_event_stream = True
+    mux.agent_status.side_effect = [AgentStatus("working"), AgentStatus("idle")]
+    if cached_positive:
+        agent_status_cache.set_status("@1", AgentStatus("done"))
+    backend = MultiplexerSessionBackend(mux, "/tmp")
+
+    first = await backend.targets()
+    second = await backend.targets()
+
+    assert first[0].status.state == "working"
+    assert second[0].status.state == "idle"
+    assert mux.agent_status.await_count == 2
+
+
 async def test_active_inspect_bypasses_bulk_negative_status_cache(
     mux, clean_agent_status_cache
 ):

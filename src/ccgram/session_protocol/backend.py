@@ -230,7 +230,9 @@ class MultiplexerSessionBackend:
                 native = await agent_status_cache.get_status_or_probe(
                     window.window_id,
                     lambda: self.mux.agent_status(window.window_id),
-                    cache_positive=self.mux.capabilities.supports_event_stream,
+                    # Push coverage is Telegram-bound, not guaranteed for every
+                    # target returned by the shared core.
+                    cache_positive=False,
                 )
             else:
                 native = await self.mux.agent_status(window.window_id)

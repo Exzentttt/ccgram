@@ -104,10 +104,11 @@ writers. For work and personal groups, use the
 
 Native agent status is optional enrichment. Telegram status polling and the
 shared core use the same cache during bulk refresh. The core refreshes targets
-once per second. Event-stream backends use pushed status and probe on a cold
-miss. Backends without a push stream cache an empty result for five seconds.
-They do not cache positive results. This keeps positive transitions visible on
-the next probe.
+once per second, stores its empty probe results for five seconds, and keeps
+positive probes live. A backend's event-stream capability does not guarantee
+pushes for every core target: Herdr watches Telegram-bound targets only.
+Telegram polling uses pushed status when available; backends without a push
+stream cache empty results for five seconds and leave positive results live.
 
 The Herdr and Agterm backends return `None` for expected transport or response
 errors. On a backend without a push stream, this value uses the five-second
