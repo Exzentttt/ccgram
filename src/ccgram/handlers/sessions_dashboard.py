@@ -34,6 +34,7 @@ from ..multiplexer.reconciliation import (
     window_presence,
 )
 from ..window_query import view_window
+from ..session_protocol.telegram import TelegramSessionAdapter, adapter_for
 from .callback_data import (
     CB_SESSIONS_KILL,
     CB_SESSIONS_KILL_CONFIRM,
@@ -182,7 +183,11 @@ async def handle_sessions_kill(
 
 
 async def handle_sessions_kill_confirm(
-    query: CallbackQuery, user_id: int, window_id: str, client: TelegramClient
+    query: CallbackQuery,
+    user_id: int,
+    window_id: str,
+    client: TelegramClient,
+    adapter: TelegramSessionAdapter,
 ) -> None:
     """Second tap — kill the tmux window, unbind all users, refresh dashboard."""
     display = thread_router.get_display_name(window_id)
@@ -201,7 +206,7 @@ async def handle_sessions_kill_confirm(
         )
         return
 
-    if presence and not await tmux_manager.kill_window(window_id):
+    if presence and not (await adapter.close(window_id))[0]:
         # The window was there a moment ago and the kill did not succeed, so
         # it may still be running. Clearing the bindings now would strand it.
         await safe_edit(
@@ -281,7 +286,11 @@ async def _dispatch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await query.answer("Not your session", show_alert=True)
             return
         await handle_sessions_kill_confirm(
-            query, user.id, window_id, PTBTelegramClient(context.bot)
+            query,
+            user.id,
+            window_id,
+            PTBTelegramClient(context.bot),
+            adapter_for(context.bot_data),
         )
         await query.answer("Killed")
     elif data.startswith(CB_SESSIONS_KILL):

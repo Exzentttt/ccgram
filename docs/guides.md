@@ -474,44 +474,31 @@ ccgram --unbound-window-ttl 0
 
 ## Multi-Instance Setup
 
-Run multiple ccgram instances on the same machine, each owning a different Telegram group. All instances can share a single bot token. Because Telegram rate limits are token-wide, divide the expected aggregate traffic across instances; these processes do not share a rate-limit coordinator.
+Run one ccgram process per multiplexer backend for each OS user. The shared session
+core acquires a backend-wide process lock even when the mobile API is disabled.
+Separate `CCGRAM_DIR` or `TMUX_SESSION_NAME` values do not permit a second process
+with that backend. Separate tmux sessions can share linked windows, so a lock for
+each session would not prevent two cores from controlling the same target.
 
-### Example: work + personal instances
+### Work and personal groups in one process
 
-Instance 1 (`~/.ccgram-work/.env`):
-
-```ini
-TELEGRAM_BOT_TOKEN=same_token_for_both
-ALLOWED_USERS=123456789
-CCGRAM_GROUP_ID=-1001111111111
-CCGRAM_INSTANCE_NAME=work
-CCGRAM_DIR=~/.ccgram-work
-TMUX_SESSION_NAME=ccgram-work
-```
-
-Instance 2 (`~/.ccgram-personal/.env`):
+Leave `CCGRAM_GROUP_ID` unset to handle multiple Telegram groups with one core:
 
 ```ini
-TELEGRAM_BOT_TOKEN=same_token_for_both
+TELEGRAM_BOT_TOKEN=your_bot_token
 ALLOWED_USERS=123456789
-CCGRAM_GROUP_ID=-1002222222222
-CCGRAM_INSTANCE_NAME=personal
-CCGRAM_DIR=~/.ccgram-personal
-TMUX_SESSION_NAME=ccgram-personal
+CCGRAM_INSTANCE_NAME=work-and-personal
+TMUX_SESSION_NAME=ccgram
 ```
 
-Run both:
+Add the bot to each group, enable Topics, and grant the required topic permissions.
+Both groups use the same configuration, session discovery, allowed users, and state.
+They do not provide separate control or security boundaries. Use separate machines
+or OS users when those settings and terminal targets must be isolated.
 
-```bash
-CCGRAM_DIR=~/.ccgram-work ccgram &
-CCGRAM_DIR=~/.ccgram-personal ccgram &
-```
-
-Each instance uses a separate tmux session, config directory, and state. When `CCGRAM_GROUP_ID` is set, an instance silently ignores updates from other groups.
-
-Without `CCGRAM_GROUP_ID`, a single instance processes all groups (the default).
-
-> To find your group's chat ID, add [@RawDataBot](https://t.me/RawDataBot) to the group — it replies with the chat ID (a negative number like `-1001234567890`).
+Set `CCGRAM_GROUP_ID` to one group ID to restrict the process to that group. It then
+ignores updates from other groups. To find the ID, add
+[@RawDataBot](https://t.me/RawDataBot) to the group; it replies with the negative chat ID.
 
 ## Creating Sessions from the Terminal
 
