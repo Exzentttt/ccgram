@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import socket
 from subprocess import TimeoutExpired
 from dataclasses import dataclass, replace
@@ -17,6 +18,7 @@ from ..providers import get_provider_for_window, has_yolo_mode, resolve_launch_c
 from ..providers.process_detection import classify_provider_from_argv
 from ..providers.shell_infra import KNOWN_SHELLS, match_prompt
 from ..window_state_ports import identity_state
+from ..utils import log_throttled
 from ..worktrees import (
     check_worktree_eligibility,
     create_worktree,
@@ -27,6 +29,8 @@ from ..worktrees import (
     WorktreeError,
 )
 from .models import ProtocolError, Status, utc_now
+
+logger = logging.getLogger(__name__)
 
 _CREATION_UNCONFIRMED = (
     "Could not confirm session creation; inspect the terminal before retrying"
@@ -218,7 +222,20 @@ class MultiplexerSessionBackend:
             marker = match_prompt(lines[-1]) if lines else None
             if marker is None or marker.trailing_text.strip():
                 resume_provider = ""
-        native = await self.mux.agent_status(window.window_id)
+        try:
+            native = await self.mux.agent_status(window.window_id)
+        except Exception as exc:  # noqa: BLE001  # optional enrichment is logged and discarded
+            # Native status is optional; keep building this target and let the
+            # next refresh retry the probe.
+            log_throttled(
+                logger,
+                f"session-protocol-agent-status:{window.window_id}",
+                "Native agent-status probe failed for window %s: %s",
+                window.window_id,
+                exc,
+                level="warning",
+            )
+            native = None
         now = utc_now()
         status = Status("unknown", "", "screen", now)
         if native and native.state in {

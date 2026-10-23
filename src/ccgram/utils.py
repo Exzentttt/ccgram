@@ -7,7 +7,7 @@ Provides:
   - read_cwd_from_jsonl(): extract the cwd field from the first JSONL entry.
   - read_session_metadata_from_jsonl(): single-pass extraction of (cwd, summary).
   - task_done_callback(): log unhandled exceptions from background asyncio tasks.
-  - log_throttled(): suppress repeated identical debug messages per key.
+  - log_throttled(): suppress repeated identical messages per key.
   - detect_tmux_context(): auto-detect tmux session name and own window ID.
   - check_duplicate_ccgram(): check if another ccgram is running in the session.
   - is_general_topic(): check if a message is in the General (default) forum topic.
@@ -23,7 +23,7 @@ import tempfile
 import time
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import structlog
 from telegram import Bot, Message
@@ -42,9 +42,10 @@ def log_throttled(
     msg: str,
     *args: object,
     cooldown: float = 300.0,
+    level: Literal["debug", "info", "warning", "error"] = "debug",
     _clock: Callable[[], float] = time.monotonic,
 ) -> None:
-    """Log at debug level, suppressing repeated identical messages per key.
+    """Log at *level* (debug by default), suppressing repeated messages per key.
 
     First occurrence always logs. Subsequent calls with the same *key* and
     identical formatted message are suppressed until *cooldown* seconds elapse.
@@ -61,7 +62,7 @@ def log_throttled(
     if prev and prev[1] == formatted and (now - prev[0]) < cooldown:
         return
     _throttle_state[key] = (now, formatted)
-    log.debug(msg, *args)
+    getattr(log, level)(msg, *args)
 
 
 def log_throttle_reset(prefix: str) -> None:
