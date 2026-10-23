@@ -11,7 +11,11 @@ from unittest.mock import patch
 import aiofiles.threadpool
 import pytest
 
-from ccgram.delivery_contract import DeliveryOutcome, get_active_delivery_receipt
+from ccgram.delivery_contract import (
+    DeliveryOutcome,
+    DeliveryReceipt,
+    get_active_delivery_receipt,
+)
 from ccgram.monitor_state import TrackedSession
 from ccgram.providers.claude import ClaudeProvider
 from ccgram.session import SessionManager
@@ -367,3 +371,83 @@ async def test_transcript_replacement_keeps_registered_undelivered_tail(
     await _dispatch_pending(case.monitor, pending)
     assert case.texts("s1") == ["old one", "old two"]
     assert all(not receipt.revoked for _, _, receipt in pending)
+
+
+@pytest.mark.parametrize("replace_source", [False, True])
+async def test_refresh_waits_for_old_queued_tail_without_blocking_other_sources(
+    source_case, replace_source: bool
+) -> None:
+    case = source_case
+    queued: list[tuple[str, str, DeliveryReceipt]] = []
+
+    async def enqueue(message) -> None:
+        receipt = get_active_delivery_receipt()
+        assert receipt is not None
+        receipt.track()
+        queued.append((message.session_id, message.text, receipt))
+
+    case.monitor.set_message_callback(enqueue)
+    await case.monitor.check_for_updates(case.current_map)
+    await case.dispatch_buffered()
+    assert len(queued) == 2
+    old_eof = case.transcript.stat().st_size
+    if replace_source:
+        replacement = case.transcript.with_name("replacement.jsonl")
+        replacement.write_bytes(_assistant_line("replacement history"))
+        replacement.replace(case.transcript)
+    case.add_other_source()
+    refreshed = {
+        "@0": {"session_id": "refreshed", "transcript_path": str(case.transcript)},
+        "@1": case.current_map["@1"],
+    }
+    case.monitor._last_session_map = refreshed
+    await case.monitor.check_for_updates(refreshed)
+    await case.dispatch_buffered()
+    assert [(sid, text) for sid, text, _ in queued] == [
+        ("s1", "old one"),
+        ("s1", "old two"),
+        ("s2", "other source"),
+    ]
+    assert case.monitor.state.get_session("refreshed") is None
+    assert case.tracked.last_byte_offset == 0
+    for _sid, _text, receipt in queued:
+        receipt.settle(DeliveryOutcome.DELIVERED)
+    await case.monitor.commit_delivered_watermarks()
+    assert case.tracked.last_byte_offset == old_eof
+
+    await case.monitor.check_for_updates(refreshed)
+    await case.dispatch_buffered()
+    await case.monitor.commit_delivered_watermarks()
+    adopted = case.monitor.state.get_session("refreshed")
+    assert adopted is not None
+    assert adopted.last_byte_offset == case.transcript.stat().st_size
+    assert len(queued) == 3
+
+
+@pytest.mark.parametrize("retired", ["failed", "revoked"])
+async def test_refresh_does_not_wait_forever_for_unsuccessful_receipts(
+    source_case, retired: str
+) -> None:
+    case = source_case
+    old_receipts = []
+
+    async def enqueue(_message) -> None:
+        receipt = get_active_delivery_receipt()
+        assert receipt is not None
+        receipt.track()
+        old_receipts.append(receipt)
+
+    case.monitor.set_message_callback(enqueue)
+    await case.monitor.check_for_updates(case.current_map)
+    await case.dispatch_buffered()
+    for receipt in old_receipts:
+        if retired == "failed":
+            receipt.fail()
+        else:
+            receipt.revoke()
+    refreshed = {
+        "@0": {"session_id": "refreshed", "transcript_path": str(case.transcript)}
+    }
+    case.monitor._last_session_map = refreshed
+    await case.monitor.check_for_updates(refreshed)
+    assert case.monitor.state.get_session("refreshed") is not None

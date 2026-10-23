@@ -131,3 +131,17 @@ def test_active_delivery_admission_tracks_revocation_without_leaking() -> None:
     finally:
         deactivate_delivery_receipt(token)
     assert delivery_is_current()
+
+
+def test_pending_tasks_distinguish_queue_work_from_unclosed_producers() -> None:
+    receipt = DeliveryReceipt(checkpoint=10)
+    assert not receipt.has_pending_tasks
+    receipt.track()
+    receipt.track()
+    receipt.close()
+    assert receipt.has_pending_tasks
+    receipt.settle(DeliveryOutcome.DELIVERED)
+    assert receipt.has_pending_tasks
+    receipt.settle(DeliveryOutcome.DELIVERED)
+    assert not receipt.has_pending_tasks
+    assert receipt.commit_ready

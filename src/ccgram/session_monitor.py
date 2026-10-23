@@ -1212,6 +1212,19 @@ class SessionMonitor:
         self, session_id: str, file_path: Path, new_messages: list, window_id: str = ""
     ) -> None:
         """Process a single session file (delegates to TranscriptReader)."""
+        if self.state.get_session(session_id) is None:
+            for old_id, old_session in self.state.tracked_sessions.items():
+                if not _same_resolved_path(Path(old_session.file_path), file_path):
+                    continue
+                # Finish the old queued tail before adopting its watermark.
+                # Failed/revoked delivery still falls back to at-least-once replay.
+                if any(
+                    not receipt.failed
+                    and not receipt.revoked
+                    and receipt.has_pending_tasks
+                    for receipt in self._delivery_receipts.get(old_id, ())
+                ):
+                    return
         await self._transcript_reader._process_session_file(
             session_id, file_path, new_messages, window_id=window_id
         )

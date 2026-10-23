@@ -57,6 +57,11 @@ class DeliveryReceipt:
         self._closed = True
 
     @property
+    def has_pending_tasks(self) -> bool:
+        """Whether outbound tasks have been queued but not yet settled."""
+        return self._pending > 0
+
+    @property
     def commit_ready(self) -> bool:
         return (
             self._closed and self._pending == 0 and not self.failed and not self.revoked
