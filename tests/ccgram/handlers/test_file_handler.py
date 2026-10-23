@@ -224,7 +224,16 @@ class TestUploadTypingFailure:
             patch.object(file_handler, "safe_reply", new_callable=AsyncMock),
         ):
             await file_handler._upload_and_notify(
-                message, 1, 42, "a.txt", "fid", 10, "File", "see {path}", "📎"
+                message,
+                1,
+                42,
+                "a.txt",
+                "fid",
+                10,
+                "File",
+                "see {path}",
+                "📎",
+                adapter=MagicMock(),
             )
 
         mock_send.assert_awaited_once()
@@ -266,7 +275,16 @@ class TestUploadNotifiesAbsolutePath:
             ) as mock_reply,
         ):
             await file_handler._upload_and_notify(
-                message, 1, 42, "a.txt", "fid", 10, "File", "see {path}", "📎"
+                message,
+                1,
+                42,
+                "a.txt",
+                "fid",
+                10,
+                "File",
+                "see {path}",
+                "📎",
+                adapter=MagicMock(),
             )
 
         assert mock_send.await_args is not None

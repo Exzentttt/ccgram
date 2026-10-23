@@ -7,6 +7,8 @@ lifecycle events, and retain only metadata safe enough for ``events.jsonl``.
 from __future__ import annotations
 
 import os
+import hashlib
+import json
 from pathlib import Path
 from typing import cast
 
@@ -119,6 +121,8 @@ class ClaudeHookAdapter:
         "SubagentStop",
         "TeammateIdle",
         "TaskCompleted",
+        "PermissionRequest",
+        "PreToolUse",
     )
     # Claude installs all of its event types — the install path uses
     # ~/.claude/settings.json schema rather than the JSON-hook installer,
@@ -297,43 +301,42 @@ class GeminiHookAdapter:
 def _extract_claude_data(
     event_name: str, payload: dict[str, object]
 ) -> dict[str, JsonValue]:
-    if event_name == "Notification":
+    if event_name in {"PermissionRequest", "PreToolUse"}:
+        tool_input = payload.get("tool_input")
         return {
             "tool_name": _str_field(payload, "tool_name"),
-            "message": _str_field(payload, "message"),
+            "tool_input_hash": hashlib.sha256(
+                json.dumps(
+                    tool_input,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=False,
+                ).encode()
+            ).hexdigest()
+            if isinstance(tool_input, dict)
+            else "",
         }
     if event_name == "Stop":
         return {
             "stop_reason": _str_field(payload, "stop_reason"),
             "num_turns": _int_field(payload, "num_turns"),
         }
-    if event_name == "StopFailure":
-        return {
-            "error": _str_field(payload, "error"),
-            "error_details": _str_field(payload, "error_details"),
-        }
-    if event_name == "SessionEnd":
-        return {"reason": _str_field(payload, "reason")}
-    if event_name in {"SubagentStart", "SubagentStop"}:
-        return {
-            "subagent_id": _str_field(payload, "subagent_id"),
-            "description": _str_field(payload, "description"),
-            "name": _str_field(payload, "name"),
-        }
-    if event_name == "TeammateIdle":
-        return {
-            "teammate_name": _str_field(payload, "teammate_name"),
-            "team_name": _str_field(payload, "team_name"),
-        }
-    if event_name == "TaskCompleted":
-        return {
-            "task_id": _str_field(payload, "task_id"),
-            "task_subject": _str_field(payload, "task_subject"),
-            "task_description": _str_field(payload, "task_description"),
-            "teammate_name": _str_field(payload, "teammate_name"),
-            "team_name": _str_field(payload, "team_name"),
-        }
-    return {}
+    fields = {
+        "Notification": ("tool_name", "message"),
+        "StopFailure": ("error", "error_details"),
+        "SessionEnd": ("reason",),
+        "SubagentStart": ("subagent_id", "description", "name"),
+        "SubagentStop": ("subagent_id", "description", "name"),
+        "TeammateIdle": ("teammate_name", "team_name"),
+        "TaskCompleted": (
+            "task_id",
+            "task_subject",
+            "task_description",
+            "teammate_name",
+            "team_name",
+        ),
+    }
+    return {key: _str_field(payload, key) for key in fields.get(event_name, ())}
 
 
 _ADAPTERS: dict[ProviderName, HookAdapter] = {

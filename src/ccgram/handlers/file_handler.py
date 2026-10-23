@@ -24,6 +24,7 @@ from telegram.constants import ChatAction
 from telegram.error import TelegramError
 from ..config import config
 from ..telegram_client import PTBTelegramClient
+from ..session_protocol.telegram import adapter_for
 from ..window_query import view_window
 from .telegram_origin import send_telegram_to_window
 from ..thread_router import thread_router
@@ -234,6 +235,8 @@ async def _upload_and_notify(
     size_label: str,
     claude_msg_tpl: str,
     success_emoji: str,
+    *,
+    adapter,
 ) -> None:
     """Shared upload flow: resolve dir, download, notify Claude, reply to user."""
     window_id, upload_path, error = _resolve_upload_dir(
@@ -263,7 +266,12 @@ async def _upload_and_notify(
         claude_msg += f"\n\nUser note: {_sanitize_caption(caption)}"
 
     success, err = await send_telegram_to_window(
-        user_id, window_id, message.message_thread_id, claude_msg, message.chat.id
+        user_id,
+        window_id,
+        message.message_thread_id,
+        claude_msg,
+        message.chat.id,
+        adapter=adapter,
     )
     if success:
         await ack_reaction(
@@ -277,7 +285,7 @@ async def _upload_and_notify(
 
 
 async def handle_photo_message(
-    update: Update, _context: ContextTypes.DEFAULT_TYPE
+    update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
     """Handle photo uploads: save to .ccgram-uploads/ and notify Claude."""
     user = update.effective_user
@@ -299,11 +307,12 @@ async def handle_photo_message(
         "Photo",
         "I've uploaded an image to {path} — please take a look.",
         "\U0001f4f7",
+        adapter=adapter_for(context.bot_data),
     )
 
 
 async def handle_document_message(
-    update: Update, _context: ContextTypes.DEFAULT_TYPE
+    update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
     """Handle document uploads: save to .ccgram-uploads/ and notify Claude."""
     user = update.effective_user
@@ -325,4 +334,5 @@ async def handle_document_message(
         "File",
         "I've uploaded {name} to {path}",
         "\U0001f4ce",
+        adapter=adapter_for(context.bot_data),
     )
