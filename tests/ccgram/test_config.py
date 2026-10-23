@@ -5,6 +5,7 @@ import pytest
 from ccgram.config import (
     Config,
     _delivery_watch_gap_bytes,
+    _replay_cap_bytes,
     _skip_barrier_deadline_s,
 )
 
@@ -343,3 +344,20 @@ class TestDeliveryWatchGap:
     def test_invalid_values_fall_back(self, monkeypatch, raw) -> None:
         monkeypatch.setenv("CCGRAM_DELIVERY_WATCH_GAP_KB", raw)
         assert _delivery_watch_gap_bytes() == 256 * 1024
+
+
+class TestReplayCap:
+    def test_disabled_when_unset_or_zero(self, monkeypatch) -> None:
+        monkeypatch.delenv("CCGRAM_REPLAY_CAP_MB", raising=False)
+        assert _replay_cap_bytes() == 0
+        monkeypatch.setenv("CCGRAM_REPLAY_CAP_MB", "0")
+        assert _replay_cap_bytes() == 0
+
+    def test_megabytes_convert_to_bytes(self, monkeypatch) -> None:
+        monkeypatch.setenv("CCGRAM_REPLAY_CAP_MB", "1.5")
+        assert _replay_cap_bytes() == int(1.5 * 1024 * 1024)
+
+    @pytest.mark.parametrize("raw", ["", "abc", "-1", "inf", "nan", "1e308"])
+    def test_invalid_values_disable_cap(self, monkeypatch, raw) -> None:
+        monkeypatch.setenv("CCGRAM_REPLAY_CAP_MB", raw)
+        assert _replay_cap_bytes() == 0

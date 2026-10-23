@@ -25,6 +25,30 @@ from ccgram.handlers.status.status_bubble import (
 )
 from ccgram.monitor_state import BacklogSkipIntent, TrackedSession
 from ccgram.session_monitor import SessionMonitor
+from ccgram.thread_router import thread_router
+
+
+def _complete_jsonl_record(size: int) -> bytes:
+    prefix = b'{"record":"'
+    suffix = b'"}\n'
+    return prefix + b"x" * (size - len(prefix) - len(suffix)) + suffix
+
+
+def _allow_skip_for_one_recipient(monitor, monkeypatch) -> None:
+    transcript_path = monitor.state.tracked_sessions["s1"].file_path
+    monkeypatch.setattr(
+        "ccgram.session_monitor.session_lifecycle.resolve_session_id",
+        lambda window_id: "s1" if window_id == "@0" else None,
+    )
+    monkeypatch.setattr(
+        "ccgram.session_monitor.session_lifecycle._last_session_map",
+        {"@0": {"session_id": "s1", "transcript_path": transcript_path}},
+    )
+    monkeypatch.setattr(
+        thread_router,
+        "iter_thread_bindings_with_chat",
+        lambda: iter([(1, 99, 4, "@0")]),
+    )
 
 
 def _callbacks(kb) -> list[str]:
@@ -210,16 +234,17 @@ async def test_purge_is_source_scoped_and_settles_only_retired_receipts() -> Non
 
 
 async def test_failed_notice_retries_in_process_before_watermark_advances(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch
 ) -> None:
     transcript = tmp_path / "session.jsonl"
-    transcript.write_bytes(b"x" * 50)
+    transcript.write_bytes(_complete_jsonl_record(50))
     state_file = tmp_path / "monitor.json"
     monitor = SessionMonitor(projects_path=tmp_path, state_file=state_file)
     monitor.state.update_session(
         TrackedSession("s1", str(transcript), last_byte_offset=10, parsed_offset=50)
     )
     monitor._last_session_map = {"@0": {"session_id": "s1"}}
+    _allow_skip_for_one_recipient(monitor, monkeypatch)
     purged: list[int] = []
 
     async def purge(intent) -> int:
@@ -265,12 +290,14 @@ async def test_failed_notice_retries_in_process_before_watermark_advances(
     monitor.commit_delivered_watermarks()
     assert monitor.state.get_session("s1").last_byte_offset == 50  # type: ignore[union-attr]
     assert "s1" not in monitor.state.pending_skips
-    assert transcript.read_bytes() == b"x" * 50
+    assert transcript.read_bytes() == _complete_jsonl_record(50)
 
 
-async def test_notice_enqueue_failure_retries_in_process(tmp_path: Path) -> None:
+async def test_notice_enqueue_failure_retries_in_process(
+    tmp_path: Path, monkeypatch
+) -> None:
     transcript = tmp_path / "session.jsonl"
-    transcript.write_bytes(b"x" * 50)
+    transcript.write_bytes(_complete_jsonl_record(50))
     monitor = SessionMonitor(
         projects_path=tmp_path, state_file=tmp_path / "monitor.json"
     )
@@ -278,6 +305,7 @@ async def test_notice_enqueue_failure_retries_in_process(tmp_path: Path) -> None
         TrackedSession("s1", str(transcript), last_byte_offset=10, parsed_offset=50)
     )
     monitor._last_session_map = {"@0": {"session_id": "s1"}}
+    _allow_skip_for_one_recipient(monitor, monkeypatch)
 
     async def purge(_intent) -> int:
         return 3
@@ -311,15 +339,18 @@ async def test_notice_enqueue_failure_retries_in_process(tmp_path: Path) -> None
     assert "s1" not in monitor.state.pending_skips
 
 
-async def test_failed_purge_resumes_after_restart_before_notice(tmp_path: Path) -> None:
+async def test_failed_purge_resumes_after_restart_before_notice(
+    tmp_path: Path, monkeypatch
+) -> None:
     transcript = tmp_path / "session.jsonl"
-    transcript.write_bytes(b"x" * 50)
+    transcript.write_bytes(_complete_jsonl_record(50))
     state_file = tmp_path / "monitor.json"
     monitor = SessionMonitor(projects_path=tmp_path, state_file=state_file)
     monitor.state.update_session(
         TrackedSession("s1", str(transcript), last_byte_offset=10, parsed_offset=50)
     )
     monitor._last_session_map = {"@0": {"session_id": "s1"}}
+    _allow_skip_for_one_recipient(monitor, monkeypatch)
 
     async def failed_purge(_intent) -> int:
         raise RuntimeError("queue unavailable")
@@ -335,6 +366,7 @@ async def test_failed_purge_resumes_after_restart_before_notice(tmp_path: Path) 
     assert "s1" in monitor.state.pending_skips
 
     restarted = SessionMonitor(projects_path=tmp_path, state_file=state_file)
+    _allow_skip_for_one_recipient(restarted, monkeypatch)
 
     async def purge(_intent) -> int:
         return 3
@@ -357,10 +389,10 @@ async def test_failed_purge_resumes_after_restart_before_notice(tmp_path: Path) 
 
 
 async def test_rebound_after_notice_delivery_does_not_commit_skip(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch
 ) -> None:
     transcript = tmp_path / "session.jsonl"
-    transcript.write_bytes(b"x" * 50)
+    transcript.write_bytes(_complete_jsonl_record(50))
     monitor = SessionMonitor(
         projects_path=tmp_path, state_file=tmp_path / "monitor.json"
     )
@@ -368,6 +400,7 @@ async def test_rebound_after_notice_delivery_does_not_commit_skip(
         TrackedSession("s1", str(transcript), last_byte_offset=10, parsed_offset=50)
     )
     monitor._last_session_map = {"@0": {"session_id": "s1"}}
+    _allow_skip_for_one_recipient(monitor, monkeypatch)
     binding_current = True
 
     async def purge(_intent) -> int:
@@ -397,7 +430,7 @@ async def test_purge_retry_preserves_retired_count_after_state_save_failure(
     tmp_path: Path, monkeypatch
 ) -> None:
     transcript = tmp_path / "session.jsonl"
-    transcript.write_bytes(b"x" * 50)
+    transcript.write_bytes(_complete_jsonl_record(50))
     monitor = SessionMonitor(
         projects_path=tmp_path, state_file=tmp_path / "monitor.json"
     )
@@ -405,6 +438,7 @@ async def test_purge_retry_preserves_retired_count_after_state_save_failure(
         TrackedSession("s1", str(transcript), last_byte_offset=10, parsed_offset=50)
     )
     monitor._last_session_map = {"@0": {"session_id": "s1"}}
+    _allow_skip_for_one_recipient(monitor, monkeypatch)
     purge_calls = 0
 
     async def purge(_intent) -> int:

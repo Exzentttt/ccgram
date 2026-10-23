@@ -76,6 +76,20 @@ def _delivery_watch_gap_bytes() -> int:
         return 256 * 1024
 
 
+def _replay_cap_bytes() -> int:
+    """Return the opt-in unsettled-transcript cap in bytes; invalid input disables it."""
+    try:
+        megabytes = float(os.getenv("CCGRAM_REPLAY_CAP_MB") or 0.0)
+    except ValueError:
+        return 0
+    if not math.isfinite(megabytes) or megabytes <= 0:
+        return 0
+    try:
+        return int(megabytes * 1024 * 1024)
+    except OverflowError:
+        return 0
+
+
 def _whisper_timeout_s() -> float:
     """Seconds before the transcription POST gives up, floored at 1s and
     tolerant of empty, non-numeric, or non-finite input (inf would disable
