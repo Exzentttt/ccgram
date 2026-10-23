@@ -1,5 +1,7 @@
+import asyncio
 from dataclasses import replace
 import subprocess
+from tempfile import TemporaryFile
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, call
 from uuid import uuid4
@@ -7,12 +9,19 @@ from uuid import uuid4
 import pytest
 from libtmux.exc import LibTmuxException
 
-from ccgram.multiplexer.base import ForegroundInfo, Multiplexer, PaneInfo, WindowRef
+from ccgram.multiplexer.base import (
+    AgentStatus,
+    ForegroundInfo,
+    Multiplexer,
+    PaneInfo,
+    WindowRef,
+)
 from ccgram.multiplexer.tmux import TmuxManager
 from ccgram.multiplexer.herdr import HerdrError
 from ccgram.multiplexer.vim_state import notify_vim_insert_seen, reset_vim_state
 from ccgram.session_protocol.backend import CreationOptions, MultiplexerSessionBackend
 from ccgram.session_protocol.models import Action, ProtocolError
+from ccgram.session_protocol.runtime import ProtocolRuntime
 from ccgram.session_protocol.service import LocalSessionService
 from ccgram.session_protocol.telegram import adapter_for
 from ccgram.window_state_ports import identity_state
@@ -294,6 +303,62 @@ async def test_tracked_ineligible_target_preserves_identity_and_backend_id(
     assert targets[0].conversation_id == "conv"
     assert targets[0].transcript == path
     mux.foreground.assert_awaited_once_with(reported)
+
+
+async def test_native_probe_failure_is_per_target_and_recovers(mux, monkeypatch):
+    monkeypatch.setattr(identity_state, "get_identity", lambda _: None)
+    mux.list_windows_for_reconciliation.return_value = [
+        WindowRef("@1", "first", "/tmp"),
+        WindowRef("@2", "second", "/tmp"),
+    ]
+    mux.agent_status.side_effect = [
+        RuntimeError("probe failed"),
+        AgentStatus("working"),
+        AgentStatus("done"),
+        AgentStatus("idle"),
+    ]
+    backend = MultiplexerSessionBackend(mux, "/tmp")
+
+    targets = await backend.targets()
+    assert [target.id for target in targets] == ["@1", "@2"]
+    assert targets[0].status.source == "screen"
+    assert targets[1].status.source == "native"
+    assert targets[1].status.state == "working"
+
+    recovered = await backend.targets()
+    assert [target.status.source for target in recovered] == ["native", "native"]
+    assert [target.status.state for target in recovered] == ["done", "idle"]
+
+
+async def test_native_probe_cancellation_propagates(mux, monkeypatch):
+    monkeypatch.setattr(identity_state, "get_identity", lambda _: None)
+    mux.agent_status.side_effect = asyncio.CancelledError
+    backend = MultiplexerSessionBackend(mux, "/tmp")
+
+    with pytest.raises(asyncio.CancelledError):
+        await backend._target(WindowRef("@1", "project", "/tmp"))
+
+
+async def test_protocol_runtime_refresh_recovers_after_native_probe_failure(
+    mux, store, monkeypatch
+):
+    monkeypatch.setattr(identity_state, "get_identity", lambda _: None)
+    mux.agent_status.side_effect = [
+        RuntimeError("probe failed"),
+        AgentStatus("working"),
+    ]
+    service = LocalSessionService(MultiplexerSessionBackend(mux, "/tmp"), store)
+    sleep = AsyncMock(side_effect=[None, asyncio.CancelledError])
+    monkeypatch.setattr("ccgram.session_protocol.runtime.asyncio.sleep", sleep)
+
+    with TemporaryFile() as lock:
+        runtime = ProtocolRuntime(store, service, lock)
+        with pytest.raises(asyncio.CancelledError):
+            await runtime.poll("")
+
+    assert mux.agent_status.await_count == 2
+    assert sleep.await_count == 2
+    assert next(iter(service._snapshots.values())).status.state == "working"
 
 
 @pytest.fixture

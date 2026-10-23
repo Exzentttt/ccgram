@@ -100,6 +100,19 @@ share linked windows, so a lock for each session cannot prevent overlapping
 writers. For work and personal groups, use the
 [single-core group setup](../guides.md#multi-instance-setup).
 
+## Status refresh and native probes
+
+Native agent status is optional enrichment. If its probe raises unexpectedly,
+ccgram logs a rate-limited warning and continues the refresh with screen-derived
+status when available. A failed Telegram probe does not stop other window ticks;
+a failed shared-core probe does not discard other targets or stop the runtime poll.
+The next refresh retries the probe.
+
+The Herdr and Agterm backends already return no native status for expected
+transport or response errors. This hardening covers unexpected raised errors; it
+does not indicate a reproduced socket failure. If the warning persists, check the
+multiplexer health and the error details in the ccgram log.
+
 ## Remote input and approval modes
 
 The API has no operation for raising the approval mode. Remote session creation
