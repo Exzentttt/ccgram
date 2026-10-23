@@ -31,6 +31,7 @@ from telegram.error import TelegramError
 from .config import config
 from .delivery_contract import (
     DeliveryReceipt,
+    delivery_is_current,
     activate_delivery_receipt,
     deactivate_delivery_receipt,
     new_delivery_receipt,
@@ -300,7 +301,8 @@ class SessionMonitor:
         if notice_receipt is not None:
             notice_receipt.fail()
             self._skip_notice_receipts.pop(session_id, None)
-        self._delivery_receipts.pop(session_id, None)
+        for receipt in self._delivery_receipts.pop(session_id, ()):
+            receipt.revoke()
         self._clear_skip_retry(session_id)
 
     def _cancel_pending_skip(
@@ -339,6 +341,8 @@ class SessionMonitor:
 
         async def render_and_deliver(batch: TranscriptBatch) -> None:
             for message in render_transcript_batch(batch):
+                if not delivery_is_current():
+                    break
                 await callback(message)
 
         self._event_hub.unregister_durable_consumer("telegram")
@@ -483,6 +487,9 @@ class SessionMonitor:
             self.state.cancel_skip(session_id)
             self.state.save_if_dirty()
             return None
+        self._transcript_reader.replay_from_watermark(session_id)
+        for receipt in self._delivery_receipts.get(session_id, ()):
+            receipt.revoke()
         prepared = await self._prepare_pending_skip(intent)
         if prepared is True and await self._enqueue_pending_skip_notice(intent):
             return intent
@@ -727,37 +734,36 @@ class SessionMonitor:
         )
         if not identity_state.accepts_provider_observation(window_id, provider_name):
             return
-        (
-            generation_changed,
-            _consumed_intact,
-        ) = await self._transcript_reader._prepare_observed_generation(
+        generation = await self._transcript_reader._prepare_observed_generation(
             session_id,
             tracked,
             file_path,
             before,
             check_marker=provider.capabilities.supports_incremental_read,
         )
+        if generation is None:
+            return
+        generation_changed, _consumed_intact = generation
         if generation_changed:
             self._clear_replay_cap_retry_floor(tracked)
         after = _stable_source_stat(file_path)
         signature = _source_stat_signature(after) if after is not None else None
         if (
-            generation_changed
-            or signature is None
-            or _source_stat_signature(before) != signature
-            or not identity_state.accepts_provider_observation(window_id, provider_name)
-            or session_lifecycle.resolve_session_id(window_id) != session_id
-            or set(self._skip_recipients(session_id)) != set(recipients)
+            not generation_changed
+            and signature is not None
+            and _source_stat_signature(before) == signature
+            and identity_state.accepts_provider_observation(window_id, provider_name)
+            and session_lifecycle.resolve_session_id(window_id) == session_id
+            and set(self._skip_recipients(session_id)) == set(recipients)
         ):
-            return
-        await self.request_backlog_skip(
-            user_id,
-            recipient_window,
-            thread_id,
-            chat_id,
-            expected_source=signature,
-            automatic=True,
-        )
+            await self.request_backlog_skip(
+                user_id,
+                recipient_window,
+                thread_id,
+                chat_id,
+                expected_source=signature,
+                automatic=True,
+            )
 
     def _skip_retry_due(self, session_id: str) -> bool:
         return time.monotonic() >= self._skip_retry_at.get(session_id, 0.0)
@@ -1499,6 +1505,9 @@ class SessionMonitor:
         if receipt is None:
             receipt = new_delivery_receipt(checkpoint=batch.byte_checkpoint)
             self._delivery_receipts.setdefault(batch.session_id, []).append(receipt)
+        if receipt.revoked:
+            receipt.close()
+            return
         token = activate_delivery_receipt(receipt)
         try:
             await self._event_hub.dispatch_durable(consumer_name, batch)

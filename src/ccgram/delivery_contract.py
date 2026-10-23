@@ -31,6 +31,7 @@ class DeliveryReceipt:
     _pending: int = 0
     _closed: bool = False
     failed: bool = False
+    revoked: bool = False
 
     def track(self) -> None:
         if self._closed:
@@ -48,12 +49,18 @@ class DeliveryReceipt:
         """Record a producer-side failure that prevented safe enqueueing."""
         self.failed = True
 
+    def revoke(self) -> None:
+        """Withdraw superseded source work without recording a send failure."""
+        self.revoked = True
+
     def close(self) -> None:
         self._closed = True
 
     @property
     def commit_ready(self) -> bool:
-        return self._closed and self._pending == 0 and not self.failed
+        return (
+            self._closed and self._pending == 0 and not self.failed and not self.revoked
+        )
 
 
 _active_receipt: ContextVar[DeliveryReceipt | None] = ContextVar(
@@ -81,6 +88,12 @@ def deactivate_delivery_receipt(token: Token[DeliveryReceipt | None]) -> None:
 def get_active_delivery_receipt() -> DeliveryReceipt | None:
     """Return the receipt associated with the current producer context."""
     return _active_receipt.get()
+
+
+def delivery_is_current() -> bool:
+    """Admit unscoped work or a producer whose receipt was not withdrawn."""
+    receipt = get_active_delivery_receipt()
+    return receipt is None or not receipt.revoked
 
 
 def delivery_receipts_ready(receipts: list[DeliveryReceipt]) -> bool:
