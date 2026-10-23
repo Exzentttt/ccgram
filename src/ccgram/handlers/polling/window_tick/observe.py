@@ -116,18 +116,20 @@ async def _native_agent_status(window_id: str) -> StatusUpdate | None:
     """
     if not tmux_manager.capabilities.native_agent_status:
         return None
-    # Push-primary: read the event-stream cache (no subprocess). On a cold cache
-    # (just-bound, before the first push — or a backend without an event stream)
-    # fall back to one ``agent_status`` subprocess call. On event-stream backends
-    # the push keeps the cache warm, so the per-tick subprocess is skipped.
+    # Event-stream backends read pushed status and probe once on a cold cache.
+    # Probe-only backends share short-lived negative results with the protocol
+    # refresh, but pass positive results through so status transitions stay live.
     try:
         if tmux_manager.capabilities.supports_event_stream:
             native = await agent_status_cache.get_status_or_probe(
                 window_id, lambda: tmux_manager.agent_status(window_id)
             )
         else:
-            # Probe-only backends have no push stream to refresh cached transitions.
-            native = await tmux_manager.agent_status(window_id)
+            native = await agent_status_cache.get_status_or_probe(
+                window_id,
+                lambda: tmux_manager.agent_status(window_id),
+                cache_positive=False,
+            )
     except Exception as exc:  # noqa: BLE001  # optional enrichment is logged and discarded
         # Native status is optional enrichment; an unexpected probe failure must
         # not prevent the rest of this tick or the next poll cycle.
