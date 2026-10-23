@@ -2,7 +2,7 @@
 
 Producers create a receipt for one transcript item. Queue workers settle each
 tracked outbound task. Persistence advances over the leading run of receipts
-that closed without a failed task (see ``settled_prefix`` and
+that closed without a failed or revoked task (see ``settled_prefix`` and
 ``settled_run_offset``); the first pending, failed, or unclosed receipt, or
 one without a checkpoint, fences the rest. This module deliberately knows
 nothing about Telegram, handlers, queues, or session monitoring.

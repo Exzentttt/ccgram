@@ -429,7 +429,7 @@ class TestDispatch:
         ct = _content_task("hello")
         extra = await _dispatch(bot, 1, ct, queue, lock)
         assert extra == 0
-        mock_flush.assert_awaited_once_with(bot, 1, ct)
+        mock_flush.assert_awaited_once_with(bot, 1, ct, admit=None)
         mock_process.assert_awaited_once()
 
     @patch(
@@ -458,7 +458,7 @@ class TestDispatch:
             result = await _dispatch(bot, 1, ct, queue, lock)
         assert result == 0
         assert result.outcome.value == "delivered"
-        mock_tool_event.assert_awaited_once_with(bot, 1, ct)
+        mock_tool_event.assert_awaited_once_with(bot, 1, ct, admit=None)
         mock_process.assert_not_awaited()
 
     @patch(
@@ -1697,7 +1697,7 @@ class TestThinkingGate:
             extra = await _handle_content_task(bot, 1, ct, queue, lock)
 
         assert extra == 0
-        mock_flush.assert_awaited_once_with(bot, 1, ct)
+        mock_flush.assert_awaited_once_with(bot, 1, ct, admit=None)
         mock_process.assert_awaited_once_with(bot, 1, ct)
 
 
@@ -1807,7 +1807,7 @@ class TestToolCallsGate:
         mock_tool_event.return_value = None
         extra = await _handle_content_task(bot, 1, ct, queue, lock)
         assert extra == 0
-        mock_tool_event.assert_awaited_once_with(bot, 1, ct)
+        mock_tool_event.assert_awaited_once_with(bot, 1, ct, admit=None)
 
     @patch(
         "ccgram.handlers.messaging_pipeline.message_queue._process_content_task",
@@ -1838,7 +1838,7 @@ class TestToolCallsGate:
         ct = _content_task("hello", content_type="text")
         extra = await _handle_content_task(bot, 1, ct, queue, lock)
         assert extra == 0
-        mock_flush.assert_awaited_once_with(bot, 1, ct)
+        mock_flush.assert_awaited_once_with(bot, 1, ct, admit=None)
         mock_process.assert_awaited_once()
 
     @patch("ccgram.handlers.messaging_pipeline.message_queue._tool_msg_ids", {})

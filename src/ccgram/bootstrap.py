@@ -28,6 +28,7 @@ from telegram.error import TelegramError
 
 from .handlers.commands.menu_sync import register_control_menus
 from .config import config
+from .delivery_contract import delivery_is_current
 from .handlers.commands import setup_menu_refresh_job
 from .handlers.hook_events import dispatch_hook_event
 from .handlers.messaging_pipeline.message_queue import shutdown_workers
@@ -114,6 +115,8 @@ async def _deliver_telegram_batch(
     batch: TranscriptBatch, client: PTBTelegramClient
 ) -> None:
     for message in render_transcript_batch(batch):
+        if not delivery_is_current():
+            return
         await handle_new_message(message, client)
 
 
