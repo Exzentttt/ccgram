@@ -307,6 +307,12 @@ class TestResolveUploadDir:
             ("repo", None, "Session working directory is not absolute."),
             # a control character in the cwd would split the literal tmux send
             ("/tmp/re\npo", None, "Session working directory is not usable."),
+            ("/tmp/re\x00po", None, "Session working directory is not usable."),
+            ("/tmp/re\tpo", None, "Session working directory is not usable."),
+            ("/tmp/re\x1fpo", None, "Session working directory is not usable."),
+            ("/tmp/re\x7fpo", None, "Session working directory is not usable."),
+            ("/tmp/re\x80po", None, "Session working directory is not usable."),
+            ("/tmp/re\x9fpo", None, "Session working directory is not usable."),
             # a C1 control is executed by terminals on echo (U+009B is CSI)
             ("/tmp/re\x9bpo", None, "Session working directory is not usable."),
             # a nonprinting-but-legal Unicode char (NBSP) is not a control
