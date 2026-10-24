@@ -1,4 +1,5 @@
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
@@ -90,7 +91,14 @@ def _session_adapter(monkeypatch: pytest.MonkeyPatch) -> MagicMock:
         foreground_argv=("codex",),
     )
     adapter = MagicMock()
-    adapter.create = AsyncMock(return_value=target)
+
+    async def create(data, **_kwargs):
+        target.provider = data["provider"]
+        target.available = True
+        target.foreground_argv = (data["provider"],)
+        return target
+
+    adapter.create = AsyncMock(side_effect=create)
     adapter.resolve = AsyncMock(return_value=(target, MagicMock()))
     adapter.send_keys = AsyncMock(return_value=(True, "ok"))
     monkeypatch.setattr(
@@ -361,6 +369,12 @@ class TestHandleModeSelect:
         mock_sm.get_window_state.return_value = MagicMock()
         mock_sms.wait_for_session_map_entry = AsyncMock(return_value=True)
         mock_accept_yolo.return_value = True
+        _session_adapter.resolve.return_value = (
+            SimpleNamespace(
+                foreground_argv=("claude",), provider="claude", available=True
+            ),
+            None,
+        )
 
         user_data = {"browse_path": "/tmp/proj", PENDING_THREAD_ID: 42}
         query = _make_query(data=f"{CB_MODE_SELECT}claude:yolo")
@@ -372,6 +386,7 @@ class TestHandleModeSelect:
         )
 
         mock_accept_yolo.assert_awaited_once_with("@5", _session_adapter)
+        mock_tr.commit_topic_provisioning.assert_called_once()
         mock_sms.wait_for_session_map_entry.assert_awaited_once_with(
             "@5", resolve_window_id=resolve_window_alias
         )

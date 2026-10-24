@@ -59,6 +59,15 @@ CCGRAM_ANTIGRAVITY_COMMAND=agy --effort high
 
 `<NAME>` is uppercase: `CLAUDE`, `CODEX`, `GEMINI`, `PI`, `ANTIGRAVITY`. Defaults to the provider's built-in command (`claude`, `codex`, `gemini`, `pi`, `agy`) when unset. New providers automatically support `CCGRAM_<NAME>_COMMAND` without code changes.
 
+A custom launch script must replace itself with the recognizable provider CLI. For example, `my-codex-wrapper` can contain:
+
+```sh
+#!/bin/sh
+exec codex "$@"
+```
+
+A long-running intermediary shell or an unrecognized wrapper is not foreground evidence for its child agent. Such launches remain quarantined; configure the CLI directly or use an `exec` wrapper. CCGram does not send input based only on a wrapper name or a stored hook identity.
+
 You can use this for a global "today" setup (all new sessions), for example:
 
 ```ini
@@ -161,7 +170,16 @@ Gemini supports `/status` snapshots: CCGram parses recent transcript activity to
 
 ## Pi
 
-[Pi](https://pi.dev) is a Node.js-based CLI with JSONL v3 transcripts. With the `hook-runner` extension from `cc-thingz`, Pi emits Claude-compatible lifecycle hooks to `ccgram hook` for instant `SessionStart`, `Stop`, `SessionEnd`, and subagent signals. Without hook-runner, session tracking falls back to scanning `~/.pi/agent/sessions/--<encoded-cwd>--/` for the newest transcript whose header `cwd` matches the window working directory.
+[Pi](https://pi.dev) is a Node.js-based CLI with JSONL v3 transcripts. Install or check CCGram's Pi command hooks with:
+
+```bash
+ccgram hook --provider pi --install
+ccgram hook --provider pi --status
+```
+
+CCGram writes `SessionStart`, `Stop`, `SessionEnd`, and `Notification` entries to `~/.pi/agent/hooks.json`. Set `PI_CODING_AGENT_DIR` to use another Pi agent directory for both hook configuration and transcript discovery. Existing top-level event maps are preserved; if an object-valued `hooks` map exists, it takes precedence, matching hook-runner behavior.
+
+Pi must load the existing `cc-thingz` `hook-runner` extension. CCGram installs hook commands but does not install or replace the extension. The runner caches hook configuration and does not watch the file. Restart Pi or reload the extension after changes. Without the runner, session tracking falls back to scanning transcripts under `~/.pi/agent/sessions/`.
 
 ### Launch
 
