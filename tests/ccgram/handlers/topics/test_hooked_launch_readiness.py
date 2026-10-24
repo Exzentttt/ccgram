@@ -1,7 +1,7 @@
 """A lifecycle hook is not evidence that the launched agent owns its pane."""
 
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -136,3 +136,35 @@ async def test_hookless_launch_rejects_another_provider(tmp_path, available):
         )
     assert not result.success
     m.router.commit_topic_provisioning.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("argv", "expected"),
+    [
+        (("/usr/local/bin/claude",), True),
+        (("node", "/opt/node_modules/@anthropic-ai/claude-code/cli.js"), True),
+        (("/bin/sh", "/opt/custom-wrapper"), False),
+        (("node", "/opt/opaque-wrapper.js"), False),
+        (("codex",), False),
+    ],
+)
+async def test_custom_launcher_requires_recognizable_foreground(argv, expected):
+    from ccgram.handlers.topics.window_launch_service import agent_process_started
+    from ccgram.providers.process_detection import classify_provider_from_argv
+
+    adapter = MagicMock()
+    adapter.resolve = AsyncMock(
+        return_value=(
+            SimpleNamespace(
+                foreground_argv=argv,
+                provider=classify_provider_from_argv(argv) or "unknown",
+                available=True,
+            ),
+            None,
+        )
+    )
+
+    assert (
+        await agent_process_started("@5", adapter, expected_provider="claude")
+        is expected
+    )

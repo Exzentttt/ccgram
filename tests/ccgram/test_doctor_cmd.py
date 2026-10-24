@@ -164,6 +164,71 @@ class TestCheckPiHooks:
         assert "hooks.json" in message
         assert event_status == dict.fromkeys(self._EVENTS, False)
 
+    def test_flat_pi_hooks_are_checked_without_shadowing_nested_map(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        hooks_file = tmp_path / "hooks.json"
+        settings = {
+            **{
+                event: [
+                    {
+                        "hooks": [
+                            {
+                                "type": "command",
+                                "command": "ccgram.main hook --provider pi",
+                            }
+                        ]
+                    }
+                ]
+                for event in self._EVENTS
+            },
+            "PreToolUse": [
+                {"hooks": [{"type": "command", "command": "custom-pre-tool-use"}]}
+            ],
+            "hookRunner": {"disabledHooks": ["custom-hook.sh"]},
+            "customOption": {"keep": True},
+        }
+        hooks_file.write_text(json.dumps(settings))
+        monkeypatch.setenv("PI_CODING_AGENT_DIR", str(tmp_path))
+
+        status, message, event_status = _check_hooks("pi")
+
+        assert status == "pass"
+        assert "4 hook events" in message
+        assert event_status == dict.fromkeys(self._EVENTS, True)
+
+    def test_nested_pi_hooks_take_precedence_over_flat_events(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        hooks_file = tmp_path / "hooks.json"
+        settings = {
+            **{
+                event: [
+                    {
+                        "hooks": [
+                            {
+                                "type": "command",
+                                "command": "ccgram.main hook --provider pi",
+                            }
+                        ]
+                    }
+                ]
+                for event in self._EVENTS
+            },
+            "hooks": {
+                "SessionStart": [
+                    {"hooks": [{"type": "command", "command": "custom-nested"}]}
+                ]
+            },
+        }
+        hooks_file.write_text(json.dumps(settings))
+        monkeypatch.setenv("PI_CODING_AGENT_DIR", str(tmp_path))
+
+        status, _message, event_status = _check_hooks("pi")
+
+        assert status == "fail"
+        assert event_status == dict.fromkeys(self._EVENTS, False)
+
     def test_custom_agent_dir_pi_hooks_are_checked(self, tmp_path, monkeypatch) -> None:
         agent_dir = tmp_path / "custom-agent"
         hooks_file = agent_dir / "hooks.json"

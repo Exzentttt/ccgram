@@ -208,11 +208,12 @@ async def agent_process_started(
     *,
     expected_provider: str | None = None,
 ) -> bool | None:
-    """Whether a non-shell process owns the pane right now; None if unknown.
+    """Inspect launch readiness once, without waiting.
 
-    One probe, no waiting: callers decide whether to retry (launch) or leave
-    the claim quarantined (recovery). ``None`` means the backend could not
-    answer, not that the agent is gone.
+    Return None if resolution fails or no foreground argv is reported.
+    Return False for a shell or, with ``expected_provider``, an unavailable
+    target or another provider. True means a non-shell process, also available
+    and matching when ``expected_provider`` is supplied.
     """
     # Lazy: only launch/recovery flows need process inspection.
     import os
@@ -743,8 +744,8 @@ async def launch_window(  # noqa: C901, PLR0911, PLR0912, PLR0915
     created_wid = _follow_supersession(created_wid, claim_id=claim_id)
 
     if not map_entry_found:
-        # A hook-registration timeout does not prove that the new terminal is
-        # dead. Re-read presence before deciding whether the target may be
+        # Registration/readiness timeout does not prove the terminal is dead.
+        # Re-read presence before deciding whether the target may be
         # aborted; live or unknown targets remain quarantined for recovery.
         # Lazy: reconciliation imports the active multiplexer backend.
         from ...multiplexer.reconciliation import window_presence
@@ -774,7 +775,7 @@ async def launch_window(  # noqa: C901, PLR0911, PLR0912, PLR0915
                 failure_message="session target is gone",
                 target_already_absent=True,
             )
-            message = "Session did not register with ccgram and is gone"
+            message = "Session target is gone"
             await _abort_topic_creation(query, message, context)
             return WindowLaunchResult(success=False, error_message=message)
 
@@ -782,11 +783,12 @@ async def launch_window(  # noqa: C901, PLR0911, PLR0912, PLR0915
         if claim_id is not None:
             topic_orchestration.clear_pending_creation(created_wid)
         message = (
-            "Session is still starting; ccgram kept it quarantined for recovery. "
-            "Try again after it finishes registering."
+            "Session is still starting or its foreground is unverified; "
+            "ccgram kept it quarantined for recovery. Try again once the selected "
+            "provider is running. Custom launch scripts must exec the provider CLI."
         )
-        # Keep pending thread/text state so the recovery flow can finish the
-        # exact topic once the late hook registration becomes observable.
+        # Retain the exact topic and first-message state while registration or
+        # matching foreground evidence is still unavailable.
         await safe_edit(query, f"⚠ {message}")
         return WindowLaunchResult(success=False, error_message=message)
 
@@ -819,8 +821,8 @@ async def launch_window(  # noqa: C901, PLR0911, PLR0912, PLR0915
         )
         session_manager.flush_state()
 
-    # The target either has a hook record or never needed one. This also clears
-    # the no-thread path, which otherwise has no topic bind to release the guard.
+    # The provider-specific creation checks passed. Release the guard also for
+    # the no-thread path, which has no topic bind to release it.
     topic_orchestration.clear_pending_creation(created_wid)
     if pending_thread_id is None:
         await safe_edit(query, f"✅ {message}")

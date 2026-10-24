@@ -445,7 +445,9 @@ Before each removal, CCGram rechecks the exact chat/topic binding. A topic that 
 
 Session creation owns an exact topic record, saved before the first remote request. That ownership protects the topic during slow startup and replacement. It does not expire while the creation task is running.
 
-Registration can arrive before the terminal reports the running agent process. CCGram waits for a confirmed foreground process matching the selected provider before binding the topic or sending its first message. A readiness timeout keeps the session quarantined and retains the first message in the creation flow. Recovery also requires matching foreground evidence; elapsed time never substitutes for it.
+For `/new` topic creation and recovery of unfinished topic creation, registration can arrive before the terminal reports the running agent process. CCGram waits for a confirmed foreground matching the selected provider before binding or sending the first message. A readiness timeout keeps the session quarantined and retains the first message in the creation flow. Recovery, including replacement of a deleted topic, also requires matching foreground evidence; elapsed time never substitutes for it. Custom launch scripts must [exec the provider CLI](providers.md#custom-launch-commands).
+
+This startup wait does not cover existing-topic resume/relaunch commands. Their existing input paths still use the normal foreground lease checks.
 
 Startup, periodic cleanup, and `/sync` recover abandoned creation records from current session presence. Recovery verifies the recorded Telegram topic by editing its title to the resolved session name before restoring its binding. It checks only abandoned creation records, never scans all active topics, and sends no temporary probe messages. Missing edit permission or transport errors leave the creation record unresolved.
 

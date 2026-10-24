@@ -304,6 +304,18 @@ def _check_hooks(provider_name: str = "claude") -> tuple[str, str, dict[str, boo
         from .hook import get_installed_events
 
         event_status = get_installed_events(settings)
+    elif provider_name == "pi":
+        # Pi's hook-runner accepts either a nested `hooks` map or a flat
+        # hooks.json event map, with the nested object taking precedence.
+        # Lazy: defer hook module dependencies until Pi diagnostics run.
+        from .hook import _json_hook_events
+
+        hook_events = _json_hook_events(settings, "pi")
+        if hook_events is None:
+            event_status = all_missing
+        else:
+            hooks, _flat = hook_events
+            event_status = _scan_json_hook_events({"hooks": hooks}, events, predicate)
     else:
         event_status = _scan_json_hook_events(settings, events, predicate)
     installed = [e for e, v in event_status.items() if v]

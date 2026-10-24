@@ -39,6 +39,17 @@ def _expected_module_command() -> str:
     return f"{shlex.quote(sys.executable)} -m ccgram.main hook"
 
 
+def _hook_runner_effective_pi_events(settings: dict) -> dict:
+    """Mirror hook-runner's nested-first, then hooks.json root-map parsing."""
+    nested = settings.get("hooks")
+    raw = (
+        nested
+        if isinstance(nested, dict)
+        else {key: value for key, value in settings.items() if key != "hookRunner"}
+    )
+    return {event: groups for event, groups in raw.items() if isinstance(groups, list)}
+
+
 @pytest.fixture(autouse=True)
 def _clear_ambient_multiplexer_env(monkeypatch: pytest.MonkeyPatch) -> None:
     """Keep hook tests independent of the terminal running pytest."""
@@ -701,6 +712,136 @@ class TestPiHookManagement:
         assert adapter is not None
         assert adapter.installable_events == self._EVENTS
 
+    def test_flat_hooks_install_preserves_effective_events_and_options(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        monkeypatch.setenv("PI_CODING_AGENT_DIR", str(tmp_path))
+        path = tmp_path / "hooks.json"
+        existing_pre_tool_use = [
+            {
+                "matcher": "Bash",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "custom-pre-tool-use",
+                        "timeout": 19,
+                        "async": True,
+                    }
+                ],
+            }
+        ]
+        hook_runner_options = {
+            "disableBundledHooks": True,
+            "disabledHooks": ["custom-hook.sh"],
+        }
+        settings = {
+            "PreToolUse": existing_pre_tool_use,
+            "SessionStart": [
+                {"hooks": [{"type": "command", "command": "ccgram hook --provider pi"}]}
+            ],
+            "hookRunner": hook_runner_options,
+            "customOption": {"keep": True},
+        }
+        path.write_text(json.dumps(settings))
+
+        assert _install_hook("pi") == 0
+        assert _install_hook("pi") == 0
+        updated = json.loads(path.read_text())
+
+        assert "hooks" not in updated
+        assert updated["PreToolUse"] == existing_pre_tool_use
+        assert updated["hookRunner"] == hook_runner_options
+        assert updated["customOption"] == {"keep": True}
+        session_start_commands = [
+            hook["command"]
+            for group in updated["SessionStart"]
+            for hook in group["hooks"]
+        ]
+        assert session_start_commands == [f"{_expected_module_command()} --provider pi"]
+        effective_events = _hook_runner_effective_pi_events(updated)
+        assert all(
+            any(
+                hook.get("command") == f"{_expected_module_command()} --provider pi"
+                for group in effective_events[event]
+                for hook in group.get("hooks", [])
+            )
+            for event in self._EVENTS
+        )
+        assert _hook_status("pi") == 0
+
+    def test_flat_hooks_uninstall_removes_only_pi_commands(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        monkeypatch.setenv("PI_CODING_AGENT_DIR", str(tmp_path))
+        path = tmp_path / "hooks.json"
+        settings = {
+            "PreToolUse": [
+                {"hooks": [{"type": "command", "command": "custom-pre-tool-use"}]}
+            ],
+            "SessionStart": [
+                {
+                    "hooks": [
+                        {"type": "command", "command": "custom-start"},
+                        {
+                            "type": "command",
+                            "command": f"{_expected_module_command()} --provider pi",
+                        },
+                        {"type": "command", "command": "ccgram hook"},
+                    ]
+                }
+            ],
+            "hookRunner": {"disabledHooks": ["custom-hook.sh"]},
+        }
+        path.write_text(json.dumps(settings))
+
+        assert _uninstall_hook("pi") == 0
+        updated = json.loads(path.read_text())
+
+        assert "hooks" not in updated
+        assert updated["PreToolUse"] == settings["PreToolUse"]
+        assert updated["hookRunner"] == settings["hookRunner"]
+        assert updated["SessionStart"][0]["hooks"] == [
+            {"type": "command", "command": "custom-start"},
+            {"type": "command", "command": "ccgram hook"},
+        ]
+
+    def test_nested_hooks_take_precedence_over_flat_event_map(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        monkeypatch.setenv("PI_CODING_AGENT_DIR", str(tmp_path))
+        path = tmp_path / "hooks.json"
+        flat_pre_tool_use = [
+            {"hooks": [{"type": "command", "command": "custom-flat-pre-tool-use"}]}
+        ]
+        flat_session_start = [
+            {
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": f"{_expected_module_command()} --provider pi",
+                    }
+                ]
+            }
+        ]
+        settings = {
+            "PreToolUse": flat_pre_tool_use,
+            "SessionStart": flat_session_start,
+            "hooks": {
+                "SessionStart": [
+                    {"hooks": [{"type": "command", "command": "custom-nested"}]}
+                ]
+            },
+        }
+        path.write_text(json.dumps(settings))
+
+        assert _install_hook("pi") == 0
+        updated = json.loads(path.read_text())
+
+        assert updated["PreToolUse"] == flat_pre_tool_use
+        assert updated["SessionStart"] == flat_session_start
+        assert _hook_runner_effective_pi_events(updated) == updated["hooks"]
+        assert _hook_status("pi") == 0
+
     @pytest.mark.parametrize("custom_agent_dir", [False, True])
     def test_cli_installs_pi_hooks_in_agent_hooks_file_and_status_detects_them(
         self, tmp_path, monkeypatch, custom_agent_dir: bool
@@ -837,7 +978,7 @@ class TestPiHookManagement:
         monkeypatch.delenv("PI_CODING_AGENT_DIR", raising=False)
         hooks_file = tmp_path / ".pi" / "agent" / "hooks.json"
         hooks_file.parent.mkdir(parents=True)
-        original = json.dumps({"hooks": bad_hooks})
+        original = json.dumps(bad_hooks)
         hooks_file.write_text(original)
 
         assert _install_hook("pi") == 1
@@ -1410,3 +1551,52 @@ def test_pi_hook_commands_reject_invalid_encoding(tmp_path, monkeypatch, operati
         }[operation]
         assert command("pi") == 1
     assert path.read_bytes() == b"\xff"
+
+
+@pytest.mark.parametrize(
+    "nested_value",
+    [
+        None,
+        [],
+        "ignored",
+        7,
+        True,
+        [{"hooks": [{"command": "ccgram hook --provider pi"}]}],
+    ],
+)
+def test_pi_non_object_hooks_uses_flat_events(tmp_path, monkeypatch, nested_value):
+    from ccgram.doctor_cmd import _check_hooks
+    from ccgram.hook import _hook_status, _PI_HOOK_EVENTS
+
+    monkeypatch.setenv("PI_CODING_AGENT_DIR", str(tmp_path))
+    path = tmp_path / "hooks.json"
+    existing = [{"hooks": [{"type": "command", "command": "preserved-custom-hook"}]}]
+    settings = {
+        "hooks": nested_value,
+        "hookRunner": {"disableBundledHooks": True},
+        "PreToolUse": existing,
+        **{
+            event: [
+                {"hooks": [{"type": "command", "command": "ccgram hook --provider pi"}]}
+            ]
+            for event in _PI_HOOK_EVENTS
+        },
+    }
+    path.write_text(json.dumps(settings))
+
+    assert _hook_status("pi") == 0
+    assert _check_hooks("pi")[0] == "pass"
+    assert _install_hook("pi") == 0
+    installed = json.loads(path.read_text())
+    assert installed["hooks"] == nested_value
+    assert installed["PreToolUse"] == existing
+    assert installed["hookRunner"] == settings["hookRunner"]
+    assert _hook_status("pi") == 0
+
+    assert _uninstall_hook("pi") == 0
+    removed = json.loads(path.read_text())
+    assert removed["hooks"] == nested_value
+    assert removed["PreToolUse"] == existing
+    assert removed["hookRunner"] == settings["hookRunner"]
+    assert _hook_status("pi") == 1
+    assert _check_hooks("pi")[0] == "fail"

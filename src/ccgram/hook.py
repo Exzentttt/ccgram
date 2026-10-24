@@ -248,6 +248,26 @@ def _json_hook_command_predicate(provider_name: str) -> Callable[[str], bool]:
     return _predicate
 
 
+def _json_hook_events(
+    settings: dict[str, Any], provider_name: str, *, create: bool = False
+) -> tuple[dict[str, Any], bool] | None:
+    """Return the effective event map and whether it is Pi's flat format."""
+    if provider_name == "pi":
+        # hook-runner prefers an object-valued nested `hooks`; otherwise it reads
+        # the hooks.json root map, excluding the `hookRunner` options key.
+        hooks = settings.get("hooks")
+        if isinstance(hooks, dict):
+            return hooks, False
+        if any(key != "hookRunner" for key in settings):
+            return settings, True
+        if create:
+            return settings.setdefault("hooks", {}), False
+        return {}, False
+
+    hooks = settings.setdefault("hooks", {}) if create else settings.get("hooks", {})
+    return (hooks, False) if isinstance(hooks, dict) else None
+
+
 def _hook_entry(provider_name: str, timeout_value: int) -> dict[str, Any]:
     """Build a command hook entry for non-Claude providers.
 
@@ -273,10 +293,12 @@ def _install_json_hooks(
     settings = _load_json_settings(path)
     if settings is None:
         return 1
-    hooks = settings.setdefault("hooks", {})
-    if not isinstance(hooks, dict):
+    hook_events = _json_hook_events(settings, provider_name, create=True)
+    if hook_events is None:
         print(f"Error reading {path}: hooks must be an object", file=sys.stderr)
         return 1
+    hooks, _flat = hook_events
+    hook_settings = {"hooks": hooks}
 
     installed_count = 0
     already_count = 0
@@ -290,8 +312,8 @@ def _install_json_hooks(
                 file=sys.stderr,
             )
             return 1
-        if _has_matching_hook(settings, event_type, predicate):
-            _replace_hook_commands(settings, event_type, predicate, hook_command)
+        if _has_matching_hook(hook_settings, event_type, predicate):
+            _replace_hook_commands(hook_settings, event_type, predicate, hook_command)
             already_count += 1
             continue
         event_hooks.append({"hooks": [_hook_entry(provider_name, timeout_value)]})
@@ -462,13 +484,16 @@ def _uninstall_json_hooks(path: Path, provider_name: str) -> int:
     if not settings:
         print(f"No {path} found — nothing to uninstall.")
         return 0
-    hooks = settings.get("hooks", {})
-    if not isinstance(hooks, dict):
+    hook_events = _json_hook_events(settings, provider_name)
+    if hook_events is None:
         print(f"Error reading {path}: hooks must be an object", file=sys.stderr)
         return 1
+    hooks, flat = hook_events
     predicate = _json_hook_command_predicate(provider_name)
     removed = 0
-    for event_hooks in hooks.values():
+    for event_name, event_hooks in hooks.items():
+        if flat and event_name in {"hookRunner", "hooks"}:
+            continue
         if not isinstance(event_hooks, list):
             continue
         for group in event_hooks:
@@ -509,12 +534,15 @@ def _json_hook_status(path: Path, provider_name: str, events: tuple[str, ...]) -
     if not settings:
         print(f"Not installed ({path} does not exist)")
         return 1
-    if not isinstance(settings.get("hooks", {}), dict):
+    hook_events = _json_hook_events(settings, provider_name)
+    if hook_events is None:
         print(f"Error reading {path}: hooks must be an object", file=sys.stderr)
         return 1
+    hooks, _flat = hook_events
+    hook_settings = {"hooks": hooks}
     predicate = _json_hook_command_predicate(provider_name)
     statuses = {
-        event_type: _has_matching_hook(settings, event_type, predicate)
+        event_type: _has_matching_hook(hook_settings, event_type, predicate)
         for event_type in events
     }
     for event_type, installed in statuses.items():

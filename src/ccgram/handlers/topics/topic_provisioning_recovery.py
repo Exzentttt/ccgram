@@ -179,6 +179,24 @@ def _recreation_outcome(
     return "unresolved" if current.uncertain else "deferred"
 
 
+async def _claim_agent_is_ready(
+    claim: TopicProvisioning, adapter: TelegramSessionAdapter
+) -> bool:
+    """Require current provider evidence before recovering an agent binding."""
+    assert claim.target_id is not None
+    provider_name = window_query.get_window_provider(claim.target_id)
+    if not provider_name:
+        return False
+    if provider_registry.get(provider_name).capabilities.chat_first_command_path:
+        return True
+    return (
+        await agent_process_started(
+            claim.target_id, adapter, expected_provider=provider_name
+        )
+        is True
+    )
+
+
 async def _recreate_deleted_topic(
     client: TelegramClient,
     router: ThreadRouter,
@@ -186,6 +204,7 @@ async def _recreate_deleted_topic(
     claim: TopicProvisioning,
     target_id: str,
     topic_name: str,
+    adapter: TelegramSessionAdapter,
 ) -> str:
     """Recreate a deleted topic through the original durable claim."""
     assert claim.target_id is not None
@@ -216,35 +235,54 @@ async def _recreate_deleted_topic(
                 if _drop_recreation(router, claim, target_closed=False)
                 else "changed"
             )
+        ready = await _claim_agent_is_ready(claim, adapter)
+        if not _claim_is_current(router, claim):
+            return "changed"
+        if not ready:
+            return "unresolved"
         prepared = _prepare_recreation(router, claim)
         if prepared is None:
             return "changed"
-        if dead_window is not None:
-            assert claim.thread_id is not None
-            await clear_topic_state(
-                claim.user_id,
-                claim.thread_id,
-                client=client,
-                window_id=dead_window,
-                chat_id=claim.chat_id,
-                window_dead=False,
-            )
-            if not _claim_is_current(router, prepared, owned=True):
-                return "changed"
-        try:
-            created = await create_topic_in_chat(
-                client,
-                claim.chat_id,
-                target_id,
-                topic_name,
-                user_id=prepared.user_id,
-                propagate_retry_after=True,
-                claim_id=prepared.claim_id,
-            )
-        except RetryAfter:
-            return "rate_limited"
-        session_manager.flush_state()
-        return _recreation_outcome(router, prepared, created=created)
+        return await _create_prepared_replacement(
+            client, router, prepared, target_id, topic_name, dead_window
+        )
+
+
+async def _create_prepared_replacement(
+    client: TelegramClient,
+    router: ThreadRouter,
+    prepared: TopicProvisioning,
+    target_id: str,
+    topic_name: str,
+    dead_window: str | None,
+) -> str:
+    """Finish remote creation under the caller's target lock and ownership."""
+    if dead_window is not None:
+        assert prepared.retry_thread_id is not None
+        await clear_topic_state(
+            prepared.user_id,
+            prepared.retry_thread_id,
+            client=client,
+            window_id=dead_window,
+            chat_id=prepared.chat_id,
+            window_dead=False,
+        )
+        if not _claim_is_current(router, prepared, owned=True):
+            return "changed"
+    try:
+        created = await create_topic_in_chat(
+            client,
+            prepared.chat_id,
+            target_id,
+            topic_name,
+            user_id=prepared.user_id,
+            propagate_retry_after=True,
+            claim_id=prepared.claim_id,
+        )
+    except RetryAfter:
+        return "rate_limited"
+    session_manager.flush_state()
+    return _recreation_outcome(router, prepared, created=created)
 
 
 async def _commit_present_topic(router: ThreadRouter, claim: TopicProvisioning) -> str:
@@ -283,19 +321,7 @@ async def _recover_present_topic(
     if topic_exists is None:
         return "unresolved"
     if topic_exists:
-        provider_name = window_query.get_window_provider(claim.target_id)
-        if not provider_name:
-            return "unresolved"
-        if (
-            not provider_registry.get(
-                provider_name
-            ).capabilities.chat_first_command_path
-            and await agent_process_started(
-                claim.target_id, adapter, expected_provider=provider_name
-            )
-            is not True
-        ):
-            # Registration and elapsed time are not foreground proof.
+        if not await _claim_agent_is_ready(claim, adapter):
             return "unresolved"
         return await _commit_present_topic(router, claim)
 
@@ -307,6 +333,7 @@ async def _recover_present_topic(
         claim,
         claim.target_id,
         topic_name,
+        adapter,
     )
 
 
@@ -315,6 +342,7 @@ async def _recover_retry_topic(
     router: ThreadRouter,
     backend: object | None,
     claim: TopicProvisioning,
+    adapter: TelegramSessionAdapter,
 ) -> str:
     """Resume a persisted replacement claim without a new window event."""
     assert claim.target_id is not None and claim.retry_thread_id is not None
@@ -331,6 +359,7 @@ async def _recover_retry_topic(
         claim,
         target_id,
         _cached_topic_name(router, target_id),
+        adapter,
     )
 
 
@@ -408,7 +437,7 @@ async def _recover_claim(
         return "unresolved"
     if claim.retry_at > time.time():
         return "deferred"
-    return await _recover_retry_topic(client, router, backend, claim)
+    return await _recover_retry_topic(client, router, backend, claim, adapter)
 
 
 async def recover_topic_provisioning(
