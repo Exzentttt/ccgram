@@ -198,11 +198,22 @@ class LocalSessionService:
     async def _source_version(self, target: Target) -> Target:
         if target.transcript is None:
             return target
+        source_key = f"{target.id.casefold()}:{target.conversation_id}"
         try:
             observation = await self.store.transcript_snapshot(
-                f"{target.id.casefold()}:{target.conversation_id}", target.transcript
+                source_key, target.transcript
             )
         except OSError as exc:
+            if (
+                isinstance(exc, FileNotFoundError)
+                and target.provider == "claude"
+                and target.foreground_verified
+                and target.conversation_id
+                and not self.store.has_transcript_observation(source_key)
+            ):
+                # Claude can create the JSONL only after its first input. Do not
+                # confuse pending initial history with an unverified terminal.
+                return replace(target, transcript=None)
             raise ProtocolError(
                 503, "backend_unavailable", "Transcript source is unavailable"
             ) from exc
