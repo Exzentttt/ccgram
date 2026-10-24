@@ -351,7 +351,14 @@ def _launch_env(
         )
         adapter.close = AsyncMock(return_value=(True, "Closed"))
         adapter.resolve = AsyncMock(
-            return_value=(SimpleNamespace(foreground_argv=(launch_command,)), None)
+            return_value=(
+                SimpleNamespace(
+                    foreground_argv=(launch_command,),
+                    provider={"agy": "antigravity"}.get(launch_command, launch_command),
+                    available=True,
+                ),
+                None,
+            )
         )
         adapter_for.return_value = adapter
         mux.stamp_pane_title = AsyncMock()
@@ -507,7 +514,11 @@ class TestLaunchWindowSuccess:
         async def resolve(_window_id: str) -> tuple[SimpleNamespace, None]:
             command = next(panes)
             order.append(command)
-            return SimpleNamespace(foreground_argv=(command,)), None
+            return SimpleNamespace(
+                foreground_argv=(command,),
+                provider="shell" if command == "zsh" else "antigravity",
+                available=True,
+            ), None
 
         with _launch_env(launch_command="agy") as m:
             m.adapter.resolve = AsyncMock(side_effect=resolve)
@@ -542,7 +553,12 @@ class TestLaunchWindowSuccess:
             ),
         ):
             m.adapter.resolve = AsyncMock(
-                return_value=(SimpleNamespace(foreground_argv=("zsh",)), None)
+                return_value=(
+                    SimpleNamespace(
+                        foreground_argv=("zsh",), provider="shell", available=True
+                    ),
+                    None,
+                )
             )
             result = await launch_window(
                 _make_query(),
@@ -556,17 +572,6 @@ class TestLaunchWindowSuccess:
         m.router.bind_thread.assert_not_called()
         m.adapter.close.assert_not_awaited()
         assert user_data[PENDING_THREAD_ID] == 42
-
-    async def test_hook_provider_does_not_poll_pane_process(self, tmp_path) -> None:
-        with _launch_env(supports_hook=True) as m:
-            await launch_window(
-                _make_query(),
-                _make_context({PENDING_THREAD_ID: 42}),
-                _request(cwd=str(tmp_path)),
-            )
-
-        m.session_map.wait_for_session_map_entry.assert_awaited_once()
-        m.adapter.resolve.assert_not_awaited()
 
 
 class TestLaunchWindowFailure:

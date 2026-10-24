@@ -151,6 +151,65 @@ class TestCheckHooks:
         assert all(v is False for v in event_status.values())
 
 
+class TestCheckPiHooks:
+    _EVENTS = ("SessionStart", "Stop", "SessionEnd", "Notification")
+
+    def test_missing_pi_hooks_are_reported(self, tmp_path, monkeypatch) -> None:
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.delenv("PI_CODING_AGENT_DIR", raising=False)
+
+        status, message, event_status = _check_hooks("pi")
+
+        assert status == "fail"
+        assert "hooks.json" in message
+        assert event_status == dict.fromkeys(self._EVENTS, False)
+
+    def test_custom_agent_dir_pi_hooks_are_checked(self, tmp_path, monkeypatch) -> None:
+        agent_dir = tmp_path / "custom-agent"
+        hooks_file = agent_dir / "hooks.json"
+        agent_dir.mkdir()
+        hooks_file.write_text(
+            json.dumps(
+                {
+                    "hooks": {
+                        event: [
+                            {
+                                "hooks": [
+                                    {
+                                        "type": "command",
+                                        "command": "ccgram.main hook --provider pi",
+                                    }
+                                ]
+                            }
+                        ]
+                        for event in self._EVENTS
+                    }
+                }
+            )
+        )
+        monkeypatch.setenv("PI_CODING_AGENT_DIR", str(agent_dir))
+
+        status, message, event_status = _check_hooks("pi")
+
+        assert status == "pass"
+        assert "4 hook events" in message
+        assert event_status == dict.fromkeys(self._EVENTS, True)
+
+    def test_malformed_pi_hooks_are_reported_not_raised(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        agent_dir = tmp_path / ".pi" / "agent"
+        agent_dir.mkdir(parents=True)
+        (agent_dir / "hooks.json").write_text(json.dumps({"hooks": []}))
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.delenv("PI_CODING_AGENT_DIR", raising=False)
+
+        status, _message, event_status = _check_hooks("pi")
+
+        assert status == "fail"
+        assert event_status == dict.fromkeys(self._EVENTS, False)
+
+
 class TestDoctorMain:
     def test_runs_without_crash(self, tmp_path, monkeypatch, capsys) -> None:
         monkeypatch.setenv("CCGRAM_DIR", str(tmp_path))
@@ -467,3 +526,27 @@ class TestCheckDraftStreaming:
         assert status == "warn"
         assert "Bot API <9.5" in msg
         reset_draft_state()
+
+
+@pytest.mark.parametrize("group", [{}, {"hooks": [{}]}, {"hooks": [{"command": None}]}])
+def test_pi_diagnostics_ignore_missing_hook_fields(tmp_path, monkeypatch, group):
+    monkeypatch.setenv("PI_CODING_AGENT_DIR", str(tmp_path))
+    (tmp_path / "hooks.json").write_text(
+        json.dumps({"hooks": {"SessionStart": [group]}})
+    )
+
+    status, _message, events = _check_hooks("pi")
+
+    assert status == "fail"
+    assert events and not any(events.values())
+
+
+@pytest.mark.parametrize("value", [[], None, True, 7, "not-an-object"])
+def test_pi_diagnostics_reject_non_object_json(tmp_path, monkeypatch, value):
+    monkeypatch.setenv("PI_CODING_AGENT_DIR", str(tmp_path))
+    (tmp_path / "hooks.json").write_text(json.dumps(value))
+
+    status, _message, events = _check_hooks("pi")
+
+    assert status == "fail"
+    assert events and not any(events.values())

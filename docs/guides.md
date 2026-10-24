@@ -25,8 +25,10 @@ ccgram status                 # Show running state (no token needed)
 ccgram doctor                 # Validate setup and diagnose issues
 ccgram doctor --fix           # Auto-fix issues (install hook, kill orphans)
 ccgram hook --install         # Install Claude Code hooks
-ccgram hook --uninstall       # Remove all hooks
-ccgram hook --status          # Check per-event hook installation status
+ccgram hook --uninstall       # Remove Claude Code hooks
+ccgram hook --status          # Check Claude Code hook installation
+ccgram hook --provider pi --install  # Install Pi hooks (requires cc-thingz hook-runner)
+ccgram hook --provider pi --status   # Check Pi hook installation
 ccgram --version              # Show version
 ccgram -v                     # Run with debug logging
 ```
@@ -220,7 +222,7 @@ All settings accept both CLI flags and environment variables. CLI flags take pre
 | `CCGRAM_WHISPER_BASE_URL` / `--whisper-base-url`      | _(provider default)_           | Custom OpenAI-compatible endpoint URL                                                                |
 | `CCGRAM_WHISPER_MODEL` / `--whisper-model`            | _(provider default)_           | Model override (e.g., `whisper-large-v3-turbo`)                                                      |
 | `CCGRAM_WHISPER_LANGUAGE` / `--whisper-language`      | _(auto-detect)_                | Force language code (e.g., `en`, `zh`)                                                               |
-| `CCGRAM_WHISPER_TIMEOUT`                             | `60`                          | Seconds before the transcription POST gives up; raise it for local backends with slow model loads     |
+| `CCGRAM_WHISPER_TIMEOUT`                              | `60`                           | Seconds before the transcription POST gives up; raise it for local backends with slow model loads    |
 | `CCGRAM_LLM_PROVIDER`                                 | _(empty = disabled)_           | LLM provider for shell command generation                                                            |
 | `CCGRAM_LLM_API_KEY`                                  | _(empty)_                      | API key for LLM provider (env only)                                                                  |
 | `CCGRAM_LLM_BASE_URL`                                 | _(from provider)_              | Custom LLM API endpoint                                                                              |
@@ -442,6 +444,8 @@ Before each removal, CCGram rechecks the exact chat/topic binding. A topic that 
 `CCGRAM_AUTODELETE_DEAD_TOPICS=false` only gates the automatic per-tick dead-session deletion. A topic kept that way is still a binding pointing at a confirmed-dead window, so it surfaces as a `ghost_binding` audit issue; `/sync` (run directly or via its **Fix** button) closes and deletes it like any other ghost topic, regardless of the knob.
 
 Session creation owns an exact topic record, saved before the first remote request. That ownership protects the topic during slow startup and replacement. It does not expire while the creation task is running.
+
+Registration can arrive before the terminal reports the running agent process. CCGram waits for a confirmed foreground process matching the selected provider before binding the topic or sending its first message. A readiness timeout keeps the session quarantined and retains the first message in the creation flow. Recovery also requires matching foreground evidence; elapsed time never substitutes for it.
 
 Startup, periodic cleanup, and `/sync` recover abandoned creation records from current session presence. Recovery verifies the recorded Telegram topic by editing its title to the resolved session name before restoring its binding. It checks only abandoned creation records, never scans all active topics, and sends no temporary probe messages. Missing edit permission or transport errors leave the creation record unresolved.
 

@@ -14,7 +14,12 @@ from ccgram.thread_router import ThreadRouter
 def _adapter() -> MagicMock:
     adapter = MagicMock()
     adapter.resolve = AsyncMock(
-        return_value=(SimpleNamespace(foreground_argv=("claude",)), None)
+        return_value=(
+            SimpleNamespace(
+                foreground_argv=("claude",), provider="claude", available=True
+            ),
+            None,
+        )
     )
     return adapter
 
@@ -45,6 +50,10 @@ def _isolate_persistence():
     with (
         patch("ccgram.handlers.topics.topic_provisioning_recovery.session_manager"),
         patch("ccgram.handlers.topics.topic_deletion.session_manager"),
+        patch(
+            "ccgram.handlers.topics.topic_provisioning_recovery.window_query.get_window_provider",
+            return_value="claude",
+        ),
         patch(
             "ccgram.handlers.topics.topic_provisioning_recovery.clear_topic_state",
             new_callable=AsyncMock,
@@ -405,46 +414,6 @@ async def test_hookless_agent_unknown_probe_also_holds_the_claim():
     assert router.iter_topic_provisionings() == [claim]
 
 
-async def test_hookless_agent_past_the_grace_settles_instead_of_leaking():
-    """A CLI that never starts must not quarantine the claim forever."""
-    router, claim = _restored_claim()
-    client = AsyncMock()
-    provider = MagicMock()
-    provider.capabilities.supports_hook = False
-    provider.capabilities.chat_first_command_path = False
-    with (
-        patch(
-            "ccgram.handlers.topics.topic_provisioning_recovery.window_presence",
-            new_callable=AsyncMock,
-            return_value=True,
-        ),
-        patch(
-            "ccgram.handlers.topics.topic_provisioning_recovery.probe_topic_exists",
-            new_callable=AsyncMock,
-            return_value=True,
-        ),
-        patch(
-            "ccgram.handlers.topics.topic_provisioning_recovery.window_query.get_window_provider",
-            return_value="antigravity",
-        ),
-        patch("ccgram.providers.registry.registry.get", return_value=provider),
-        patch(
-            "ccgram.handlers.topics.topic_provisioning_recovery.agent_process_started",
-            new_callable=AsyncMock,
-            return_value=False,
-        ),
-        patch(
-            "ccgram.handlers.topics.topic_provisioning_recovery.time.time",
-            return_value=claim.created_at + 181.0,
-        ),
-    ):
-        assert await recover_topic_provisioning(
-            client, router=router, adapter=_adapter()
-        ) == {"bound": 1}
-
-    assert router.get_window_for_chat_thread(-100, 42) == "@2"
-
-
 async def test_hookless_agent_in_shell_commits_once_the_cli_took_over():
     router, _claim = _restored_claim()
     client = AsyncMock()
@@ -477,41 +446,6 @@ async def test_hookless_agent_in_shell_commits_once_the_cli_took_over():
             client, router=router, adapter=_adapter()
         ) == {"bound": 1}
 
-    assert router.get_window_for_chat_thread(-100, 42) == "@2"
-
-
-async def test_hook_provider_skips_the_pane_probe():
-    router, _claim = _restored_claim()
-    client = AsyncMock()
-    provider = MagicMock()
-    provider.capabilities.supports_hook = True
-    provider.capabilities.chat_first_command_path = False
-    with (
-        patch(
-            "ccgram.handlers.topics.topic_provisioning_recovery.window_presence",
-            new_callable=AsyncMock,
-            return_value=True,
-        ),
-        patch(
-            "ccgram.handlers.topics.topic_provisioning_recovery.probe_topic_exists",
-            new_callable=AsyncMock,
-            return_value=True,
-        ),
-        patch(
-            "ccgram.handlers.topics.topic_provisioning_recovery.window_query.get_window_provider",
-            return_value="claude",
-        ),
-        patch("ccgram.providers.registry.registry.get", return_value=provider),
-        patch(
-            "ccgram.handlers.topics.topic_provisioning_recovery.agent_process_started",
-            new_callable=AsyncMock,
-        ) as started,
-    ):
-        assert await recover_topic_provisioning(
-            client, router=router, adapter=_adapter()
-        ) == {"bound": 1}
-
-    started.assert_not_awaited()
     assert router.get_window_for_chat_thread(-100, 42) == "@2"
 
 
@@ -895,3 +829,89 @@ async def test_recovery_restores_recorded_title_without_probe_messages():
     )
     client.send_message.assert_not_awaited()
     client.delete_message.assert_not_awaited()
+
+
+@pytest.mark.parametrize("supports_hook", [True, False])
+@pytest.mark.parametrize("age", [30, 181])
+@pytest.mark.parametrize(
+    ("argv", "foreground_provider"),
+    [((), "claude"), (("-zsh",), "shell"), (("codex",), "codex")],
+)
+async def test_hook_registration_cannot_commit_without_matching_foreground(
+    age, argv, foreground_provider, supports_hook
+):
+    router, claim = _restored_claim()
+    client = AsyncMock()
+    adapter = _adapter()
+    adapter.resolve.return_value = (
+        SimpleNamespace(
+            foreground_argv=argv, provider=foreground_provider, available=True
+        ),
+        None,
+    )
+    provider = SimpleNamespace(
+        capabilities=SimpleNamespace(
+            supports_hook=supports_hook, chat_first_command_path=False
+        )
+    )
+    with (
+        patch(
+            "ccgram.handlers.topics.topic_provisioning_recovery.window_presence",
+            new_callable=AsyncMock,
+            return_value=True,
+        ),
+        patch(
+            "ccgram.handlers.topics.topic_provisioning_recovery.probe_topic_exists",
+            new_callable=AsyncMock,
+            return_value=True,
+        ),
+        patch(
+            "ccgram.handlers.topics.topic_provisioning_recovery.window_query.get_window_provider",
+            return_value="claude",
+        ),
+        patch("ccgram.providers.registry.registry.get", return_value=provider),
+        patch(
+            "ccgram.handlers.topics.topic_provisioning_recovery.time.time",
+            return_value=claim.created_at + age,
+        ),
+    ):
+        assert await recover_topic_provisioning(
+            client, router=router, adapter=adapter
+        ) == {"unresolved": 1}
+        assert router.iter_topic_provisionings() == [claim]
+        assert router.get_window_for_chat_thread(-100, 42) is None
+        client.delete_forum_topic.assert_not_awaited()
+
+        adapter.resolve.return_value = (
+            SimpleNamespace(
+                foreground_argv=("claude",), provider="claude", available=True
+            ),
+            None,
+        )
+        assert await recover_topic_provisioning(
+            client, router=router, adapter=adapter
+        ) == {"bound": 1}
+
+    assert router.get_window_for_chat_thread(-100, 42) == "@2"
+    assert not router.iter_topic_provisionings()
+
+
+async def test_recovery_without_provider_identity_remains_quarantined():
+    router, claim = _restored_claim()
+    with (
+        patch(
+            "ccgram.handlers.topics.topic_provisioning_recovery.window_presence",
+            new_callable=AsyncMock,
+            return_value=True,
+        ),
+        patch(
+            "ccgram.handlers.topics.topic_provisioning_recovery.window_query.get_window_provider",
+            return_value=None,
+        ),
+    ):
+        outcome = await recover_topic_provisioning(
+            AsyncMock(), router=router, adapter=_adapter()
+        )
+    assert outcome == {"unresolved": 1}
+    assert router.iter_topic_provisionings() == [claim]
+    assert router.get_window_for_chat_thread(-100, 42) is None

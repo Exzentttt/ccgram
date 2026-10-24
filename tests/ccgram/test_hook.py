@@ -6,7 +6,10 @@ import sys
 from unittest.mock import patch
 
 import pytest
+from click.testing import CliRunner
 
+from ccgram.cli import cli
+from ccgram.hooks.adapters import get_hook_adapter
 from ccgram.hook import (
     _claude_settings_file,
     _closest_claude_ancestor,
@@ -14,11 +17,14 @@ from ccgram.hook import (
     _foreground_pgid_on_tty,
     _hook_status,
     _install_hook,
+    _install_json_hooks,
     _is_nested_session,
+    _json_hook_status,
     _provider_from_pane_tty,
     _resolve_window_id,
     _session_map_session_for,
     _uninstall_hook,
+    _uninstall_json_hooks,
     get_installed_events,
     hook_main,
 )
@@ -687,6 +693,171 @@ class TestHookStatus:
         assert "Not installed" in capsys.readouterr().out
 
 
+class TestPiHookManagement:
+    _EVENTS = ("SessionStart", "Stop", "SessionEnd", "Notification")
+
+    def test_pi_adapter_declares_installable_lifecycle_events(self) -> None:
+        adapter = get_hook_adapter("pi")
+        assert adapter is not None
+        assert adapter.installable_events == self._EVENTS
+
+    @pytest.mark.parametrize("custom_agent_dir", [False, True])
+    def test_cli_installs_pi_hooks_in_agent_hooks_file_and_status_detects_them(
+        self, tmp_path, monkeypatch, custom_agent_dir: bool
+    ) -> None:
+        monkeypatch.setenv("HOME", str(tmp_path))
+        agent_dir = (
+            tmp_path / "custom-pi-agent"
+            if custom_agent_dir
+            else tmp_path / ".pi" / "agent"
+        )
+        if custom_agent_dir:
+            monkeypatch.setenv("PI_CODING_AGENT_DIR", str(agent_dir))
+        else:
+            monkeypatch.delenv("PI_CODING_AGENT_DIR", raising=False)
+
+        runner = CliRunner()
+        status_before = runner.invoke(cli, ["hook", "--provider", "pi", "--status"])
+        assert status_before.exit_code == 1
+        assert (
+            "Missing hooks:" in status_before.output
+            or "Not installed" in status_before.output
+        )
+
+        result = runner.invoke(cli, ["hook", "--provider", "pi", "--install"])
+        assert result.exit_code == 0, result.output
+
+        hooks_file = agent_dir / "hooks.json"
+        assert hooks_file.exists()
+        assert not (tmp_path / ".claude" / "settings.json").exists()
+        settings = json.loads(hooks_file.read_text())
+        assert set(settings["hooks"]) == set(self._EVENTS)
+        for event in self._EVENTS:
+            hook_config = settings["hooks"][event][0]["hooks"][0]
+            assert hook_config["type"] == "command"
+            assert (
+                hook_config["command"] == f"{_expected_module_command()} --provider pi"
+            )
+
+        status_after = runner.invoke(cli, ["hook", "--provider", "pi", "--status"])
+        assert status_after.exit_code == 0, status_after.output
+        assert "All hooks installed" in status_after.output
+
+    def test_install_preserves_other_hooks_and_is_idempotent(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.delenv("PI_CODING_AGENT_DIR", raising=False)
+        agent_dir = tmp_path / ".pi" / "agent"
+        hooks_file = agent_dir / "hooks.json"
+        settings_file = agent_dir / "settings.json"
+        agent_dir.mkdir(parents=True)
+        existing_settings = {
+            "hooks": {
+                "SessionStart": [
+                    {
+                        "matcher": "*",
+                        "hooks": [
+                            {"type": "command", "command": "custom-start"},
+                            {"type": "command", "command": "ccgram hook --provider pi"},
+                        ],
+                    }
+                ]
+            },
+            "custom-setting": {"keep": True},
+        }
+        hooks_file.write_text(json.dumps(existing_settings))
+        settings_file.write_text(json.dumps({"hooks": {"Stop": "untouched"}}))
+        original_settings = settings_file.read_text()
+
+        assert _install_hook("pi") == 0
+        assert _install_hook("pi") == 0
+
+        updated = json.loads(hooks_file.read_text())
+        assert updated["custom-setting"] == {"keep": True}
+        groups = updated["hooks"]["SessionStart"]
+        assert groups[0]["matcher"] == "*"
+        commands = [hook["command"] for group in groups for hook in group["hooks"]]
+        assert commands.count("custom-start") == 1
+        assert commands.count(f"{_expected_module_command()} --provider pi") == 1
+        assert settings_file.read_text() == original_settings
+
+    def test_uninstall_removes_only_pi_commands(self, tmp_path, monkeypatch) -> None:
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.delenv("PI_CODING_AGENT_DIR", raising=False)
+        hooks_file = tmp_path / ".pi" / "agent" / "hooks.json"
+        hooks_file.parent.mkdir(parents=True)
+        hooks_file.write_text(
+            json.dumps(
+                {
+                    "hooks": {
+                        "SessionStart": [
+                            {
+                                "hooks": [
+                                    {"type": "command", "command": "custom-start"},
+                                    {
+                                        "type": "command",
+                                        "command": f"{_expected_module_command()} --provider pi",
+                                    },
+                                    {"type": "command", "command": "ccgram hook"},
+                                ]
+                            }
+                        ],
+                        "Stop": [
+                            {
+                                "hooks": [
+                                    {
+                                        "type": "command",
+                                        "command": f"{_expected_module_command()} --provider pi",
+                                    }
+                                ]
+                            }
+                        ],
+                    },
+                    "unrelated": [1, 2],
+                }
+            )
+        )
+
+        assert _uninstall_hook("pi") == 0
+
+        updated = json.loads(hooks_file.read_text())
+        assert updated["unrelated"] == [1, 2]
+        assert updated["hooks"]["SessionStart"][0]["hooks"] == [
+            {"type": "command", "command": "custom-start"},
+            {"type": "command", "command": "ccgram hook"},
+        ]
+        assert updated["hooks"]["Stop"][0]["hooks"] == []
+
+    @pytest.mark.parametrize("bad_hooks", [[], "not-an-object"])
+    def test_malformed_pi_hooks_config_is_not_overwritten(
+        self, tmp_path, monkeypatch, bad_hooks
+    ) -> None:
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.delenv("PI_CODING_AGENT_DIR", raising=False)
+        hooks_file = tmp_path / ".pi" / "agent" / "hooks.json"
+        hooks_file.parent.mkdir(parents=True)
+        original = json.dumps({"hooks": bad_hooks})
+        hooks_file.write_text(original)
+
+        assert _install_hook("pi") == 1
+        assert hooks_file.read_text() == original
+        assert _json_hook_status(hooks_file, "pi", self._EVENTS) == 1
+        assert _uninstall_json_hooks(hooks_file, "pi") == 1
+
+    def test_malformed_existing_command_does_not_crash_install(self, tmp_path) -> None:
+        hooks_file = tmp_path / "hooks.json"
+        hooks_file.write_text(
+            json.dumps({"hooks": {"SessionStart": [{"hooks": [{"command": []}]}]}})
+        )
+
+        assert _install_json_hooks(hooks_file, "pi", self._EVENTS, 5) == 0
+
+        updated = json.loads(hooks_file.read_text())
+        assert updated["hooks"]["SessionStart"][0]["hooks"][0]["command"] == []
+        assert _json_hook_status(hooks_file, "pi", self._EVENTS) == 0
+
+
 class TestClaudeSettingsFile:
     def test_default_path(self, monkeypatch) -> None:
         from pathlib import Path
@@ -1186,3 +1357,56 @@ class TestProviderFromPaneTty:
         )
         with patch("ccgram.hook.subprocess.run", return_value=result):
             assert _provider_from_pane_tty("/dev/ttys012") == provider
+
+
+@pytest.mark.parametrize("malformed", [None, 7])
+def test_pi_uninstall_preserves_malformed_groups(tmp_path, monkeypatch, malformed):
+    monkeypatch.setenv("PI_CODING_AGENT_DIR", str(tmp_path))
+    path = tmp_path / "hooks.json"
+    path.write_text(
+        json.dumps(
+            {
+                "hooks": {
+                    "Stop": [
+                        {"hooks": malformed},
+                        {
+                            "hooks": [
+                                {
+                                    "type": "command",
+                                    "command": "ccgram hook --provider pi",
+                                }
+                            ]
+                        },
+                    ]
+                }
+            }
+        )
+    )
+
+    assert _uninstall_hook("pi") == 0
+
+    groups = json.loads(path.read_text())["hooks"]["Stop"]
+    assert groups == [{"hooks": malformed}, {"hooks": []}]
+
+
+@pytest.mark.parametrize("operation", ["install", "status", "uninstall", "doctor"])
+def test_pi_hook_commands_reject_invalid_encoding(tmp_path, monkeypatch, operation):
+    from ccgram.doctor_cmd import _check_hooks
+    from ccgram.hook import _hook_status
+
+    monkeypatch.setenv("PI_CODING_AGENT_DIR", str(tmp_path))
+    path = tmp_path / "hooks.json"
+    path.write_bytes(b"\xff")
+
+    if operation == "doctor":
+        status, _message, events = _check_hooks("pi")
+        assert status == "fail"
+        assert events and not any(events.values())
+    else:
+        command = {
+            "install": _install_hook,
+            "status": _hook_status,
+            "uninstall": _uninstall_hook,
+        }[operation]
+        assert command("pi") == 1
+    assert path.read_bytes() == b"\xff"

@@ -161,7 +161,16 @@ Gemini supports `/status` snapshots: CCGram parses recent transcript activity to
 
 ## Pi
 
-[Pi](https://pi.dev) is a Node.js-based CLI with JSONL v3 transcripts. With the `hook-runner` extension from `cc-thingz`, Pi emits Claude-compatible lifecycle hooks to `ccgram hook` for instant `SessionStart`, `Stop`, `SessionEnd`, and subagent signals. Without hook-runner, session tracking falls back to scanning `~/.pi/agent/sessions/--<encoded-cwd>--/` for the newest transcript whose header `cwd` matches the window working directory.
+[Pi](https://pi.dev) is a Node.js-based CLI with JSONL v3 transcripts. Install or check CCGram's Pi command hooks with:
+
+```bash
+ccgram hook --provider pi --install
+ccgram hook --provider pi --status
+```
+
+CCGram writes `SessionStart`, `Stop`, `SessionEnd`, and `Notification` entries to `~/.pi/agent/hooks.json`. Set `PI_CODING_AGENT_DIR` to use another Pi agent directory for both hook configuration and transcript discovery.
+
+Pi must load the existing `cc-thingz` `hook-runner` extension. CCGram installs hook commands but does not install or replace the extension. The runner caches hook configuration and does not watch the file. Restart Pi or reload the extension after changes. Without the runner, session tracking falls back to scanning transcripts under `~/.pi/agent/sessions/`.
 
 ### Launch
 

@@ -320,6 +320,7 @@ class TestCapabilities:
         assert caps.name == "pi"
         assert caps.launch_command == "pi"
         assert caps.supports_hook is True
+        assert caps.hook_install_managed_by_ccgram is True
         assert caps.supports_resume is True
         assert caps.supports_continue is True
         assert caps.supports_incremental_read is True

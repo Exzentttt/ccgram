@@ -125,7 +125,7 @@ def verify_hooks_installed() -> None:
     provider_name = provider.capabilities.name
     if provider_name != "claude":
         if provider.capabilities.hook_install_managed_by_ccgram:
-            # DEBUG (not INFO/WARNING): Codex/Gemini fall back to transcript-scan
+            # DEBUG (not INFO/WARNING): Codex/Gemini/Pi fall back to transcript
             # discovery when hooks are absent, so this is an opt-in latency tip,
             # not a degraded state — it should not greet every startup at INFO.
             logger.debug(
