@@ -235,10 +235,12 @@ async def test_unavailable_transcript_does_not_block_healthy_sessions(
     service, backend, tmp_path
 ):
     healthy = backend.target
-    unavailable = replace(
-        healthy, id="@2", conversation_id="other", transcript=tmp_path / "missing"
-    )
+    path = tmp_path / "missing"
+    path.touch()
+    unavailable = replace(healthy, id="@2", conversation_id="other", transcript=path)
     backend.targets = AsyncMock(return_value=[unavailable, healthy])
+    await service.list_sessions()
+    path.unlink()
     sessions = await service.list_sessions()
     assert len(sessions) == 2
     failed = next(

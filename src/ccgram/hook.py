@@ -1801,6 +1801,27 @@ def _defer_unavailable_herdr_snapshot(
     return True
 
 
+def _session_start_replays_from_zero(
+    provider_name: str, session_id: str, transcript_path: str
+) -> bool:
+    """Reserve a fresh exact Claude file; never rewind existing Claude history."""
+    if provider_name == "pi":
+        return True
+    if (
+        provider_name != "claude"
+        or not transcript_path
+        or Path(transcript_path).stem.casefold() != session_id.casefold()
+    ):
+        return False
+    try:
+        Path(transcript_path).stat()
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    return False
+
+
 def _process_hook_stdin(
     provider_name: str | None = None,
 ) -> NormalizedHookEvent | None:
@@ -1908,7 +1929,9 @@ def _process_hook_stdin(
             transcript_path,
             tmux_session_name,
             detected_provider,
-            replay_from_start=detected_provider == "pi",
+            replay_from_start=_session_start_replays_from_zero(
+                detected_provider, normalized.session_id, transcript_path
+            ),
         )
         data = dict(normalized.data)
         data.update(

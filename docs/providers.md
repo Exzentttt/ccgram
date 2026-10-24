@@ -103,6 +103,10 @@ If hooks are missing, ccgram warns at startup with the fix command. Hooks are op
 
 Claude transcripts are JSONL files under `~/.claude/projects/`. They are read incrementally (byte offsets) for efficient polling.
 
+A newly started Claude session can create its transcript only after the first input. Until that first file appears, history is empty, but input remains available when the foreground process and prompt can be verified. Once a transcript has been observed, its disappearance or a read failure still makes the source unavailable; this startup exception never supplies foreground evidence.
+
+When SessionStart provides the exact path for a not-yet-created Claude transcript, the monitor reserves offset zero so a reply arriving before the next poll is not skipped. Existing Claude transcripts are not rewound.
+
 ### Task Lists
 
 Claude task state is derived from the transcript, not from terminal footer scraping. CCGram recognizes the structured `TaskCreate`, `TaskUpdate`, and `TaskList` tool flow, plus legacy `TodoWrite`, and renders the current tasks inside the topic's single editable status bubble. Hook notifications are used to refresh wait-state headers such as waiting for input or approval prompts faster, but they do not replace the transcript as the source of truth.
