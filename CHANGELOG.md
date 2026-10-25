@@ -5,6 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [4.18.4] - 2026-10-25
+
+### Reliable session cleanup
+
+- Fix dead-window cleanup stopping when topic deletion changes recipient bindings. Other affected topics now continue through the existing safety checks ([#350](https://github.com/alexei-led/ccgram/pull/350)).
+- Separate event observation, Telegram cleanup, and runtime shutdown state while preserving shared mobile-core boundaries. Shutdown notices read the current reason through a runtime callback instead of private CLI state.
+
+### Upgrade
+
+No configuration or state migration is required. Upgrade with your installation method, then restart ccgram when ready:
+
+```console
+uv tool upgrade ccgram
+# Or, for Homebrew installations:
+brew upgrade ccgram
+```
+
+[Full Changelog](https://github.com/alexei-led/ccgram/compare/v4.18.3...v4.18.4)
+
 ## [4.17.0] - 2026-10-21
 
 ### Shared session core for Telegram and mobile
