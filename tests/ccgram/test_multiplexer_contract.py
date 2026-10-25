@@ -52,6 +52,7 @@ CONTRACT_METHODS = (
     "send_keys_to_pane",
     "get_pane_title",
     "stamp_pane_title",
+    "server_boot_id",
 )
 
 
@@ -420,3 +421,9 @@ async def test_tmux_does_not_prove_foreign_ids_absent(
 
     assert await window_presence(window_id, backend) is None
     assert await window_snapshot(window_id, backend) == (False, None)
+
+
+@pytest.mark.parametrize("name", ["herdr", "agterm"])
+async def test_backends_without_a_server_clock_report_no_boot_id(name: str) -> None:
+    """Only tmux can say when its server started; the others must say None."""
+    assert await _backend_or_skip(name).server_boot_id() is None

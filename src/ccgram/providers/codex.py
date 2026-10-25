@@ -65,6 +65,11 @@ _TOOL_RESULT_QUOTE_THRESHOLD = 3
 _TRANSCRIPT_MAX_AGE_SECS = 120.0
 
 
+def codex_sessions_dir() -> Path:
+    """Root of Codex's rollout transcripts (``~/.codex/sessions``)."""
+    return Path.home() / ".codex" / "sessions"
+
+
 def _collect_codex_sessions(sessions_dir: Path) -> list[tuple[float, Path]]:
     """Collect all JSONL files under sessions_dir, sorted newest-first by mtime."""
     result: list[tuple[float, Path]] = []
@@ -209,7 +214,7 @@ class CodexProvider(JsonlProvider):
                 default ``_TRANSCRIPT_MAX_AGE_SECS`` (120s). Pass ``0`` or
                 negative to disable the age check entirely.
         """
-        sessions_dir = Path.home() / ".codex" / "sessions"
+        sessions_dir = codex_sessions_dir()
         if not sessions_dir.is_dir():
             return None
 

@@ -24,6 +24,15 @@ class TestHeadlessUi:
         assert ui.pending_text() is None
         assert ui.user_data is None
 
+    def test_rate_limit_is_recorded_per_instance(self) -> None:
+        ui, other = HeadlessUi(), HeadlessUi()
+        assert ui.retry_after is None
+
+        ui.note_rate_limit(12.0)
+
+        assert ui.retry_after == 12.0
+        assert other.retry_after is None
+
 
 class TestReplacementRequest:
     def test_defaults_describe_a_fresh_session_without_a_previous_window(self) -> None:
@@ -33,3 +42,5 @@ class TestReplacementRequest:
         assert request.resume_id is None
         assert request.continue_session is False
         assert request.chat_id is None
+        assert request.offer_verified is False
+        assert request.approval_mode == ""

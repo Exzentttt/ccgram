@@ -87,6 +87,8 @@ CCGram losslessly combines only eligible consecutive transcript text deliveries 
 
 Topics and their history are deleted as soon as CCGram confirms that the terminal session has closed. Set `CCGRAM_AUTODELETE_DEAD_TOPICS=false` to keep a dead session's topic and its binding instead: the recovery banner still answers the next message there, and a later restart can re-link the topic to a re-keyed session. Failed deletions survive restarts and are retried automatically. `/sync` immediately cleans up locally known stale and retired topics; active or rebound topics are protected. It cannot discover topics whose IDs CCGram no longer knows. See the [Sync cleanup guide](docs/guides.md#sync-and-retired-topic-cleanup) for retries and Telegram admin permissions.
 
+Set `CCGRAM_AUTO_RESTORE_ON_START=true` (tmux, with `CCGRAM_AUTODELETE_DEAD_TOPICS=false`) to resume dead topics at startup after a reboot; see [Auto-restore after a reboot](docs/guides.md#auto-restore-after-a-reboot).
+
 Topics remain protected while their sessions are being created, including slow startup and recovery flows. Creation ownership is saved before remote operations; after a restart, CCGram checks the recorded target before binding or deleting its topic. An unavailable backend or an unresolved creation outcome never counts as a closed session.
 
 ---

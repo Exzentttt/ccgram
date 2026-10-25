@@ -746,6 +746,10 @@ class AgtermManager:
             return None
         return await self.capture_pane(window_id, with_ansi=with_ansi)
 
+    async def server_boot_id(self) -> str | None:
+        """Always None — no server clock to tell one boot from another."""
+        return None
+
     async def pane_dims(self, window_id: str) -> PaneDims | None:
         """Always None — agterm reports no pane geometry over the control channel."""
         del window_id

@@ -21,6 +21,7 @@ import asyncio
 import contextlib
 import json
 import os
+from functools import partial
 from typing import TYPE_CHECKING
 
 import structlog
@@ -33,6 +34,7 @@ from .handlers.hook_events import dispatch_hook_event
 from .handlers.messaging_pipeline.message_queue import shutdown_workers
 from .handlers.messaging_pipeline.message_routing import handle_new_message
 from .handlers.polling.polling_coordinator import status_poll_loop
+from .handlers.recovery.auto_restore import start_auto_restore
 from .handlers.polling.polling_state import terminal_poll_state
 from .handlers.shell import register_approval_callback, show_command_approval
 from .handlers.status.topic_emoji import mark_awaiting_first_paint
@@ -76,6 +78,7 @@ logger = structlog.get_logger()
 
 session_monitor: SessionMonitor | None = None
 _status_poll_task: asyncio.Task[None] | None = None
+_auto_restore_task: asyncio.Task[None] | None = None
 _callbacks_wired = False
 _protocol_runtime: ProtocolRuntime | None = None
 
@@ -375,7 +378,7 @@ def start_event_stream(application: Application) -> object | None:
 
 async def bootstrap_application(application: Application) -> None:
     """Run the full post_init sequence in the prescribed order."""
-    global _protocol_runtime
+    global _protocol_runtime, _auto_restore_task
 
     install_global_exception_handler()
     wire_multiplexer()
@@ -434,6 +437,12 @@ async def bootstrap_application(application: Application) -> None:
         _protocol_runtime = None
         raise
 
+    # Plan synchronously (every binding is settled by now); resume in the
+    # background so post_init is not held for the pause between topics.
+    _auto_restore_task = await start_auto_restore(
+        application.bot, partial(adapter_for, application.bot_data)
+    )
+
     await start_session_monitor(application, event_hub=_protocol_runtime.service.hub)
     start_status_polling(application)
     start_event_stream(application)
@@ -454,7 +463,14 @@ async def stop_delivery_runtime() -> None:
     can actually deliver parsed-but-unsent messages (TASK-5/6). Must run
     before any consumer that could enqueue new work is gone.
     """
-    global _status_poll_task, session_monitor
+    global _status_poll_task, session_monitor, _auto_restore_task
+
+    if _auto_restore_task is not None:
+        _auto_restore_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await _auto_restore_task
+        _auto_restore_task = None
+        logger.info("Auto-restore stopped")
 
     if _status_poll_task is not None:
         _status_poll_task.cancel()
@@ -517,6 +533,7 @@ def reset_for_testing() -> None:
     ``_callbacks_wired`` flag too.
     """
     global _callbacks_wired, session_monitor, _status_poll_task, _protocol_runtime
+    global _auto_restore_task
 
     # Lazy: each module's _reset_*_for_testing hook is only needed by the
     # test harness; production callers never reach reset_for_testing().
@@ -542,6 +559,7 @@ def reset_for_testing() -> None:
 
     clear_pending_telegram_injections()
     _status_poll_task = None
+    _auto_restore_task = None
     session_resolver.bind_session_service(None)
     _protocol_runtime = None
     clear_active_monitor()

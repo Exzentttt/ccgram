@@ -18,7 +18,7 @@ the ``safe_edit`` it wraps.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
 import structlog
 
@@ -32,6 +32,11 @@ class ReplacementRequest:
     ``chat_id`` is the chat the request came from, when known; the flow falls
     back to the topic's routed chat otherwise. ``provider_name`` overrides the
     provider inherited from ``old_window_id``.
+
+    ``offer_verified`` means the caller already proved ``old_window_id`` dead,
+    so the flow skips its own liveness check. ``approval_mode`` overrides the
+    mode read from ``old_window_id``; both exist for callers whose old id may
+    since name another topic's window.
     """
 
     user_id: int
@@ -43,6 +48,8 @@ class ReplacementRequest:
     success_label: str = "Session started."
     old_window_id: str = ""
     provider_name: str = ""
+    offer_verified: bool = False
+    approval_mode: Literal["normal", "yolo", ""] = ""
 
 
 class RecoveryUi(Protocol):
@@ -64,11 +71,17 @@ class RecoveryUi(Protocol):
     def clear_state(self) -> None:
         """Drop every pending-recovery key."""
 
+    def note_rate_limit(self, retry_after: float) -> None:
+        """Record that Telegram asked the flow to wait ``retry_after`` seconds."""
+
 
 class HeadlessUi:
     """A :class:`RecoveryUi` for runs with no Telegram message to edit."""
 
     user_data: dict[str, Any] | None = None
+
+    def __init__(self) -> None:
+        self.retry_after: float | None = None
 
     async def edit(self, text: str, **_kwargs: Any) -> None:
         logger.info("recovery_progress", text=text)
@@ -81,3 +94,6 @@ class HeadlessUi:
 
     def clear_state(self) -> None:
         return None
+
+    def note_rate_limit(self, retry_after: float) -> None:
+        self.retry_after = retry_after

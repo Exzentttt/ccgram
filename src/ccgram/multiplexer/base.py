@@ -367,6 +367,14 @@ class Multiplexer(Protocol):
         """
         ...
 
+    async def server_boot_id(self) -> str | None:
+        """Identify the running server instance; it changes when the server restarts.
+
+        tmux: the server's ``#{start_time}``, ``None`` if it cannot be asked.
+        herdr, agterm: always ``None`` (no server clock).
+        """
+        ...
+
     async def pane_dims(self, window_id: str) -> PaneDims | None:
         """Return the active pane's column/row dimensions.
 

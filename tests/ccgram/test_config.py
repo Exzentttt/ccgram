@@ -146,6 +146,23 @@ class TestAutodeleteDeadTopics:
 
 
 @pytest.mark.usefixtures("_base_env")
+class TestAutoRestoreOnStart:
+    def test_default_off(self, monkeypatch):
+        monkeypatch.delenv("CCGRAM_AUTO_RESTORE_ON_START", raising=False)
+        assert Config().auto_restore_on_start is False
+
+    @pytest.mark.parametrize("value", ["1", "true", "yes", "True", "YES"])
+    def test_enabled(self, monkeypatch, value):
+        monkeypatch.setenv("CCGRAM_AUTO_RESTORE_ON_START", value)
+        assert Config().auto_restore_on_start is True
+
+    @pytest.mark.parametrize("value", ["0", "false", "no", "off", "", "anything-else"])
+    def test_anything_else_is_off(self, monkeypatch, value):
+        monkeypatch.setenv("CCGRAM_AUTO_RESTORE_ON_START", value)
+        assert Config().auto_restore_on_start is False
+
+
+@pytest.mark.usefixtures("_base_env")
 class TestHideToolCalls:
     def test_hide_tool_calls_default_false(self, monkeypatch):
         monkeypatch.delenv("CCGRAM_HIDE_TOOL_CALLS", raising=False)

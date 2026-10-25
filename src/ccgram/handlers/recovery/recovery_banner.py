@@ -25,6 +25,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable
 from dataclasses import dataclass, replace
+from datetime import timedelta
 from functools import partial
 from http import HTTPStatus
 from pathlib import Path
@@ -38,7 +39,7 @@ from telegram import (
     InlineKeyboardMarkup,
     Update,
 )
-from telegram.error import TelegramError
+from telegram.error import RetryAfter, TelegramError
 
 from ... import window_query
 from ...providers import get_provider, get_provider_for_window
@@ -462,6 +463,9 @@ class CallbackUi:
     def clear_state(self) -> None:
         _clear_recovery_state(self.user_data)
 
+    def note_rate_limit(self, retry_after: float) -> None:
+        """A button tap has nobody to stop; the rename failure is already logged."""
+
 
 class _Replacement:
     """One window replacement for one topic; owns its provisioning claim.
@@ -539,6 +543,8 @@ class _Replacement:
         # Every Fresh / Continue / Resume route converges here, and the banner
         # offering them may have been drawn from an ambiguous lookup minutes
         # ago. Keep the old binding in place until a replacement has committed.
+        if self.req.offer_verified:
+            return True
         try:
             refusal = await _stale_recovery_offer(self.req.old_window_id)
         except BaseException:
@@ -558,6 +564,12 @@ class _Replacement:
         return False
 
     def _provider_and_mode(self) -> tuple[AgentProvider, Literal["normal", "yolo"]]:
+        provider, inherited = self._inherited_provider_and_mode()
+        return provider, self.req.approval_mode or inherited
+
+    def _inherited_provider_and_mode(
+        self,
+    ) -> tuple[AgentProvider, Literal["normal", "yolo"]]:
         old_window_id = self.req.old_window_id
         provider_name = self.req.provider_name
         if old_window_id:
@@ -763,6 +775,11 @@ class _Replacement:
                 name=format_topic_name_for_mode(launch.wname, approval_mode),
             )
         except TelegramError as e:
+            if isinstance(e, RetryAfter):
+                wait = e.retry_after
+                self.ui.note_rate_limit(
+                    wait.total_seconds() if isinstance(wait, timedelta) else float(wait)
+                )
             logger.debug("Failed to rename topic: %s", e)
 
         await self.ui.edit(f"✅ {launch.message}\n\n{self.req.success_label}")

@@ -179,6 +179,7 @@ Top-level (constants, leaves, top-level commands):
 - `recovery_banner.py` — dead-window banner UX: `RecoveryBanner`, `render_banner`, `build_recovery_keyboard`, `_create_and_bind_window`, fresh/continue/resume/back/browse/cancel handlers.
 - `resume_picker.py` — resume picker UX + transcript scan: `_SessionEntry`, `scan_sessions_for_cwd`, `_scan_index_for_cwd`, `_scan_bare_jsonl_for_cwd`, picker keyboard builders, `_handle_resume_pick`.
 - `restore_command.py` — `/restore`.
+- `auto_restore.py` — opt-in startup resume of dead topics (`CCGRAM_AUTO_RESTORE_ON_START`): plan, boot-keyed ledger, sequential loop over `HeadlessUi`; no Telegram callback imports.
 - `resume_command.py` — `/resume` (scan past sessions, paginated picker).
 - `transcript_discovery.py` — hookless transcript discovery for Codex/Gemini, provider auto-detection, shell↔agent transitions.
 - `history.py` + `history_callbacks.py` — `/history` + pagination.

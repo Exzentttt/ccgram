@@ -1059,6 +1059,10 @@ class HerdrManager:
             return None
         return CaptureResult(text=text, truncated=effective != lines)
 
+    async def server_boot_id(self) -> str | None:
+        """Always None — no server clock to tell one boot from another."""
+        return None
+
     async def pane_dims(self, window_id: str) -> PaneDims | None:
         try:
             record = await self.guard_session_target(window_id)

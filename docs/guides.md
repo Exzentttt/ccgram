@@ -240,6 +240,7 @@ All settings accept both CLI flags and environment variables. CLI flags take pre
 | `CCGRAM_PROMPT_MARKER`                                | `ccgram`                       | Marker prefix used only by `replace` mode                                                            |
 | `CCGRAM_PANE_LIFECYCLE_NOTIFY`                        | `false`                        | Default for per-window pane create/close notifications (toggle via `/panes`)                         |
 | `CCGRAM_AUTODELETE_DEAD_TOPICS`                       | `true`                         | Set `false` to keep a dead session's topic and binding instead of deleting it                        |
+| `CCGRAM_AUTO_RESTORE_ON_START`                        | `false`                        | Set `true` to resume dead topics at startup (tmux only; needs `CCGRAM_AUTODELETE_DEAD_TOPICS=false`). See [Auto-restore after a reboot](#auto-restore-after-a-reboot)|
 | `CCGRAM_SHOW_HIDDEN_DIRS` / `--show-hidden-dirs`      | `false`                        | Show dot-directories in the directory browser                                                        |
 | `CCGRAM_SEND_SEARCH_DEPTH`                            | `5`                            | Max directory depth for `/send` file search                                                          |
 | `CCGRAM_SEND_MAX_RESULTS`                             | `50`                           | Max file results returned by `/send` search                                                          |
@@ -463,6 +464,24 @@ For a retired topic, cleanup calls `deleteForumTopic`. Deletion is irreversible 
 The bot must be a group administrator with **Delete Messages** (`can_delete_messages`) to delete topics, and **Manage Topics** (`can_manage_topics`) to close them. See [BotFather Setup](#botfather-setup) and Telegram's [deleteForumTopic documentation](https://core.telegram.org/bots/api#deleteforumtopic). The report distinguishes deleted, already gone, closed with deletion pending, deferred, and protected outcomes. General/control topics are protected.
 
 The Bot API cannot enumerate arbitrary topics. If an old topic's ID was already discarded from local state, `/sync` cannot discover it. Legacy bindings without a recorded chat ID are also left untouched: the same thread number in another incoming chat is not proof of ownership. Restore a known mapping or explicitly rebind before cleanup. Recovery of unknown topics requires an explicit list of topic IDs or a separate user-authorized Telegram client: MTProto's [messages.getForumTopics](https://core.telegram.org/method/messages.getForumTopics) can enumerate topics but is user-only. CCGram never guesses ownership from names or closed icons.
+
+## Auto-restore after a reboot
+
+A reboot kills the tmux server and every agent window in it, while each Telegram topic stays bound to a dead window. With `CCGRAM_AUTO_RESTORE_ON_START=true` (default `false`), CCGram resumes those topics at startup instead of waiting for `/restore` and **Resume** in each one. It runs the same replacement the **Resume** button runs, so the provider command (`CCGRAM_CLAUDE_COMMAND` and the like), the approval mode and the topic binding behave exactly as after a manual resume.
+
+Requirements and limits:
+
+- The tmux backend only. herdr and agterm cannot tell one server boot from another, so the feature logs `boot_id_unavailable` and does nothing there.
+- `CCGRAM_AUTODELETE_DEAD_TOPICS=false` is required. With deletion on, status polling would delete the dead topics before they are resumed, so CCGram logs a warning and skips auto-restore.
+- Claude and Codex topics only. Claude needs the session in this account's transcript store for the topic's folder; Codex needs its `rollout-*-<session id>.jsonl` under `~/.codex/sessions`.
+
+A topic is restored only when all of these hold: its chat is known; its window is confirmed gone in one window listing; its folder still exists; its session is on disk; no other running window carries that session; and no topic creation or replacement claim covers it. Every skipped topic is logged as an `auto_restore_skip` event with its `reason`.
+
+tmux window ids restart with the server, so a topic's old id may now belong to a live window, including CCGram's own `_ccgram`. Such a topic is never resumed into or rebound: it is skipped with reason `stale_id_collision_suspected` and left to a manual `/restore`.
+
+The run is one plan, built before anything is created and saved to `auto_restore.json` in the CCGram config directory. Topics are resumed one at a time, three seconds apart, and the run stops at the first Telegram rate limit; the next start continues. Each (chat, topic, session) is attempted once per tmux server boot, so a failing topic is not retried on every restart. A restored topic's row is kept until the boot changes, so a window you kill on purpose later in the same boot is not resumed again at the next restart. If CCGram stops mid-run, the next start finishes the plan from the saved data, including a topic whose binding an earlier resume replaced by reusing its old window id.
+
+Known limitation: status polling may post the dead-window banner in a topic shortly before auto-restore rebinds it.
 
 ## Session Closure and Topic Deletion
 

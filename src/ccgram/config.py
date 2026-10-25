@@ -180,6 +180,12 @@ class Config:
             "CCGRAM_AUTODELETE_DEAD_TOPICS", "true"
         ).strip().lower() not in ("0", "false", "no", "off")
 
+        # Resume dead topics at startup (after a reboot kills every window).
+        # Opt-in: a restart that relaunches agents unasked must be a choice.
+        self.auto_restore_on_start: bool = os.getenv(
+            "CCGRAM_AUTO_RESTORE_ON_START", ""
+        ).lower() in ("1", "true", "yes")
+
         # Ack reaction: react to forwarded messages with an emoji (empty = disabled)
         self.ack_reaction: str = os.getenv("CCGRAM_ACK_REACTION", "")
 

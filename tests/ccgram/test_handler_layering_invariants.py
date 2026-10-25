@@ -97,6 +97,7 @@ _SINGLETON_ALLOWLIST = frozenset(
         "polling/polling_coordinator.py",
         "polling/polling_state.py",
         "polling/window_tick/apply.py",
+        "recovery/auto_restore.py",  # reads thread_router bindings/claims (as recovery_banner).
         "recovery/history.py",
         "recovery/recovery_banner.py",
         "recovery/recovery_callbacks.py",

@@ -15,6 +15,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from libtmux.exc import LibTmuxException
 
 from ccgram.multiplexer.base import (
     CaptureResult,
@@ -425,3 +426,39 @@ async def test_foreground_none_when_window_gone(mgr: TmuxManager) -> None:
 )
 def test_parse_ps_line(line: str, expected: tuple | None) -> None:
     assert TmuxManager._parse_ps_line(line) == expected
+
+
+# ── server_boot_id ─────────────────────────────────────────────────────
+
+
+class TestServerBootId:
+    async def test_returns_the_server_start_time(self, mgr: TmuxManager) -> None:
+        server = MagicMock()
+        server.cmd.return_value = SimpleNamespace(stdout=["1750000000"], stderr=[])
+        mgr._server = server
+
+        assert await mgr.server_boot_id() == "1750000000"
+        server.cmd.assert_called_once_with("display-message", "-p", "#{start_time}")
+
+    @pytest.mark.parametrize(
+        "result",
+        [
+            SimpleNamespace(stdout=[], stderr=["no server running"]),
+            SimpleNamespace(stdout=["  "], stderr=[]),
+        ],
+    )
+    async def test_no_answer_is_none_not_an_empty_key(
+        self, mgr: TmuxManager, result: SimpleNamespace
+    ) -> None:
+        server = MagicMock()
+        server.cmd.return_value = result
+        mgr._server = server
+
+        assert await mgr.server_boot_id() is None
+
+    async def test_a_libtmux_failure_is_none(self, mgr: TmuxManager) -> None:
+        server = MagicMock()
+        server.cmd.side_effect = LibTmuxException("boom")
+        mgr._server = server
+
+        assert await mgr.server_boot_id() is None

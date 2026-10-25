@@ -1,3 +1,4 @@
+import asyncio
 from types import SimpleNamespace
 from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, call, patch
@@ -190,6 +191,7 @@ class TestSettlePreexistingWindows:
 class TestBootstrapApplication:
     async def test_runs_full_sequence_in_order(self):
         app = _make_app()
+        restore_task = MagicMock(name="restore-task")
 
         order: list[str] = []
 
@@ -248,6 +250,14 @@ class TestBootstrapApplication:
                 side_effect=lambda: order.append("wire"),
             ),
             patch(
+                "ccgram.bootstrap.start_auto_restore",
+                new=AsyncMock(
+                    side_effect=lambda *_args, **_kwargs: (
+                        order.append("auto_restore") or restore_task
+                    )
+                ),
+            ) as start_restore,
+            patch(
                 "ccgram.bootstrap.start_session_monitor",
                 new=AsyncMock(
                     side_effect=lambda *_args, **_kwargs: order.append("monitor")
@@ -277,12 +287,44 @@ class TestBootstrapApplication:
             "hooks",
             "protocol",
             "recover_creation",
+            "auto_restore",
             "monitor",
             "polling",
             "miniapp",
         ]
         assert app.bot_data["session_service"].hub == "shared-hub"
         start_monitor.assert_awaited_once_with(app, event_hub="shared-hub")
+        assert start_restore.await_args is not None
+        bot, get_adapter = start_restore.await_args.args
+        assert bot is app.bot
+        assert get_adapter() == "telegram-adapter"
+        assert bootstrap._auto_restore_task is restore_task
+
+
+class TestAutoRestoreTask:
+    async def test_the_started_task_is_kept_and_cancelled_at_shutdown(self):
+        started = asyncio.Event()
+
+        async def _restore_forever() -> None:
+            started.set()
+            await asyncio.Event().wait()
+
+        task = asyncio.create_task(_restore_forever())
+        await started.wait()
+        bootstrap._auto_restore_task = task
+
+        with patch("ccgram.bootstrap.shutdown_workers", new_callable=AsyncMock):
+            await bootstrap.stop_delivery_runtime()
+
+        assert task.cancelled()
+        assert bootstrap._auto_restore_task is None
+
+    async def test_reset_for_testing_forgets_the_task(self):
+        bootstrap._auto_restore_task = MagicMock()
+
+        bootstrap.reset_for_testing()
+
+        assert bootstrap._auto_restore_task is None
 
 
 class TestShutdownRuntime:

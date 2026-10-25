@@ -16,12 +16,16 @@ from types import SimpleNamespace
 from unittest.mock import ANY, AsyncMock, MagicMock, call, patch
 
 import pytest
+from structlog.testing import capture_logs
+from telegram.error import BadRequest, RetryAfter
 
 from ccgram.handlers.callback_data import CB_RECOVERY_FRESH, CB_RECOVERY_PICK
 from ccgram.handlers.recovery.recovery_banner import (
+    _create_and_bind_window,
     _handle_fresh,
     _stale_recovery_offer as _real_stale_recovery_offer,
 )
+from ccgram.handlers.recovery.recovery_ui import HeadlessUi, ReplacementRequest
 from ccgram.handlers.recovery.resume_picker import _handle_resume_pick
 from ccgram.handlers.status.topic_emoji import format_topic_name_for_mode
 from ccgram.handlers.topics import topic_orchestration
@@ -679,3 +683,89 @@ class TestSessionServiceMissing:
             await flow.tap_fresh()
 
         assert flow.parent.mock_calls == [*_CLAIM, *_STALE_CHECKED, *_UNCERTAIN]
+
+
+class TestRenameRateLimit:
+    async def test_button_path_swallows_it_exactly_as_before(self, flow) -> None:
+        flow.parent.client.edit_forum_topic.side_effect = RetryAfter(7)
+
+        with capture_logs() as logs:
+            await flow.tap_fresh()
+
+        assert flow.parent.mock_calls == [
+            *_CLAIM,
+            *_STALE_CHECKED,
+            _CREATE_NORMAL,
+            *_ATTACHED,
+            *_REGISTERED,
+            *_bound("normal", "Fresh session started."),
+        ]
+        assert [log["event"] for log in logs if log["log_level"] == "debug"] == [
+            f"Failed to rename topic: {RetryAfter(7)}"
+        ]
+
+    async def test_headless_path_reports_the_wait_and_still_succeeds(
+        self, flow
+    ) -> None:
+        flow.parent.client.edit_forum_topic.side_effect = RetryAfter(7)
+        ui = HeadlessUi()
+        request = ReplacementRequest(user_id=100, thread_id=42, cwd=_CWD, chat_id=-100)
+
+        ok = await _create_and_bind_window(request, ui, MagicMock(), flow.adapter_for)
+
+        assert ok is True
+        assert ui.retry_after == 7
+
+    async def test_other_telegram_errors_are_not_a_rate_limit(self, flow) -> None:
+        flow.parent.client.edit_forum_topic.side_effect = BadRequest("nope")
+        ui = HeadlessUi()
+        request = ReplacementRequest(user_id=100, thread_id=42, cwd=_CWD, chat_id=-100)
+
+        assert await _create_and_bind_window(request, ui, MagicMock(), flow.adapter_for)
+        assert ui.retry_after is None
+
+
+class TestRequestOverrides:
+    async def test_verified_offer_skips_the_liveness_check(self, flow) -> None:
+        request = ReplacementRequest(
+            user_id=100,
+            thread_id=42,
+            cwd=_CWD,
+            chat_id=-100,
+            old_window_id="@0",
+            offer_verified=True,
+        )
+
+        assert await _create_and_bind_window(
+            request, HeadlessUi(), MagicMock(), flow.adapter_for
+        )
+        flow.stale.assert_not_called()
+
+    async def test_unverified_offer_is_still_checked(self, flow) -> None:
+        request = ReplacementRequest(
+            user_id=100, thread_id=42, cwd=_CWD, chat_id=-100, old_window_id="@0"
+        )
+
+        await _create_and_bind_window(
+            request, HeadlessUi(), MagicMock(), flow.adapter_for
+        )
+        flow.stale.assert_awaited_once_with("@0")
+
+    async def test_request_approval_mode_beats_the_old_window_state(self, flow) -> None:
+        # The old id may now name another topic's window, so its state lies.
+        flow.view.approval_mode = "normal"
+        request = ReplacementRequest(
+            user_id=100,
+            thread_id=42,
+            cwd=_CWD,
+            chat_id=-100,
+            old_window_id="@0",
+            approval_mode="yolo",
+            offer_verified=True,
+        )
+
+        await _create_and_bind_window(
+            request, HeadlessUi(), MagicMock(), flow.adapter_for
+        )
+
+        assert flow.adapter.create.await_args.kwargs["approval_mode"] == "yolo"

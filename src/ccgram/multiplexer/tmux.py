@@ -1107,6 +1107,16 @@ class TmuxManager:
             return None
         return CaptureResult(text=text, truncated=truncated)
 
+    async def server_boot_id(self) -> str | None:
+        """Return the tmux server's ``#{start_time}``, or None if unavailable."""
+        try:
+            result = await asyncio.to_thread(
+                self.server.cmd, "display-message", "-p", "#{start_time}"
+            )
+        except LibTmuxException:
+            return None
+        return (result.stdout[0].strip() or None) if result.stdout else None
+
     async def pane_dims(self, window_id: str) -> PaneDims | None:
         """Return the active pane's column/row dimensions, or None on failure."""
         proc: asyncio.subprocess.Process | None = None
