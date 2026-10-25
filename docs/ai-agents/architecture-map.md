@@ -60,6 +60,8 @@ Live view (terminal → auto-refresh screenshots):
 
 Terminal closure and topic cleanup:
 
+On push-capable backends, the neutral `EventStreamMonitor` reports death through an awaited callback. Bootstrap snapshots current recipients (deletion can unbind them during await) and routes to the same policy used by polling. See [runtime boundaries](../architecture.md#runtime-composition-and-lifecycle-boundaries).
+
 1. `handlers/polling/window_tick/apply.py` rechecks target presence and pending creation before retiring a dead binding.
 2. `handlers/topics/topic_deletion.py` persists cleanup ownership and attempts immediate topic/history deletion. Failed deletion remains queued; `/sync` and periodic maintenance retry it. Unknown presence never proves closure.
 3. `handlers/topics/topic_provisioning_recovery.py` recovers persisted creation records, verifies saved topics before binding, and retains recreation retries or unresolved remote outcomes. Active creation ownership has no age-based expiry.
