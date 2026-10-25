@@ -21,7 +21,7 @@ from telegram.error import BadRequest, RetryAfter
 
 from ccgram.handlers.callback_data import CB_RECOVERY_FRESH, CB_RECOVERY_PICK
 from ccgram.handlers.recovery.recovery_banner import (
-    _create_and_bind_window,
+    create_and_bind_window,
     _handle_fresh,
     _stale_recovery_offer as _real_stale_recovery_offer,
 )
@@ -711,7 +711,7 @@ class TestRenameRateLimit:
         ui = HeadlessUi()
         request = ReplacementRequest(user_id=100, thread_id=42, cwd=_CWD, chat_id=-100)
 
-        ok = await _create_and_bind_window(request, ui, MagicMock(), flow.adapter_for)
+        ok = await create_and_bind_window(request, ui, MagicMock(), flow.adapter_for)
 
         assert ok is True
         assert ui.retry_after == 7
@@ -721,7 +721,7 @@ class TestRenameRateLimit:
         ui = HeadlessUi()
         request = ReplacementRequest(user_id=100, thread_id=42, cwd=_CWD, chat_id=-100)
 
-        assert await _create_and_bind_window(request, ui, MagicMock(), flow.adapter_for)
+        assert await create_and_bind_window(request, ui, MagicMock(), flow.adapter_for)
         assert ui.retry_after is None
 
 
@@ -736,7 +736,7 @@ class TestRequestOverrides:
             offer_verified=True,
         )
 
-        assert await _create_and_bind_window(
+        assert await create_and_bind_window(
             request, HeadlessUi(), MagicMock(), flow.adapter_for
         )
         flow.stale.assert_not_called()
@@ -746,7 +746,7 @@ class TestRequestOverrides:
             user_id=100, thread_id=42, cwd=_CWD, chat_id=-100, old_window_id="@0"
         )
 
-        await _create_and_bind_window(
+        await create_and_bind_window(
             request, HeadlessUi(), MagicMock(), flow.adapter_for
         )
         flow.stale.assert_awaited_once_with("@0")
@@ -764,7 +764,7 @@ class TestRequestOverrides:
             offer_verified=True,
         )
 
-        await _create_and_bind_window(
+        await create_and_bind_window(
             request, HeadlessUi(), MagicMock(), flow.adapter_for
         )
 

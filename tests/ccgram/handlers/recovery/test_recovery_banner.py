@@ -18,7 +18,7 @@ from ccgram.handlers.recovery.recovery_banner import (
     RecoveryBanner,
     RecoveryMode,
     CallbackUi,
-    _create_and_bind_window,
+    create_and_bind_window,
     _recovery_cwd_or_report,
     render_banner,
 )
@@ -307,7 +307,7 @@ class TestRecoveryProvisioning:
     async def test_replacement_keeps_old_binding_until_commit(self, create_env) -> None:
         query, context = _create_query()
 
-        await _create_and_bind_window(
+        await create_and_bind_window(
             ReplacementRequest(
                 user_id=100,
                 thread_id=42,
@@ -354,7 +354,7 @@ class TestRecoveryProbeCancellation:
             ),
             pytest.raises(asyncio.CancelledError),
         ):
-            await _create_and_bind_window(
+            await create_and_bind_window(
                 ReplacementRequest(
                     user_id=100,
                     thread_id=42,
@@ -390,7 +390,7 @@ class TestRecoveryProbeCancellation:
             )
         )
 
-        result = await _create_and_bind_window(
+        result = await create_and_bind_window(
             ReplacementRequest(
                 user_id=100,
                 thread_id=42,
@@ -422,7 +422,7 @@ class TestRecoveryProbeCancellation:
         create_env.adapter.create = AsyncMock(side_effect=create_window)
         query, context = _create_query()
         task = asyncio.create_task(
-            _create_and_bind_window(
+            create_and_bind_window(
                 ReplacementRequest(
                     user_id=100,
                     thread_id=42,

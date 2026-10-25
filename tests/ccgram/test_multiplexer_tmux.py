@@ -465,7 +465,9 @@ class TestServerBootId:
         assert await mgr.server_boot_id() is None
 
 
-# ── reserve_window_ids_above ───────────────────────────────────────────
+# ── reserve_window_ids_past ────────────────────────────────────────────
+
+_RESERVE = "_ccgram-reserve-ccgram-test"
 
 
 class FakeIdServer:
@@ -474,16 +476,24 @@ class FakeIdServer:
     def __init__(self, next_id: int) -> None:
         self.next_id = next_id
         self.calls: list[tuple[str, ...]] = []
+        self.alive: set[str] = set()
+        self.peak_alive = 0
         self.unparseable_from: int | None = None
         self.kill_stderr: list[str] = []
 
     def cmd(self, *args: str) -> SimpleNamespace:
         self.calls.append(args)
         if args[0] == "kill-session":
+            self.alive.clear()
             return SimpleNamespace(stdout=[], stderr=self.kill_stderr)
+        if args[0] == "kill-window":
+            self.alive.discard(args[2])
+            return SimpleNamespace(stdout=[], stderr=[])
         number, self.next_id = self.next_id, self.next_id + 1
         if self.unparseable_from is not None and number >= self.unparseable_from:
             return SimpleNamespace(stdout=[], stderr=["no space for new window"])
+        self.alive.add(f"@{number}")
+        self.peak_alive = max(self.peak_alive, len(self.alive))
         return SimpleNamespace(stdout=[f"@{number}"], stderr=[])
 
 
@@ -494,29 +504,63 @@ class TestReserveWindowIds:
         server = FakeIdServer(next_id=3)
         mgr._server = cast("Any", server)
 
-        assert await mgr.reserve_window_ids_above(5) is True
+        assert await mgr.reserve_window_ids_past(["@2", "@5", "@1"]) is True
 
         assert server.next_id == 7  # @3 (session), @4, @5, @6 were burned
         assert server.calls[0][0] == "kill-session"  # a leftover of a crash
         assert server.calls[1][:2] == ("new-session", "-d")
-        assert [c[0] for c in server.calls[2:-1]] == ["new-window"] * 3
-        assert server.calls[-1] == ("kill-session", "-t", "=_ccgram-reserve")
+        assert [c[0] for c in server.calls[2:-1] if c[0] == "new-window"] == [
+            "new-window"
+        ] * 3
+        assert server.calls[-1] == ("kill-session", "-t", f"={_RESERVE}")
 
-    async def test_the_throwaway_session_is_never_adoptable(
+    async def test_a_burned_window_is_killed_at_once_not_kept_until_the_end(
         self, mgr: TmuxManager
     ) -> None:
         server = FakeIdServer(next_id=1)
         mgr._server = cast("Any", server)
 
-        await mgr.reserve_window_ids_above(2)
+        assert await mgr.reserve_window_ids_past(["@50"]) is True
+
+        assert server.peak_alive == 2  # the session's first window + one burn
+        assert ("kill-window", "-t", "@2") in server.calls
+
+    async def test_the_session_is_named_per_instance(self) -> None:
+        names = set()
+        for session_name in ("ccgram", "ccgram-personal"):
+            server = FakeIdServer(next_id=1)
+            instance = TmuxManager(session_name=session_name)
+            instance._server = cast("Any", server)
+            await instance.reserve_window_ids_past(["@2"])
+            names |= {c[c.index("-s") + 1] for c in server.calls if "-s" in c}
+
+        assert names == {"_ccgram-reserve-ccgram", "_ccgram-reserve-ccgram-personal"}
+
+    async def test_the_throwaway_session_is_never_the_discovery_session(
+        self, mgr: TmuxManager
+    ) -> None:
+        server = FakeIdServer(next_id=1)
+        mgr._server = cast("Any", server)
+
+        await mgr.reserve_window_ids_past(["@2"])
 
         names = {c[c.index("-s") + 1] for c in server.calls if "-s" in c}
-        assert names == {"_ccgram-reserve"}
+        assert names == {_RESERVE}
+        assert mgr.session_name not in names
         assert all(
-            c[c.index("-t") + 1].startswith("=_ccgram-reserve")
+            c[c.index("-t") + 1].startswith((f"={_RESERVE}", "@"))
             for c in server.calls
             if "-t" in c
         )
+
+    async def test_ids_that_are_not_tmux_ids_count_as_nothing(
+        self, mgr: TmuxManager
+    ) -> None:
+        server = FakeIdServer(next_id=40)
+        mgr._server = cast("Any", server)
+
+        assert await mgr.reserve_window_ids_past(["%3", "pane-9", ""]) is True
+        assert server.next_id == 41
 
     async def test_a_counter_already_past_the_highest_burns_one_id(
         self, mgr: TmuxManager
@@ -524,7 +568,7 @@ class TestReserveWindowIds:
         server = FakeIdServer(next_id=40)
         mgr._server = cast("Any", server)
 
-        assert await mgr.reserve_window_ids_above(5) is True
+        assert await mgr.reserve_window_ids_past(["@5"]) is True
         assert server.next_id == 41
 
     async def test_an_unconfirmed_id_is_a_failure_and_the_session_is_still_removed(
@@ -534,8 +578,8 @@ class TestReserveWindowIds:
         server.unparseable_from = 3
         mgr._server = cast("Any", server)
 
-        assert await mgr.reserve_window_ids_above(10) is False
-        assert server.calls[-1] == ("kill-session", "-t", "=_ccgram-reserve")
+        assert await mgr.reserve_window_ids_past(["@10"]) is False
+        assert server.calls[-1] == ("kill-session", "-t", f"={_RESERVE}")
 
     async def test_a_runaway_highest_stops_at_the_window_cap(
         self, mgr: TmuxManager, monkeypatch: pytest.MonkeyPatch
@@ -544,7 +588,7 @@ class TestReserveWindowIds:
         server = FakeIdServer(next_id=1)
         mgr._server = cast("Any", server)
 
-        assert await mgr.reserve_window_ids_above(10**9) is False
+        assert await mgr.reserve_window_ids_past([f"@{10**9}"]) is False
         assert server.next_id == 7  # the session plus exactly 5 windows
 
     async def test_a_libtmux_failure_is_a_failure(self, mgr: TmuxManager) -> None:
@@ -552,4 +596,4 @@ class TestReserveWindowIds:
         server.cmd.side_effect = LibTmuxException("boom")
         mgr._server = server
 
-        assert await mgr.reserve_window_ids_above(3) is False
+        assert await mgr.reserve_window_ids_past(["@3"]) is False

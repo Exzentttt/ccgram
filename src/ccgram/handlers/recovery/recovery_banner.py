@@ -8,7 +8,7 @@ Owns the banner the user sees in three situations:
 Public surface:
   - :class:`RecoveryBanner` / :data:`RecoveryMode`
   - :func:`render_banner`, :func:`build_recovery_keyboard`
-  - :func:`_create_and_bind_window` (the window replacement, driven through a
+  - :func:`create_and_bind_window` (the window replacement, driven through a
     :class:`~.recovery_ui.RecoveryUi`) and :func:`_replace_from_callback` (its
     button-tap entry, used by :mod:`resume_picker` after a session is picked)
   - the per-button handlers ``_handle_back/_fresh/_continue/_resume/
@@ -888,7 +888,7 @@ async def _finish_failed_provisioning(
     return False
 
 
-async def _create_and_bind_window(
+async def create_and_bind_window(
     request: ReplacementRequest,
     ui: RecoveryUi,
     bot: Bot,
@@ -916,7 +916,7 @@ async def _replace_from_callback(
 ) -> bool:
     """Run the replacement for a recovery button tap."""
     chat = query.message.chat if query.message else None
-    return await _create_and_bind_window(
+    return await create_and_bind_window(
         replace(request, chat_id=getattr(chat, "id", None)),
         CallbackUi(query, context),
         context.bot,

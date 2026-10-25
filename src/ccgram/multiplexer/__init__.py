@@ -17,9 +17,10 @@ bootstrap and raises a clear error before wiring.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from typing import Any, cast
 
-from ccgram.multiplexer.base import Multiplexer
+from ccgram.multiplexer.base import Multiplexer, WindowIdReserver
 from ccgram.multiplexer.registry import (
     UnknownMultiplexerError,
     get_multiplexer,
@@ -34,6 +35,7 @@ __all__ = [
     "install_multiplexer",
     "multiplexer",
     "multiplexer_names",
+    "reserve_window_ids_past",
 ]
 
 
@@ -86,3 +88,11 @@ class _MultiplexerProxy:
 
 
 multiplexer: Multiplexer = cast("Multiplexer", _MultiplexerProxy())
+
+
+async def reserve_window_ids_past(window_ids: Iterable[str]) -> bool:
+    """Reserve through the wired backend; False when it has no such capability."""
+    backend = get_active_multiplexer()
+    if isinstance(backend, WindowIdReserver):
+        return await backend.reserve_window_ids_past(window_ids)
+    return False

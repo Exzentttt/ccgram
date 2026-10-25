@@ -29,7 +29,7 @@ import contextlib
 import re
 import structlog
 import subprocess
-from collections.abc import AsyncGenerator, Sequence
+from collections.abc import AsyncGenerator, Iterable, Sequence
 from pathlib import Path
 
 import libtmux
@@ -73,7 +73,8 @@ __all__ = [
 
 logger = structlog.get_logger()
 
-_RESERVE_SESSION = "_ccgram-reserve"
+_RESERVE_SESSION_PREFIX = "_ccgram-reserve-"
+_WINDOW_ID = re.compile(r"@(\d+)")
 _RESERVE_MAX_WINDOWS = 10_000
 
 # Backward-compat alias: callers still import ``TmuxWindow`` from this module.
@@ -1121,13 +1122,17 @@ class TmuxManager:
             return None
         return (result.stdout[0].strip() or None) if result.stdout else None
 
-    async def reserve_window_ids_above(self, highest: int) -> bool:
-        """Burn window ids in a throwaway session until the next one exceeds ``highest``.
+    async def reserve_window_ids_past(self, window_ids: Iterable[str]) -> bool:
+        """Burn ids (``@N`` only grow) until the next exceeds every one given.
 
-        tmux window ids are server-global and only grow, so afterwards no new
-        window can take an id at or below ``highest``. The session is named
-        with a leading underscore, which window discovery never adopts.
+        Each id is burned by creating a window in a throwaway per-instance
+        session and killing it at once; discovery lists only ``session_name``,
+        so that session is never adopted.
         """
+        highest = max(
+            (int(m[1]) for wid in window_ids if (m := _WINDOW_ID.fullmatch(wid))),
+            default=0,
+        )
         try:
             return await asyncio.to_thread(self._reserve_window_ids, highest)
         except LibTmuxException:
@@ -1135,13 +1140,16 @@ class TmuxManager:
             return False
 
     def _reserve_window_ids(self, highest: int) -> bool:
-        target = f"={_RESERVE_SESSION}"
+        session = f"{_RESERVE_SESSION_PREFIX}{self.session_name}"
+        target = f"={session}"
         self.server.cmd("kill-session", "-t", target)  # a leftover of a crash
-        last = self._created_window_number("new-session", "-d", "-s", _RESERVE_SESSION)
+        last = self._created_window_number("new-session", "-d", "-s", session)
         for _ in range(_RESERVE_MAX_WINDOWS):
             if last is None or last > highest:
                 break
             last = self._created_window_number("new-window", "-d", "-t", f"{target}:")
+            if last is not None:  # the session's first window keeps it alive
+                self.server.cmd("kill-window", "-t", f"@{last}")
         killed = self.server.cmd("kill-session", "-t", target)
         if killed.stderr:
             logger.warning(
@@ -1152,7 +1160,7 @@ class TmuxManager:
     def _created_window_number(self, *args: str) -> int | None:
         result = self.server.cmd(*args, "-P", "-F", "#{window_id}")
         match = (
-            re.fullmatch(r"@(\d+)", result.stdout[0].strip()) if result.stdout else None
+            _WINDOW_ID.fullmatch(result.stdout[0].strip()) if result.stdout else None
         )
         return int(match[1]) if match else None
 

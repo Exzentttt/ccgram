@@ -16,9 +16,20 @@ import json
 from collections.abc import Sequence
 
 import pytest
+from unittest.mock import AsyncMock, patch
 
-from ccgram.multiplexer import UnknownMultiplexerError, get_multiplexer
-from ccgram.multiplexer.base import Multiplexer, MultiplexerCapabilities
+from ccgram.multiplexer import (
+    UnknownMultiplexerError,
+    _reset_multiplexer_for_testing,
+    get_multiplexer,
+    install_multiplexer,
+    reserve_window_ids_past,
+)
+from ccgram.multiplexer.base import (
+    Multiplexer,
+    MultiplexerCapabilities,
+    WindowIdReserver,
+)
 
 # Every backend the contract should hold for. Unregistered names skip.
 CANDIDATE_BACKENDS = ["tmux", "herdr", "agterm"]
@@ -53,7 +64,6 @@ CONTRACT_METHODS = (
     "get_pane_title",
     "stamp_pane_title",
     "server_boot_id",
-    "reserve_window_ids_above",
 )
 
 
@@ -431,6 +441,29 @@ async def test_backends_without_a_server_clock_report_no_boot_id(name: str) -> N
 
 
 @pytest.mark.parametrize("name", ["herdr", "agterm"])
-async def test_backends_that_cannot_advance_window_ids_say_so(name: str) -> None:
+def test_only_tmux_can_reserve_window_ids(name: str) -> None:
     """Auto-restore must not create windows where a stale id could collide."""
-    assert await _backend_or_skip(name).reserve_window_ids_above(10) is False
+    assert isinstance(get_multiplexer("tmux"), WindowIdReserver)
+    assert not isinstance(_backend_or_skip(name), WindowIdReserver)
+
+
+@pytest.mark.parametrize("name", ["herdr", "agterm"])
+async def test_the_proxy_reports_no_reservation_for_other_backends(name: str) -> None:
+    install_multiplexer(_backend_or_skip(name))
+    try:
+        assert await reserve_window_ids_past(["@1"]) is False
+    finally:
+        _reset_multiplexer_for_testing()
+
+
+async def test_the_proxy_delegates_reservation_to_a_backend_that_has_it() -> None:
+    tmux = get_multiplexer("tmux")
+    install_multiplexer(tmux)
+    try:
+        with patch.object(
+            type(tmux), "reserve_window_ids_past", AsyncMock(return_value=True)
+        ) as reserve:
+            assert await reserve_window_ids_past(["@4"]) is True
+        reserve.assert_awaited_once_with(["@4"])
+    finally:
+        _reset_multiplexer_for_testing()

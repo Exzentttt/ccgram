@@ -12,7 +12,7 @@ refactor in Task 2 is mechanical.
 
 from __future__ import annotations
 
-from collections.abc import AsyncGenerator, Sequence
+from collections.abc import AsyncGenerator, Iterable, Sequence
 from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 
@@ -375,15 +375,6 @@ class Multiplexer(Protocol):
         """
         ...
 
-    async def reserve_window_ids_above(self, highest: int) -> bool:
-        """Advance the window-id counter so every new window's number exceeds ``highest``.
-
-        Returns False when the backend cannot do that or could not confirm it did;
-        the caller must then not create windows that a stale id could collide with.
-        tmux: burns ids in a throwaway session. herdr, agterm: always False.
-        """
-        ...
-
     async def pane_dims(self, window_id: str) -> PaneDims | None:
         """Return the active pane's column/row dimensions.
 
@@ -621,4 +612,13 @@ class Multiplexer(Protocol):
         tmux: ``select-pane -T ccgram:<provider>``.
         herdr: ``pane report-metadata --title``.
         """
+        ...
+
+
+@runtime_checkable
+class WindowIdReserver(Protocol):
+    """Optional capability: window ids only grow and can be skipped."""
+
+    async def reserve_window_ids_past(self, window_ids: Iterable[str]) -> bool:
+        """Advance the counter past ``window_ids``; False if that is unconfirmed."""
         ...

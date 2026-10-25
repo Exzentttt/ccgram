@@ -1,6 +1,6 @@
 """Presentation seam for the recovery window-replacement flow.
 
-``recovery_banner._create_and_bind_window`` replaces a topic's dead window
+``recovery_banner.create_and_bind_window`` replaces a topic's dead window
 with a new one. Every Fresh / Continue / Resume button reaches it through a
 Telegram callback, but the replacement itself needs no callback: it only
 reports progress and reads or clears the pending-recovery state. This module

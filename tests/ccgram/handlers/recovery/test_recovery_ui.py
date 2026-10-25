@@ -35,7 +35,7 @@ from ccgram.handlers.user_state import (
 )
 
 # After Round 5 split: _handle_fresh/continue/resume/back/cancel/browse,
-# _create_and_bind_window, build_recovery_keyboard, _recovery_help_text,
+# create_and_bind_window, build_recovery_keyboard, _recovery_help_text,
 # scan_sessions_for_cwd (re-imported here), session_manager, thread_router,
 # tmux_manager, etc. all live in recovery_banner. Keeping the constant name
 # minimises diff against pre-split tests.

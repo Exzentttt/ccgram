@@ -7,11 +7,10 @@ still on disk, through the replacement flow the Resume button uses.
 One confirmed window listing builds a plan before anything is created: window
 ids restart with the server, so a stale id may already name a live window, and
 such a binding is never resumed into. Before the first create the multiplexer
-advances its window-id counter past every stale id any binding holds, so no new
-window can take another topic's old id and no binding is evicted by the run.
-The plan is saved to a ledger keyed by the server boot id, which makes an
-attempt once per (chat, topic, session) per boot and lets the next start finish
-a plan a crash cut short.
+advances its window-id counter past every id any binding holds, so no new window
+takes another topic's old id. The plan is saved to a ledger keyed by the server
+boot id: one attempt per (chat, topic, session) per boot, and the next start
+finishes a plan a crash cut short.
 
 Public surface: :func:`start_auto_restore`.
 """
@@ -21,7 +20,6 @@ from __future__ import annotations
 import asyncio
 import glob
 import json
-import re
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -31,14 +29,15 @@ import structlog
 
 from ... import window_query
 from ...config import config
-from ...multiplexer import multiplexer
+from ...multiplexer import multiplexer, reserve_window_ids_past
 from ...multiplexer.base import WindowRef
 from ...multiplexer.reconciliation import list_windows_for_reconciliation
+from ...providers._resume import discover_claude_sessions
 from ...providers.codex import codex_sessions_dir
 from ...thread_router import thread_router
 from ...utils import atomic_write_json, task_done_callback
 from ..topics import topic_orchestration
-from .recovery_banner import _create_and_bind_window
+from .recovery_banner import create_and_bind_window
 from .recovery_ui import HeadlessUi, ReplacementRequest
 
 if TYPE_CHECKING:
@@ -57,7 +56,6 @@ _PENDING, _ATTEMPTING, _DONE, _FAILED = "pending", "attempting", "done", "failed
 _STATUSES = frozenset({_PENDING, _ATTEMPTING, _DONE, _FAILED})
 _ATTEMPTED = frozenset({_ATTEMPTING, _DONE, _FAILED})
 _WHERE = ("chat_id", "thread_id", "window_id")
-_TMUX_WINDOW_ID = re.compile(r"@(\d+)")
 
 
 @dataclass(frozen=True)
@@ -155,11 +153,9 @@ def _codex_rollout_exists(session_id: str) -> bool:
 
 
 def _claude_transcript_exists(entry: RestoreEntry) -> bool:
-    # Same path SessionResolver._build_session_file_path builds.
-    encoded_cwd = entry.cwd.replace("/", "-")
-    return (
-        config.claude_projects_path / encoded_cwd / f"{entry.session_id}.jsonl"
-    ).is_file()
+    # By the cwd inside each transcript: the folder name also encodes dots.
+    found = discover_claude_sessions(config.claude_projects_path, cwd=entry.cwd)
+    return any(session.session_id == entry.session_id for session in found)
 
 
 async def _session_exists(entry: RestoreEntry) -> bool | None:
@@ -252,16 +248,6 @@ async def _build_plan(ledger: _Ledger) -> list[RestoreEntry]:
     return list(planned.values())
 
 
-def _highest_window_number() -> int:
-    """The largest tmux window number any binding (planned or not) still holds."""
-    numbers = (
-        int(match[1])
-        for _user, _chat, _thread, window_id in thread_router.iter_thread_bindings_with_chat()
-        if (match := _TMUX_WINDOW_ID.fullmatch(window_id))
-    )
-    return max(numbers, default=0)
-
-
 async def _pause(seconds: float) -> None:
     await asyncio.sleep(seconds)
 
@@ -310,7 +296,7 @@ async def _restore_one(
     ledger.set_status(entry.key, _ATTEMPTING)
     ui = HeadlessUi()
     try:
-        restored = await _create_and_bind_window(_request(entry), ui, bot, get_adapter)
+        restored = await create_and_bind_window(_request(entry), ui, bot, get_adapter)
     except Exception:
         logger.exception("auto_restore_failed", key=entry.key)
         ledger.set_status(entry.key, _FAILED)
@@ -322,11 +308,19 @@ async def _restore_one(
 
 async def _run(
     plan: list[RestoreEntry],
+    stale_ids: list[str],
     ledger: _Ledger,
     bot: Bot,
     get_adapter: Callable[[], TelegramSessionAdapter],
 ) -> None:
-    """Restore the plan; wait out a rate limit up to a bounded number of times."""
+    """Reserve ids (can take seconds), then restore the plan.
+
+    Waits out a rate limit up to a bounded number of times.
+    """
+    if not await reserve_window_ids_past(stale_ids):
+        logger.warning("auto_restore_skipped", reason="id_reservation_unavailable")
+        return
+    ledger.add_pending(plan)
     waits = 0
     for index, entry in enumerate(plan):
         if index:
@@ -365,19 +359,14 @@ async def start_auto_restore(
             return None
         ledger = _Ledger.load(config.config_dir / _LEDGER_FILE, boot_id)
         plan = await _build_plan(ledger)
-        if plan and not await multiplexer.reserve_window_ids_above(
-            _highest_window_number()
-        ):
-            logger.warning("auto_restore_skipped", reason="id_reservation_unavailable")
-            return None
-        ledger.add_pending(plan)
+        stale_ids = [b[3] for b in thread_router.iter_thread_bindings_with_chat()]
     except Exception:
         logger.exception("auto_restore_failed_to_start")
         return None
     if not plan:
         return None
     task = asyncio.create_task(
-        _run(plan, ledger, bot, get_adapter), name="auto_restore"
+        _run(plan, stale_ids, ledger, bot, get_adapter), name="auto_restore"
     )
     task.add_done_callback(task_done_callback)
     return task

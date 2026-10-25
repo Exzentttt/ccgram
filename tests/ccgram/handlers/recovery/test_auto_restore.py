@@ -12,7 +12,8 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import Mapping, Sequence
+import re
+from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 from types import SimpleNamespace
@@ -49,9 +50,9 @@ class Env:
         self.live: list[WindowRef] | None = [WindowRef("@0", "_ccgram", str(tmp_path))]
         self.states: dict[str, SimpleNamespace] = {}
         self.transcripts: list[Path] = []
-        self.reserved: list[int] = []
+        self.reserved: list[list[str]] = []
         self.reserve_ok = True
-        self.next_ids: list[str] = []
+        self.next_id = 1  # a fresh tmux server hands out @1 next
         self.created: list[tuple[dict, dict]] = []
         self.rename_error: Exception | None = None
         self.create_error: BaseException | None = None
@@ -63,7 +64,7 @@ class Env:
         self.pause = AsyncMock()
         self.mux = MagicMock()
         self.mux.server_boot_id = AsyncMock(side_effect=lambda: self.boot)
-        self.mux.reserve_window_ids_above = AsyncMock(side_effect=self.reserve)
+        self.reserve_call = AsyncMock(side_effect=self.reserve)
         self.adapter = MagicMock()
         self.adapter.create = AsyncMock(side_effect=self.create)
         self.adapter.close = AsyncMock(return_value=(True, "Closed"))
@@ -104,9 +105,9 @@ class Env:
             self.transcript(cwd, session)
 
     def transcript(self, cwd: str, session: str) -> None:
-        folder = self.tmp / "claude" / "projects" / cwd.replace("/", "-")
+        folder = self.tmp / "claude" / "projects" / re.sub(r"[^A-Za-z0-9]", "-", cwd)
         folder.mkdir(parents=True, exist_ok=True)
-        (folder / f"{session}.jsonl").write_text("{}\n")
+        (folder / f"{session}.jsonl").write_text(json.dumps({"cwd": cwd}) + "\n")
         self.transcripts.append(folder / f"{session}.jsonl")
 
     def forget_sessions(self) -> None:
@@ -114,8 +115,12 @@ class Env:
             path.unlink()
         self.transcripts.clear()
 
-    async def reserve(self, highest: int) -> bool:
-        self.reserved.append(highest)
+    async def reserve(self, window_ids: Iterable[str]) -> bool:
+        ids = list(window_ids)
+        self.reserved.append(ids)
+        if self.reserve_ok:
+            highest = max((int(wid[1:]) for wid in ids), default=0)
+            self.next_id = max(self.next_id, highest + 1)
         return self.reserve_ok
 
     def codex_rollout(self, session: str) -> None:
@@ -130,8 +135,8 @@ class Env:
         if self.create_error is not None:
             raise self.create_error
         self.created.append((data, kwargs))
-        wid = self.next_ids.pop(0)
-        assert int(wid[1:]) > max(self.reserved, default=0), "id below a stale id"
+        wid = f"@{self.next_id}"
+        self.next_id += 1
         title = Path(data["directory"]).name
         assert self.live is not None
         self.live.append(WindowRef(wid, title, data["directory"]))
@@ -187,6 +192,7 @@ def env(tmp_path, monkeypatch):
         patch(f"{_AR}.thread_router", world.router),
         patch(f"{_RC}.thread_router", world.router),
         patch(f"{_AR}.multiplexer", mux),
+        patch(f"{_AR}.reserve_window_ids_past", world.reserve_call),
         patch(f"{_AR}.list_windows_for_reconciliation", listing),
         patch(f"{_AR}.window_query.view_window", view_window),
         patch(f"{_AR}._pause", world.pause),
@@ -211,7 +217,6 @@ class TestGates:
     async def test_flag_off_touches_nothing(self, env, monkeypatch) -> None:
         monkeypatch.setattr(config, "auto_restore_on_start", False)
         env.dead_topic(1, "@1")
-        env.next_ids = ["@7"]
 
         assert await env.start() is None
 
@@ -266,18 +271,17 @@ class TestGates:
 class TestHappyPath:
     async def test_claude_topic_resumes_its_own_session(self, env) -> None:
         env.dead_topic(1, "@1", session="sess-1", mode="yolo")
-        env.next_ids = ["@7"]
 
         await env.start()
 
         ((data, kwargs),) = env.created
-        assert data == {"provider": "claude", "directory": env.states["@7"].cwd}
+        assert data == {"provider": "claude", "directory": env.states["@2"].cwd}
         assert kwargs == {
             "approval_mode": "yolo",
             "resume_id": "sess-1",
             "continue_session": False,
         }
-        assert env.bound(1) == "@7"
+        assert env.bound(1) == "@2"
         env.stale.assert_not_called()
         assert env.ledger_status() == {1: "done"}
 
@@ -287,11 +291,19 @@ class TestHappyPath:
         env.dead_topic(1, "@1", session="old-one")
         for n in range(8):  # the resume picker lists only the newest few
             env.transcript(env.states["@1"].cwd, f"newer-{n}")
-        env.next_ids = ["@7"]
 
         await env.start()
 
         assert [kw["resume_id"] for _, kw in env.created] == ["old-one"]
+
+    async def test_a_cwd_with_dots_finds_its_transcript(self, env) -> None:
+        cwd = env.tmp / "repo" / ".worktrees" / "v1.2"
+        cwd.mkdir(parents=True)
+        env.dead_topic(1, "@1", session="dotted", cwd=str(cwd))
+
+        await env.start()
+
+        assert [kw["resume_id"] for _, kw in env.created] == ["dotted"]
 
     async def test_other_transcripts_in_the_folder_do_not_vouch_for_the_session(
         self, env
@@ -308,19 +320,17 @@ class TestHappyPath:
     async def test_codex_topic_resumes_when_its_rollout_exists(self, env) -> None:
         env.dead_topic(1, "@1", session="cdx-1", provider="codex")
         env.codex_rollout("cdx-1")
-        env.next_ids = ["@7"]
 
         await env.start()
 
         ((data, kwargs),) = env.created
         assert data["provider"] == "codex"
         assert kwargs["resume_id"] == "cdx-1"
-        assert env.bound(1) == "@7"
+        assert env.bound(1) == "@2"
 
     async def test_candidates_are_paused_between_not_before(self, env) -> None:
         for thread in (1, 2, 3):
             env.dead_topic(thread, f"@{thread}", session=f"s{thread}")
-        env.next_ids = ["@7", "@8", "@9"]
 
         await env.start()
 
@@ -330,7 +340,6 @@ class TestHappyPath:
     async def test_the_plan_is_on_disk_before_the_first_create(self, env) -> None:
         env.dead_topic(1, "@1", session="s1")
         env.dead_topic(2, "@2", session="s2")
-        env.next_ids = ["@7", "@8"]
         seen: list[dict[int, str]] = []
         original = env.create
 
@@ -374,7 +383,6 @@ class TestSkips:
         self, env, reason: str
     ) -> None:
         _SKIPS[reason](env)
-        env.next_ids = ["@7"]
 
         with capture_logs() as logs:
             await env.start()
@@ -435,7 +443,6 @@ class TestSkips:
         self, env
     ) -> None:
         env.dead_topic(1, "@0", name="proj1")  # the bot's own `_ccgram` is @0
-        env.next_ids = ["@7"]
 
         with capture_logs() as logs:
             await env.start()
@@ -502,7 +509,6 @@ class TestSkips:
     ) -> None:
         env.dead_topic(1, "@1", session="same", name="proj")
         env.dead_topic(2, "@2", session="same", name="proj")
-        env.next_ids = ["@7", "@8"]
 
         with capture_logs() as logs:
             await env.start()
@@ -518,19 +524,17 @@ class TestIdReservation:
         env.dead_topic(1, "@1", session="sess-A", name="alpha")
         env.dead_topic(2, "@2", session="sess-B", name="beta")
         env.dead_topic(3, "@5", session="sess-C", name="gamma", known_session=False)
-        env.next_ids = ["@7", "@8"]
 
         await env.start()
 
-        assert env.reserved == [5]  # the skipped topic's id counts too
-        assert [env.bound(t) for t in (1, 2, 3)] == ["@7", "@8", "@5"]
+        assert [sorted(ids) for ids in env.reserved] == [["@1", "@2", "@5"]]
+        assert [env.bound(t) for t in (1, 2, 3)] == ["@6", "@7", "@5"]
 
     async def test_a_failed_resume_never_retires_another_topic_for_deletion(
         self, env
     ) -> None:
-        env.dead_topic(1, "@1", session="sess-A", name="alpha")
-        env.dead_topic(2, "@2", session="sess-B", name="beta")
-        env.next_ids = ["@7", "@8"]
+        env.dead_topic(1, "@2", session="sess-A", name="alpha")
+        env.dead_topic(2, "@1", session="sess-B", name="beta")
         original = env.create
         calls: list[str] = []
 
@@ -545,14 +549,14 @@ class TestIdReservation:
         await env.start()
 
         assert list(env.router.iter_retired_topics()) == []
-        assert env.bound(2) == "@2"
+        assert env.bound(2) == "@1"
 
     async def test_an_unavailable_reservation_creates_nothing(self, env) -> None:
         env.dead_topic(1, "@1", session="s1")
         env.reserve_ok = False
 
         with capture_logs() as logs:
-            assert await env.start() is None
+            await env.start()
 
         env.adapter.create.assert_not_called()
         assert not (env.tmp / "auto_restore.json").exists()
@@ -560,12 +564,31 @@ class TestIdReservation:
             log["reason"] for log in logs if log["event"] == "auto_restore_skipped"
         ] == ["id_reservation_unavailable"]
 
+    async def test_startup_does_not_wait_for_the_reservation(self, env) -> None:
+        env.dead_topic(1, "@1", session="s1")
+        release = asyncio.Event()
+
+        async def slow(window_ids):
+            await release.wait()
+            return True
+
+        env.reserve_call.side_effect = slow
+
+        task = await auto_restore.start_auto_restore(MagicMock(), lambda: env.adapter)
+
+        assert task is not None
+        assert not task.done()
+        env.adapter.create.assert_not_called()
+        release.set()
+        await task
+        assert len(env.created) == 1
+
     async def test_an_empty_plan_reserves_nothing(self, env) -> None:
         env.dead_topic(1, "@1", known_session=False)
 
         await env.start()
 
-        env.mux.reserve_window_ids_above.assert_not_called()
+        env.reserve_call.assert_not_called()
 
 
 class TestChangesDuringTheRun:
@@ -573,7 +596,6 @@ class TestChangesDuringTheRun:
     def second_topic(self, env):
         env.dead_topic(1, "@1", session="sess-A", name="alpha")
         env.dead_topic(2, "@2", session="sess-B", name="beta")
-        env.next_ids = ["@7", "@8"]
         return env.states["@2"].cwd
 
     def start_session_b(self, env, cwd: str, *, bind: bool):
@@ -637,13 +659,11 @@ class TestRateLimit:
     def five_topics(self, env):
         for thread in range(1, 6):
             env.dead_topic(thread, f"@{thread}", session=f"s{thread}")
-        env.next_ids = ["@7", "@8", "@9", "@10", "@11"]
         env.rename_error = RetryAfter(30)
 
     async def test_a_retry_after_is_waited_out_and_the_run_goes_on(self, env) -> None:
         for thread in (1, 2):
             env.dead_topic(thread, f"@{thread}", session=f"s{thread}")
-        env.next_ids = ["@7", "@8"]
         env.rename_error = RetryAfter(30)
 
         await env.start()
@@ -657,7 +677,6 @@ class TestRateLimit:
 
     async def test_a_long_retry_after_wait_is_capped(self, env) -> None:
         env.dead_topic(1, "@1", session="s1")
-        env.next_ids = ["@7"]
         env.rename_error = RetryAfter(3600)
 
         await env.start()
@@ -717,7 +736,6 @@ class TestFailures:
 class TestLedger:
     async def test_second_startup_creates_nothing(self, env) -> None:
         env.dead_topic(1, "@1", session="s1")
-        env.next_ids = ["@7", "@8"]
         await env.start()
         assert len(env.created) == 1
 
@@ -732,12 +750,11 @@ class TestLedger:
         self, env
     ) -> None:
         env.dead_topic(1, "@1", session="s1")
-        env.next_ids = ["@7", "@8"]
         await env.start()
-        assert env.bound(1) == "@7"
+        assert env.bound(1) == "@2"
         await env.start()  # a restart while the window is alive
         assert env.live is not None
-        env.live[:] = [w for w in env.live if w.window_id != "@7"]  # user kills it
+        env.live[:] = [w for w in env.live if w.window_id != "@2"]  # user kills it
 
         with capture_logs() as logs:
             await env.start()
@@ -748,10 +765,9 @@ class TestLedger:
 
     async def test_a_new_boot_replaces_the_done_rows_of_the_old_one(self, env) -> None:
         env.dead_topic(1, "@1", session="s1")
-        env.next_ids = ["@7", "@8"]
         await env.start()
         assert env.live is not None
-        env.live[:] = [w for w in env.live if w.window_id != "@7"]
+        env.live[:] = [w for w in env.live if w.window_id != "@2"]
         env.boot = "boot-2"
 
         await env.start()
@@ -762,7 +778,6 @@ class TestLedger:
 
     async def test_a_failed_topic_is_not_retried_in_the_same_boot(self, env) -> None:
         env.dead_topic(1, "@1", session="s1")
-        env.next_ids = ["@7", "@8"]
         env.create_error = ProtocolError(400, "invalid_request", "bad")
         await env.start()
         env.create_error = None
@@ -775,7 +790,6 @@ class TestLedger:
 
     async def test_a_new_boot_allows_another_attempt(self, env) -> None:
         env.dead_topic(1, "@1", session="s1")
-        env.next_ids = ["@7"]
         env.create_error = ProtocolError(400, "invalid_request", "bad")
         await env.start()
         env.create_error = None
@@ -785,14 +799,13 @@ class TestLedger:
 
         assert len(env.created) == 1
         assert env.ledger["boot_id"] == "boot-2"
-        assert env.bound(1) == "@7"
+        assert env.bound(1) == "@2"
 
     async def test_a_crash_between_topics_leaves_the_rest_for_the_next_start(
         self, env
     ) -> None:
         env.dead_topic(1, "@1", session="sess-A", name="alpha")
         env.dead_topic(2, "@2", session="sess-B", name="beta", mode="yolo")
-        env.next_ids = ["@7", "@8"]
         env.pause.side_effect = asyncio.CancelledError  # the "crash" after A
 
         with pytest.raises(asyncio.CancelledError):
@@ -807,14 +820,13 @@ class TestLedger:
         assert kwargs["resume_id"] == "sess-B"
         assert kwargs["approval_mode"] == "yolo"
         assert data["directory"].endswith("/beta")
-        assert env.bound(2) == "@8"
+        assert env.bound(2) == "@4"
 
     async def test_a_ledger_row_whose_session_vanished_is_not_restored(
         self, env
     ) -> None:
         env.dead_topic(1, "@1", session="sess-A", name="alpha")
         env.dead_topic(2, "@2", session="sess-B", name="beta")
-        env.next_ids = ["@7", "@8"]
         env.pause.side_effect = asyncio.CancelledError
         with pytest.raises(asyncio.CancelledError):
             await env.start()
@@ -831,7 +843,6 @@ class TestLedger:
 
     async def test_the_ledger_file_carries_a_version(self, env) -> None:
         env.dead_topic(1, "@1", session="s1")
-        env.next_ids = ["@7"]
 
         await env.start()
 
@@ -841,7 +852,6 @@ class TestLedger:
         self, env
     ) -> None:
         env.dead_topic(1, "@1", session="s1")
-        env.next_ids = ["@7"]
         self.write_ledger(env, version=2)
 
         with capture_logs() as logs:
@@ -852,7 +862,6 @@ class TestLedger:
 
     async def test_a_row_that_is_not_an_object_never_breaks_startup(self, env) -> None:
         env.dead_topic(1, "@1", session="s1")
-        env.next_ids = ["@7"]
         self.write_ledger(env, entries=["junk"])
 
         with capture_logs() as logs:
@@ -863,7 +872,6 @@ class TestLedger:
 
     async def test_a_row_with_an_unknown_status_counts_as_attempted(self, env) -> None:
         env.dead_topic(1, "@1", session="s1")
-        env.next_ids = ["@7"]
         env.create_error = ProtocolError(400, "invalid_request", "bad")
         await env.start()
         env.create_error = None
@@ -879,7 +887,6 @@ class TestLedger:
 
     async def test_a_corrupt_ledger_starts_empty(self, env) -> None:
         env.dead_topic(1, "@1", session="s1")
-        env.next_ids = ["@7"]
         (env.tmp / "auto_restore.json").write_text("{not json")
 
         await env.start()
