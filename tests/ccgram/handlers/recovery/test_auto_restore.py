@@ -327,14 +327,31 @@ class TestHappyPath:
 
         assert [kw["resume_id"] for _, kw in env.created] == ["good"]
 
-    async def test_a_topic_cwd_that_is_a_symlink_finds_the_transcript(
+    async def test_an_undecodable_transcript_never_blocks_another_topic(
         self, env
+    ) -> None:
+        env.dead_topic(1, "@1", session="bad", name="alpha", known_session=False)
+        bad = env.tmp / "claude" / "projects" / "x" / "bad.jsonl"
+        bad.parent.mkdir(parents=True)
+        bad.write_bytes(b"\xff\xfe\n")
+        env.dead_topic(2, "@2", session="good", name="beta")
+
+        await env.start()
+
+        assert [kw["resume_id"] for _, kw in env.created] == ["good"]
+
+    @pytest.mark.parametrize("topic_cwd_is_link", [True, False])
+    async def test_a_symlinked_cwd_finds_the_transcript(
+        self, env, topic_cwd_is_link: bool
     ) -> None:
         real = Path(env.project("real"))
         link = env.tmp / "link"
         link.symlink_to(real)
-        env.dead_topic(1, "@1", session="linked", cwd=str(link), known_session=False)
-        env.transcript(str(real), "linked")
+        topic_cwd, transcript_cwd = (link, real) if topic_cwd_is_link else (real, link)
+        env.dead_topic(
+            1, "@1", session="linked", cwd=str(topic_cwd), known_session=False
+        )
+        env.transcript(str(transcript_cwd), "linked")
 
         await env.start()
 
