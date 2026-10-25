@@ -12,7 +12,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
+import subprocess
+import sys
 from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -25,6 +28,7 @@ from telegram.error import RetryAfter
 
 from ccgram.config import config
 from ccgram.handlers.recovery import auto_restore
+from ccgram.handlers.recovery.recovery_ui import HeadlessUi
 from ccgram.handlers.topics import topic_orchestration
 from ccgram.multiplexer.base import WindowRef
 from ccgram.session_protocol.backend import CreationOptions, MultiplexerSessionBackend
@@ -68,6 +72,33 @@ class Env:
         self.adapter = MagicMock()
         self.adapter.create = AsyncMock(side_effect=self.create)
         self.adapter.close = AsyncMock(return_value=(True, "Closed"))
+        self.lsof_result: tuple[int, bytes] | BaseException = (1, b"")
+        self.lsof_hangs = False
+        self.lsof_calls: list[tuple[Any, ...]] = []
+        self.lsof_exec = AsyncMock(side_effect=self.fake_lsof)
+
+    async def fake_lsof(self, *argv: str, **_kwargs: Any) -> MagicMock:
+        self.lsof_calls.append(argv)
+        if isinstance(self.lsof_result, BaseException):
+            raise self.lsof_result
+        code, out = self.lsof_result
+        proc = MagicMock(returncode=None)
+        proc.wait = AsyncMock()
+
+        async def communicate():
+            if self.lsof_hangs:
+                await asyncio.sleep(3600)
+            proc.returncode = code
+            return out, b""
+
+        proc.communicate = communicate
+        return proc
+
+    def claude_registry(self, session: str, pid: int) -> None:
+        folder = self.tmp / "claude" / "sessions"
+        folder.mkdir(parents=True, exist_ok=True)
+        data = {"pid": pid, "sessionId": session, "procStart": "x"}
+        (folder / f"{pid}.json").write_text(json.dumps(data))
 
     def project(self, name: str) -> str:
         path = self.tmp / name
@@ -199,6 +230,7 @@ def env(tmp_path, monkeypatch):
         patch(f"{_AR}.list_windows_for_reconciliation", listing),
         patch(f"{_AR}.window_query.view_window", view_window),
         patch(f"{_AR}._pause", world.pause),
+        patch(f"{_AR}.asyncio.create_subprocess_exec", world.lsof_exec),
         patch(f"{_RC}.session_manager"),
         patch(f"{_RC}.PTBTelegramClient", MagicMock(return_value=client)),
         patch(f"{_RC}._stale_recovery_offer", world.stale),
@@ -568,6 +600,93 @@ class TestSkips:
         env.adapter.create.assert_not_called()
         assert _skips(logs) == ["session_already_live"]
 
+    async def test_claude_session_live_in_another_tmux_is_not_resumed(
+        self, env
+    ) -> None:
+        env.dead_topic(1, "@1", session="sess-1")
+        env.claude_registry("sess-1", os.getpid())
+
+        with capture_logs() as logs:
+            await env.start()
+
+        env.adapter.create.assert_not_called()
+        assert _skips(logs) == ["session_live"]
+
+    async def test_claude_registry_entry_of_a_dead_pid_does_not_block(
+        self, env
+    ) -> None:
+        env.dead_topic(1, "@1", session="sess-1")
+        gone = subprocess.Popen([sys.executable, "-c", "pass"])
+        gone.wait()
+        env.claude_registry("sess-1", gone.pid)
+        (env.tmp / "claude" / "sessions" / "junk.json").write_text("{not json")
+        (env.tmp / "claude" / "sessions" / "x.key").write_text("never-read")
+
+        await env.start()
+
+        assert len(env.created) == 1
+
+    async def test_codex_rollout_open_by_a_process_is_live(self, env) -> None:
+        env.dead_topic(1, "@1", session="cdx-1", provider="codex")
+        env.codex_rollout("cdx-1")
+        env.lsof_result = (0, b"4242\n")
+
+        with capture_logs() as logs:
+            await env.start()
+
+        env.adapter.create.assert_not_called()
+        assert _skips(logs) == ["session_live"]
+        assert env.lsof_calls[0][:3] == ("lsof", "-t", "--")
+
+    @pytest.mark.parametrize(
+        "outcome",
+        [(2, b""), (0, b""), (1, b"4242\n"), FileNotFoundError("lsof"), "timeout"],
+    )
+    async def test_codex_lsof_failure_is_unconfirmed_never_not_live(
+        self, env, monkeypatch, outcome
+    ) -> None:
+        env.dead_topic(1, "@1", session="cdx-1", provider="codex")
+        env.codex_rollout("cdx-1")
+        if outcome == "timeout":
+            env.lsof_hangs = True
+            monkeypatch.setattr(auto_restore, "_LSOF_TIMEOUT_S", 0.01)
+        else:
+            env.lsof_result = outcome
+
+        with capture_logs() as logs:
+            await env.start()
+
+        env.adapter.create.assert_not_called()
+        assert _skips(logs) == ["liveness_unconfirmed"]
+
+    async def test_codex_rollout_not_open_is_resumed(self, env) -> None:
+        env.dead_topic(1, "@1", session="cdx-1", provider="codex")
+        env.codex_rollout("cdx-1")
+        env.lsof_result = (1, b"")
+
+        await env.start()
+
+        assert len(env.created) == 1
+
+    async def test_session_started_elsewhere_after_planning_is_caught_at_restore(
+        self, env
+    ) -> None:
+        env.dead_topic(1, "@1", session="sess-1")
+        entry = auto_restore.RestoreEntry(
+            user_id=_USER,
+            chat_id=_CHAT,
+            thread_id=1,
+            old_window_id="@1",
+            cwd=env.states["@1"].cwd,
+            session_id="sess-1",
+            provider_name="claude",
+            approval_mode="normal",
+            display="proj1",
+        )
+        env.claude_registry("sess-1", os.getpid())
+
+        assert await auto_restore._skip_reason_now(entry) == "session_live"
+
     async def test_one_session_bound_to_two_dead_topics_is_restored_once(
         self, env
     ) -> None:
@@ -650,12 +769,88 @@ class TestIdReservation:
         await task
         assert len(env.created) == 1
 
-    async def test_an_empty_plan_reserves_nothing(self, env) -> None:
+    async def test_an_empty_plan_still_reserves_for_the_dead_binding(self, env) -> None:
         env.dead_topic(1, "@1", known_session=False)
 
         await env.start()
 
+        assert env.reserved == [["@1"]]
+        env.adapter.create.assert_not_called()
+
+
+class TestStartupReservation:
+    @pytest.fixture(autouse=True)
+    def flag_off(self, env, monkeypatch) -> None:
+        monkeypatch.setattr(config, "auto_restore_on_start", False)
+
+    async def test_flag_off_reserves_before_start_returns(self, env) -> None:
+        env.dead_topic(1, "@1")
+        env.dead_topic(2, "@4")
+        done = False
+
+        async def reserve(window_ids):
+            nonlocal done
+            await asyncio.sleep(0)
+            done = True
+            return True
+
+        env.reserve_call.side_effect = reserve
+
+        assert (
+            await auto_restore.start_auto_restore(MagicMock(), lambda: env.adapter)
+            is None
+        )
+
+        assert done
+        env.adapter.create.assert_not_called()
+
+    async def test_autodelete_on_still_reserves(self, env, monkeypatch) -> None:
+        monkeypatch.setattr(config, "autodelete_dead_topics", True)
+        env.dead_topic(1, "@3")
+
+        await env.start()
+
+        assert env.reserved == [["@3"]]
+
+    async def test_every_binding_live_reserves_nothing(self, env) -> None:
+        env.dead_topic(1, "@1", name="proj1")
+        assert env.live is not None
+        env.live.append(WindowRef("@1", "proj1", env.states["@1"].cwd))
+
+        await env.start()
+
         env.reserve_call.assert_not_called()
+
+    async def test_no_bindings_reserves_nothing(self, env) -> None:
+        await env.start()
+
+        env.reserve_call.assert_not_called()
+
+    async def test_a_manual_replacement_gets_an_id_above_every_stale_one(
+        self, env
+    ) -> None:
+        env.dead_topic(1, "@1", session="sess-A", name="alpha")
+        env.dead_topic(2, "@5", session="sess-B", name="beta")
+        await env.start()
+        entry = auto_restore.RestoreEntry(
+            user_id=_USER,
+            chat_id=_CHAT,
+            thread_id=1,
+            old_window_id="@1",
+            cwd=env.states["@1"].cwd,
+            session_id="sess-A",
+            provider_name="claude",
+            approval_mode="normal",
+            display="alpha",
+        )
+
+        restored = await auto_restore.create_and_bind_window(
+            auto_restore._request(entry), HeadlessUi(), MagicMock(), lambda: env.adapter
+        )
+
+        assert restored
+        assert env.bound(1) == "@6"
+        assert env.bound(2) == "@5"
 
 
 class TestChangesDuringTheRun:

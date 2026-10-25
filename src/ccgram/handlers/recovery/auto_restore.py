@@ -6,9 +6,10 @@ still on disk, through the replacement flow the Resume button uses.
 
 One confirmed window listing builds a plan before anything is created: window
 ids restart with the server, so a stale id may already name a live window, and
-such a binding is never resumed into. Before the first create the multiplexer
-advances its window-id counter past every id any binding holds, so no new window
-takes another topic's old id. The plan is saved to a ledger keyed by the server
+such a binding is never resumed into. At every start, flag on or off, if a
+binding is dead the window-id counter advances past every bound id, so no new
+window takes another topic's old id. A session running outside the bot's tmux
+session (Claude pid registry, Codex rollout open per ``lsof``) is never resumed. The plan is saved to a ledger keyed by the server
 boot id: one attempt per (chat, topic, session) per boot, and the next start
 finishes a plan a crash cut short.
 
@@ -21,6 +22,7 @@ import asyncio
 import contextlib
 import glob
 import json
+import os
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -48,6 +50,7 @@ if TYPE_CHECKING:
 logger = structlog.get_logger()
 
 GAP_S = 3.0
+_LSOF_TIMEOUT_S = 10.0
 MAX_RATE_LIMIT_WAITS = 3
 MAX_RATE_LIMIT_WAIT_S = 300.0
 _LEDGER_FILE = "auto_restore.json"
@@ -147,9 +150,66 @@ def _skip(reason: str, where: tuple[int | None, int, str]) -> None:
     log("auto_restore_skip", reason=reason, **dict(zip(_WHERE, where, strict=True)))
 
 
-def _codex_rollout_exists(session_id: str) -> bool:
+def _codex_rollouts(session_id: str) -> list[Path]:
     pattern = f"rollout-????-??-??T??-??-??-{glob.escape(session_id)}.jsonl"
-    return any(codex_sessions_dir().glob(f"**/{pattern}"))
+    return list(codex_sessions_dir().glob(f"**/{pattern}"))
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except PermissionError:
+        return True
+    except ProcessLookupError:
+        return False
+    return True
+
+
+def _claude_registry_live(session_id: str) -> bool:
+    registry = config.claude_projects_path.parent / "sessions"
+    for path in registry.glob("*.json"):  # never the *.key files beside them
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            pid = int(data["pid"])
+            if data["sessionId"] == session_id and pid > 0 and _pid_alive(pid):
+                return True
+        except OSError, ValueError, KeyError, TypeError:
+            continue
+    return False
+
+
+async def _rollout_open(path: Path) -> bool | None:
+    """Whether any process has the file open; None when lsof cannot say."""
+    proc = None
+    try:
+        argv = ("lsof", "-t", "--", str(path))
+        proc = await asyncio.create_subprocess_exec(
+            *argv, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL
+        )
+        out, _ = await asyncio.wait_for(proc.communicate(), _LSOF_TIMEOUT_S)
+    except OSError, TimeoutError:
+        if proc is not None:
+            with contextlib.suppress(ProcessLookupError):
+                proc.kill()
+        return None
+    if proc.returncode == 0 and out.strip():
+        return True
+    return False if proc.returncode == 1 and not out.strip() else None
+
+
+async def _outside_liveness(entry: RestoreEntry) -> str | None:
+    """Skip reason when the session runs outside the bot's own tmux session."""
+    if entry.provider_name == "claude":
+        live = await asyncio.to_thread(_claude_registry_live, entry.session_id)
+    elif entry.provider_name == "codex":
+        paths = await asyncio.to_thread(_codex_rollouts, entry.session_id)
+        opened = [await _rollout_open(path) for path in paths]
+        live = True if True in opened else None if None in opened else False
+    else:
+        return None
+    if live is None:
+        return "liveness_unconfirmed"
+    return "session_live" if live else None
 
 
 def _first_cwd(transcript: Path) -> str:
@@ -180,7 +240,7 @@ async def _session_exists(entry: RestoreEntry) -> bool | None:
     if entry.provider_name == "claude":
         return await asyncio.to_thread(_claude_transcript_exists, entry)
     if entry.provider_name == "codex":
-        return await asyncio.to_thread(_codex_rollout_exists, entry.session_id)
+        return bool(await asyncio.to_thread(_codex_rollouts, entry.session_id))
     return None
 
 
@@ -203,6 +263,8 @@ async def _unrestorable(
         return "provisioning_claim"
     if entry.session_id in world.live_sessions:
         return "session_already_live"
+    if reason := await _outside_liveness(entry):
+        return reason
     if ledger.status(entry.key) in _ATTEMPTED:
         return "already_attempted"
     return None
@@ -296,7 +358,7 @@ async def _skip_reason_now(entry: RestoreEntry) -> str | None:
         return "stale_id_collision_suspected"
     if entry.session_id in world.live_sessions:
         return "session_live"
-    return None
+    return await _outside_liveness(entry)
 
 
 async def _restore_one(
@@ -347,6 +409,21 @@ async def _run(
         await _pause(min(retry_after, MAX_RATE_LIMIT_WAIT_S))
 
 
+async def _reserve_stale_ids() -> bool:
+    """Reserve ids past all bindings if any is dead or unconfirmed; never raises."""
+    try:
+        bound = [wid for *_, wid in thread_router.iter_thread_bindings_with_chat()]
+        live = await list_windows_for_reconciliation(multiplexer) if bound else []
+        stale = live is None or not all(any(w.matches(b) for w in live) for b in bound)
+        reserved = await reserve_window_ids_past(bound) if stale else True
+    except Exception:
+        logger.exception("window_id_reservation_failed")
+        return False
+    log = logger.info if reserved else logger.warning
+    log("window_id_reservation", stale=stale, reserved=reserved, bound=len(bound))
+    return reserved
+
+
 async def start_auto_restore(
     bot: Bot, get_adapter: Callable[[], TelegramSessionAdapter]
 ) -> asyncio.Task[None] | None:
@@ -355,6 +432,10 @@ async def start_auto_restore(
     Returns the running task, or None when the feature is off, cannot run, or
     has nothing to do. Never raises: a failure here must not stop the bot.
     """
+    # INVARIANT(auto-restore): reservation must finish before polling starts,
+    # else a queued Resume or /new can take a stale id and evict another topic.
+    # It runs with the resume loop off too: a manual Resume needs it.
+    reserved = await _reserve_stale_ids()
     if not config.auto_restore_on_start:
         return None
     if config.autodelete_dead_topics:
@@ -368,13 +449,7 @@ async def start_auto_restore(
             return None
         ledger = _Ledger.load(config.config_dir / _LEDGER_FILE, boot_id)
         plan = await _build_plan(ledger)
-        bound_ids = [
-            window_id
-            for *_, window_id in thread_router.iter_thread_bindings_with_chat()
-        ]
-        # INVARIANT(auto-restore): reservation must finish before polling starts,
-        # else a queued Resume or /new can take a stale id and evict another topic.
-        if plan and not await reserve_window_ids_past(bound_ids):
+        if plan and not reserved:
             logger.warning("auto_restore_skipped", reason="id_reservation_unavailable")
             return None
         ledger.add_pending(plan)
