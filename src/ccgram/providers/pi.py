@@ -21,6 +21,7 @@ everything through it after ``shlex.quote`` for safety.
 
 from __future__ import annotations
 
+import os
 import re
 import shlex
 import time
@@ -40,7 +41,9 @@ PI_QUESTION_FOOTER = "↑↓ navigate • Enter select • Esc cancel • number
 
 
 def _pi_sessions_dir() -> Path:
-    return Path.home() / ".pi" / "agent" / "sessions"
+    agent_dir = os.environ.get("PI_CODING_AGENT_DIR")
+    root = Path(agent_dir) if agent_dir else Path.home() / ".pi" / "agent"
+    return root / "sessions"
 
 
 # Cap transcript age when the pane is dead — guards against picking up an
@@ -92,6 +95,7 @@ class PiProvider(JsonlProvider):
         name="pi",
         launch_command="pi",
         supports_hook=True,
+        hook_install_managed_by_ccgram=True,
         supports_resume=True,
         supports_continue=True,
         supports_structured_transcript=True,

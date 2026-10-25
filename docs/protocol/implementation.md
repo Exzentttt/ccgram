@@ -45,8 +45,15 @@ backend-reported spelling. Gemini uses `displayContent` when its primary content
 has no displayable parts, while preserving primary tool results.
 
 The previous `transcript_parser.py`, provider parse methods, and direct window-send
-wrappers are removed. Provider records have one interpretation: `parse_records` produces structured
-records used by both `build_messages` and Telegram delivery. Telegram rendering
+wrappers are removed. Provider records have one interpretation: `parse_records` validates the native
+conversation envelope and role before producing structured records used by both
+`build_messages` and Telegram delivery. Provider prompts, diagnostic request
+snapshots, and unknown record kinds are not conversation. Unknown providers have
+no generic chat fallback. Codex injected context can carry a user role; its
+reserved context envelopes are excluded without stripping ordinary mentions or
+explicit tool output. Resume and completion summaries and Claude task extraction
+also use this classification. They cannot interpret internal records as user
+text, final answers or tasks. Telegram rendering
 keeps formatting, tool batching, topics, chunking, edits, and queue retries in the
 adapter. Codex streaming completion and phase survive normalization. Tool results
 can complete calls observed in an earlier delivery batch.
@@ -205,3 +212,28 @@ It skips only when tmux is unavailable.
 Run `make check` for formatting, lint, types, dependency checks, unit tests, and
 integration tests. APNs and the iOS UI require their own later implementation and
 verification.
+
+## Native relay smoke test
+
+From an agterm session, run:
+
+```bash
+uv run --python 3.14 python scripts/smoke_agent_relay.py --provider claude --cwd "$PWD"
+```
+
+Use `pi` or `codex` for another installed CLI. Lifecycle hooks must already be
+installed for that provider; the harness does not change global agent settings or
+guess identity from the newest transcript. It fails without sending input when
+no ready, attested hook mapping appears.
+
+This starts a dedicated agent in a separate agterm workspace and makes three real
+model requests: initial, follow-up, and after restarting the session service and
+monitor. It uses the normal input executor, transcript normalization, Telegram
+routing and queue, and receipt checkpoints. `FakeTelegramClient` records output
+and acknowledges it locally; no request goes to the production Telegram bot.
+The account's normal model usage charges still apply.
+
+State and `report.json` stay in a private temporary directory printed by the
+command. The harness closes only its create-only target and deletes its workspace
+only after confirming it is empty. It does not resume another bridge, restart
+existing agents, edit raw transcripts, or change delivered watermarks manually.
