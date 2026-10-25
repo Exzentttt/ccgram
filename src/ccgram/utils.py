@@ -183,9 +183,13 @@ def _extract_metadata_from_entry(data: dict, cwd: str, summary: str) -> tuple[st
         if found_cwd and isinstance(found_cwd, str):
             cwd = found_cwd
     if not summary and data.get("type") == "user":
-        msg = data.get("message", {})
-        if isinstance(msg, dict):
-            summary = _extract_user_text(msg)
+        # Lazy: utilities are imported while the session core is bootstrapping.
+        from .session_protocol.messages import SourceEntry, parse_records
+
+        records, _ = parse_records([SourceEntry(0, data)], "claude")
+        for _, record in records:
+            if record.role == "user":
+                summary = _extract_user_text({"content": list(record.parts)})
     return cwd, summary
 
 

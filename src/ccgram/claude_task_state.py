@@ -233,9 +233,16 @@ class ClaudeTaskStateStore:
     ) -> bool:
         if not window_id or not session_id:
             return False
+        # Lazy: providers can seed task state during core initialization.
+        from .session_protocol.messages import SourceEntry, parse_records
+
+        records, _ = parse_records(
+            [SourceEntry(index, entry) for index, entry in enumerate(entries)], "claude"
+        )
         state = self._get_or_create(window_id, session_id)
         changed = False
-        for entry in entries:
+        for source, _ in records:
+            entry = source.data
             entry_type = entry.get("type")
             if entry_type == "assistant":
                 changed |= self._apply_assistant_entry(state, entry)
