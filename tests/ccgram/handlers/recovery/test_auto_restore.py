@@ -76,6 +76,14 @@ class Env:
         self.lsof_hangs = False
         self.lsof_calls: list[tuple[Any, ...]] = []
         self.lsof_exec = AsyncMock(side_effect=self.fake_lsof)
+        self.ps_start: str | BaseException | None = "T0"
+        self.ps_run = MagicMock(side_effect=self.fake_ps)
+
+    def fake_ps(self, *_args: Any, **_kwargs: Any) -> SimpleNamespace:
+        if isinstance(self.ps_start, BaseException):
+            raise self.ps_start
+        out = "" if self.ps_start is None else f"{self.ps_start}\n"
+        return SimpleNamespace(returncode=1 if self.ps_start is None else 0, stdout=out)
 
     async def fake_lsof(self, *argv: str, **_kwargs: Any) -> MagicMock:
         self.lsof_calls.append(argv)
@@ -94,10 +102,12 @@ class Env:
         proc.communicate = communicate
         return proc
 
-    def claude_registry(self, session: str, pid: int) -> None:
+    def claude_registry(self, session: str, pid: int, start: str | None = "T0") -> None:
         folder = self.tmp / "claude" / "sessions"
         folder.mkdir(parents=True, exist_ok=True)
-        data = {"pid": pid, "sessionId": session, "procStart": "x"}
+        data: dict[str, Any] = {"pid": pid, "sessionId": session}
+        if start is not None:
+            data["procStart"] = start
         (folder / f"{pid}.json").write_text(json.dumps(data))
 
     def project(self, name: str) -> str:
@@ -231,6 +241,7 @@ def env(tmp_path, monkeypatch):
         patch(f"{_AR}.window_query.view_window", view_window),
         patch(f"{_AR}._pause", world.pause),
         patch(f"{_AR}.asyncio.create_subprocess_exec", world.lsof_exec),
+        patch(f"{_AR}.subprocess.run", world.ps_run),
         patch(f"{_RC}.session_manager"),
         patch(f"{_RC}.PTBTelegramClient", MagicMock(return_value=client)),
         patch(f"{_RC}._stale_recovery_offer", world.stale),
@@ -625,6 +636,39 @@ class TestSkips:
         await env.start()
 
         assert len(env.created) == 1
+
+    async def test_a_reused_pid_with_another_start_time_does_not_block(
+        self, env
+    ) -> None:
+        env.dead_topic(1, "@1", session="sess-1")
+        env.claude_registry("sess-1", os.getpid(), start="T-before-reboot")
+
+        await env.start()
+
+        assert len(env.created) == 1
+        assert env.ps_run.call_args.kwargs["env"]["TZ"] == "UTC"
+
+    @pytest.mark.parametrize(
+        ("registered", "ps_start"),
+        [
+            ("T0", None),
+            ("T0", subprocess.TimeoutExpired("ps", 5)),
+            ("T0", FileNotFoundError("ps")),
+            (None, "T0"),
+        ],
+    )
+    async def test_claude_start_time_unconfirmed_is_never_not_live(
+        self, env, registered, ps_start
+    ) -> None:
+        env.dead_topic(1, "@1", session="sess-1")
+        env.claude_registry("sess-1", os.getpid(), start=registered)
+        env.ps_start = ps_start
+
+        with capture_logs() as logs:
+            await env.start()
+
+        env.adapter.create.assert_not_called()
+        assert _skips(logs) == ["liveness_unconfirmed"]
 
     async def test_codex_rollout_open_by_a_process_is_live(self, env) -> None:
         env.dead_topic(1, "@1", session="cdx-1", provider="codex")

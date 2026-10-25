@@ -23,6 +23,7 @@ import contextlib
 import glob
 import json
 import os
+import subprocess
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -165,17 +166,43 @@ def _pid_alive(pid: int) -> bool:
     return True
 
 
-def _claude_registry_live(session_id: str) -> bool:
+def _ps_start(pid: int) -> str | None:
+    """Process start time as the registry writes it; None when ps cannot say."""
+    env = {**os.environ, "TZ": "UTC", "LC_ALL": "C"}
+    try:
+        done = subprocess.run(
+            ["ps", "-o", "lstart=", "-p", str(pid)],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except OSError, subprocess.TimeoutExpired:
+        return None
+    return done.stdout.strip() or None if done.returncode == 0 else None
+
+
+def _claude_registry_live(session_id: str) -> bool | None:
+    """True/False from the pid registry; None when an entry cannot be settled."""
+    unknown = False
     registry = config.claude_projects_path.parent / "sessions"
     for path in registry.glob("*.json"):  # never the *.key files beside them
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
             pid = int(data["pid"])
-            if data["sessionId"] == session_id and pid > 0 and _pid_alive(pid):
-                return True
+            if data["sessionId"] != session_id or pid <= 0 or not _pid_alive(pid):
+                continue
+            started = data.get("procStart")
         except OSError, ValueError, KeyError, TypeError:
             continue
-    return False
+        # A reboot leaves stale entries whose pids other processes now hold.
+        actual = _ps_start(pid) if started else None
+        if actual is None:
+            unknown = True
+        elif actual == started:
+            return True
+    return None if unknown else False
 
 
 async def _rollout_open(path: Path) -> bool | None:
