@@ -18,6 +18,7 @@ Public surface: :func:`start_auto_restore`.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import glob
 import json
 from collections.abc import Callable
@@ -32,7 +33,6 @@ from ...config import config
 from ...multiplexer import multiplexer, reserve_window_ids_past
 from ...multiplexer.base import WindowRef
 from ...multiplexer.reconciliation import list_windows_for_reconciliation
-from ...providers._resume import discover_claude_sessions
 from ...providers.codex import codex_sessions_dir
 from ...thread_router import thread_router
 from ...utils import atomic_write_json, task_done_callback
@@ -152,10 +152,27 @@ def _codex_rollout_exists(session_id: str) -> bool:
     return any(codex_sessions_dir().glob(f"**/{pattern}"))
 
 
+def _first_cwd(transcript: Path) -> str:
+    """The cwd of the first line carrying one; no line cap, bad JSON skipped."""
+    with transcript.open(encoding="utf-8") as lines:
+        for line in lines:
+            with contextlib.suppress(ValueError):
+                data = json.loads(line)
+                if isinstance(data, dict) and isinstance(data.get("cwd"), str):
+                    return data["cwd"]
+    return ""
+
+
 def _claude_transcript_exists(entry: RestoreEntry) -> bool:
-    # By the cwd inside each transcript: the folder name also encodes dots.
-    found = discover_claude_sessions(config.claude_projects_path, cwd=entry.cwd)
-    return any(session.session_id == entry.session_id for session in found)
+    # By file name: folder names encode dots, discovery reads only 20 lines.
+    wanted = Path(entry.cwd).resolve()
+    for path in config.claude_projects_path.glob(
+        f"*/{glob.escape(entry.session_id)}.jsonl"
+    ):
+        with contextlib.suppress(OSError, UnicodeDecodeError):
+            if (cwd := _first_cwd(path)) and Path(cwd).resolve() == wanted:
+                return True
+    return False
 
 
 async def _session_exists(entry: RestoreEntry) -> bool | None:
@@ -308,19 +325,11 @@ async def _restore_one(
 
 async def _run(
     plan: list[RestoreEntry],
-    stale_ids: list[str],
     ledger: _Ledger,
     bot: Bot,
     get_adapter: Callable[[], TelegramSessionAdapter],
 ) -> None:
-    """Reserve ids (can take seconds), then restore the plan.
-
-    Waits out a rate limit up to a bounded number of times.
-    """
-    if not await reserve_window_ids_past(stale_ids):
-        logger.warning("auto_restore_skipped", reason="id_reservation_unavailable")
-        return
-    ledger.add_pending(plan)
+    """Restore the plan; wait out a rate limit up to a bounded number of times."""
     waits = 0
     for index, entry in enumerate(plan):
         if index:
@@ -359,14 +368,23 @@ async def start_auto_restore(
             return None
         ledger = _Ledger.load(config.config_dir / _LEDGER_FILE, boot_id)
         plan = await _build_plan(ledger)
-        stale_ids = [b[3] for b in thread_router.iter_thread_bindings_with_chat()]
+        bound_ids = [
+            window_id
+            for *_, window_id in thread_router.iter_thread_bindings_with_chat()
+        ]
+        # INVARIANT(auto-restore): reservation must finish before polling starts,
+        # else a queued Resume or /new can take a stale id and evict another topic.
+        if plan and not await reserve_window_ids_past(bound_ids):
+            logger.warning("auto_restore_skipped", reason="id_reservation_unavailable")
+            return None
+        ledger.add_pending(plan)
     except Exception:
         logger.exception("auto_restore_failed_to_start")
         return None
     if not plan:
         return None
     task = asyncio.create_task(
-        _run(plan, stale_ids, ledger, bot, get_adapter), name="auto_restore"
+        _run(plan, ledger, bot, get_adapter), name="auto_restore"
     )
     task.add_done_callback(task_done_callback)
     return task

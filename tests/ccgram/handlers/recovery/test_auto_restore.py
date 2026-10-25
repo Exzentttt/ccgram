@@ -104,10 +104,13 @@ class Env:
         if session and opts["known_session"] and provider == "claude":
             self.transcript(cwd, session)
 
-    def transcript(self, cwd: str, session: str) -> None:
+    def transcript(self, cwd: str, session: str, head: int = 0) -> None:
         folder = self.tmp / "claude" / "projects" / re.sub(r"[^A-Za-z0-9]", "-", cwd)
         folder.mkdir(parents=True, exist_ok=True)
-        (folder / f"{session}.jsonl").write_text(json.dumps({"cwd": cwd}) + "\n")
+        lines = [json.dumps({"type": "api-request-blob"})] * head
+        (folder / f"{session}.jsonl").write_text(
+            "\n".join([*lines, json.dumps({"cwd": cwd})]) + "\n"
+        )
         self.transcripts.append(folder / f"{session}.jsonl")
 
     def forget_sessions(self) -> None:
@@ -304,6 +307,26 @@ class TestHappyPath:
         await env.start()
 
         assert [kw["resume_id"] for _, kw in env.created] == ["dotted"]
+
+    async def test_a_cwd_after_many_leading_lines_is_still_found(self, env) -> None:
+        env.dead_topic(1, "@1", session="long", known_session=False)
+        env.transcript(env.states["@1"].cwd, "long", head=25)
+
+        await env.start()
+
+        assert [kw["resume_id"] for _, kw in env.created] == ["long"]
+
+    async def test_a_transcript_of_another_cwd_does_not_vouch_for_the_session(
+        self, env
+    ) -> None:
+        env.dead_topic(1, "@1", session="mine", known_session=False)
+        env.transcript(env.project("elsewhere"), "mine")
+
+        with capture_logs() as logs:
+            await env.start()
+
+        env.adapter.create.assert_not_called()
+        assert _skips(logs) == ["session_not_found"]
 
     async def test_other_transcripts_in_the_folder_do_not_vouch_for_the_session(
         self, env
@@ -564,22 +587,25 @@ class TestIdReservation:
             log["reason"] for log in logs if log["event"] == "auto_restore_skipped"
         ] == ["id_reservation_unavailable"]
 
-    async def test_startup_does_not_wait_for_the_reservation(self, env) -> None:
+    async def test_ids_are_reserved_before_start_returns_and_before_any_create(
+        self, env
+    ) -> None:
         env.dead_topic(1, "@1", session="s1")
-        release = asyncio.Event()
+        done = False
 
-        async def slow(window_ids):
-            await release.wait()
+        async def reserve(window_ids):
+            nonlocal done
+            await asyncio.sleep(0)
+            done = True
             return True
 
-        env.reserve_call.side_effect = slow
+        env.reserve_call.side_effect = reserve
 
         task = await auto_restore.start_auto_restore(MagicMock(), lambda: env.adapter)
 
         assert task is not None
-        assert not task.done()
+        assert done  # post_init awaits start: polling cannot begin before this
         env.adapter.create.assert_not_called()
-        release.set()
         await task
         assert len(env.created) == 1
 

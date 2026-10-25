@@ -437,8 +437,9 @@ async def bootstrap_application(application: Application) -> None:
         _protocol_runtime = None
         raise
 
-    # Plan synchronously (every binding is settled by now); resume in the
-    # background so post_init is not held for the pause between topics.
+    # Plan and reserve window ids synchronously (every binding is settled by
+    # now, polling not started); resume in the background so post_init is not
+    # held for the pause between topics.
     _auto_restore_task = await start_auto_restore(
         application.bot, partial(adapter_for, application.bot_data)
     )
