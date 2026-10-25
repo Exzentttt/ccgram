@@ -18,6 +18,10 @@ from .models import Message, Part
 
 _PART_FIELDS = frozenset(part_field.name for part_field in fields(Part)) - {"id"}
 _CHAT_ROLES = ("user", "assistant")
+_CODEX_USER_CONTEXT_RE = re.compile(
+    r"^(?:<(?:environment_context|permissions|user_instructions)(?:\s|>)|"
+    r"# AGENTS\.md instructions for )"
+)
 
 _ANTIGRAVITY_METADATA_RE = re.compile(
     r"<(ADDITIONAL_METADATA|USER_SETTINGS_CHANGE|USER_INFORMATION|USER_RULES|SKILLS|PLUGINS|SUBAGENTS|MESSAGING|CONVERSATION_TRANSCRIPT|ARTIFACTS|SLASH_COMMANDS|GUIDELINES|COMMUNICATION_STYLE)>[\s\S]*?</\1>",
@@ -266,6 +270,13 @@ def _codex(entry: SourceEntry, state: _CodexState) -> TranscriptRecord | None:
     if not isinstance(kind, str):
         return None
     if kind == "message" and data.get("role") in _CHAT_ROLES:
+        if data.get("role") == "user":
+            parts, _ = _content(data.get("content"))
+            first_text = next(
+                (part["text"] for part in parts if part.get("type") == "text"), ""
+            )
+            if _CODEX_USER_CONTEXT_RE.match(first_text.lstrip()):
+                return None
         return _codex_message(data, key, timestamp, state)
     return _codex_other_item(data, key, timestamp, state)
 

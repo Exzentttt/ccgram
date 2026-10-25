@@ -49,8 +49,11 @@ wrappers are removed. Provider records have one interpretation: `parse_records` 
 conversation envelope and role before producing structured records used by both
 `build_messages` and Telegram delivery. Provider prompts, diagnostic request
 snapshots, and unknown record kinds are not conversation. Unknown providers have
-no generic chat fallback. Resume summaries and Claude task extraction also use
-this classification; they cannot interpret internal records as user text or tasks. Telegram rendering
+no generic chat fallback. Codex injected context can carry a user role; its
+reserved context envelopes are excluded without stripping ordinary mentions or
+explicit tool output. Resume and completion summaries and Claude task extraction
+also use this classification. They cannot interpret internal records as user
+text, final answers or tasks. Telegram rendering
 keeps formatting, tool batching, topics, chunking, edits, and queue retries in the
 adapter. Codex streaming completion and phase survive normalization. Tool results
 can complete calls observed in an earlier delivery batch.

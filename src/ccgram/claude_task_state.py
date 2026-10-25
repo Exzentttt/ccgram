@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .topic_state_registry import topic_state
+from .session_protocol.messages import SourceEntry, parse_records
 
 # Idle status sentinel — lives here (core) rather than in handlers/callback_data
 # to avoid a core → handler layer violation.
@@ -233,9 +234,6 @@ class ClaudeTaskStateStore:
     ) -> bool:
         if not window_id or not session_id:
             return False
-        # Lazy: providers can seed task state during core initialization.
-        from .session_protocol.messages import SourceEntry, parse_records
-
         records, _ = parse_records(
             [SourceEntry(index, entry) for index, entry in enumerate(entries)], "claude"
         )

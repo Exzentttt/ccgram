@@ -49,3 +49,48 @@ def test_internal_records_cannot_create_tasks_in_the_public_status_view(flag):
 
     assert not store.apply_entries("@test", "session", [row])
     assert store.get_snapshot("@test") is None
+
+
+@pytest.mark.parametrize("flag", ("isMeta", "isSidechain", "isCompactSummary"))
+def test_completion_summary_ignores_hidden_assistant_records(flag):
+    from ccgram.llm.summarizer import _build_summary_context
+
+    rows = [
+        {
+            "type": "assistant",
+            "message": {"content": [{"type": "text", "text": "Actual answer"}]},
+        },
+        {
+            "type": "assistant",
+            flag: True,
+            "message": {"content": [{"type": "text", "text": "INTERNAL_CONTEXT"}]},
+        },
+    ]
+    context = _build_summary_context([json.dumps(row) for row in rows])
+    assert "Actual answer" in context
+    assert "INTERNAL_CONTEXT" not in context
+
+
+@pytest.mark.parametrize(
+    "row",
+    [
+        {
+            "type": "api-request-blob",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "INTERNAL_CONTEXT"}],
+            },
+        },
+        {
+            "type": "assistant",
+            "message": {
+                "role": "system",
+                "content": [{"type": "text", "text": "INTERNAL_CONTEXT"}],
+            },
+        },
+    ],
+)
+def test_completion_summary_rejects_wrong_envelopes_and_roles(row):
+    from ccgram.llm.summarizer import _build_summary_context
+
+    assert _build_summary_context([json.dumps(row)]) == ""

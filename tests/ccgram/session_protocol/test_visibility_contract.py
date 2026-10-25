@@ -195,3 +195,98 @@ def test_large_internal_prompt_cannot_become_29_telegram_messages():
             event.text, event.is_complete, event.content_type, event.role
         )
     ] == ["👤 Hi", "Hello"]
+
+
+@pytest.mark.parametrize(
+    "prefix",
+    (
+        "<environment_context>",
+        "<permissions scope='session'>",
+        "<user_instructions>",
+        "# AGENTS.md instructions for /workspace",
+    ),
+)
+async def test_codex_injected_user_context_never_reaches_any_projection(
+    prefix, service, backend, tmp_path
+):
+    path = tmp_path / "codex.jsonl"
+    injected = conversation("codex", "user", prefix + "\n" + INTERNAL, "injected")
+    rows = [
+        injected,
+        conversation("codex", "user", "Hi", "user"),
+        conversation("codex", "assistant", "Hello", "assistant"),
+    ]
+    path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+    backend.target = replace(backend.target, provider="codex", transcript=path)
+    _, session = await service.for_target(backend.target.id)
+    history = await service.history(session.id, None, 20)
+    assert projected_text(history.messages) == [("user", "Hi"), ("agent", "Hello")]
+    records, state = parse_records(read_entries(path, "codex"), "codex")
+    rendered = render_protocol_records("conversation", "codex", records, state)
+    assert [(event.role, event.text) for event in rendered] == [
+        ("user", "Hi"),
+        ("assistant", "Hello"),
+    ]
+    _, events = service.hub.replay(service.hub.epoch, 0)
+    assert INTERNAL not in json.dumps([event.body() for event in events])
+
+
+@pytest.mark.parametrize(
+    "text",
+    (
+        "Please read AGENTS.md",
+        "Explain <environment_context>",
+        "# AGENTS.md is a normal filename",
+        "<environment_contextual>literal text",
+    ),
+)
+def test_codex_real_user_mentions_are_not_removed(text):
+    row = conversation("codex", "user", text, "user")
+    assert projected_text(
+        build_messages([SourceEntry(0, row)], "conversation", "codex")
+    ) == [("user", text)]
+
+
+def test_codex_tool_output_with_context_markup_remains_visible():
+    output = (
+        "<environment_context>Explicitly requested file contents</environment_context>"
+    )
+    rows = [
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "function_call",
+                "call_id": "read",
+                "name": "Read",
+                "arguments": {"path": "AGENTS.md"},
+            },
+        },
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "function_call_output",
+                "call_id": "read",
+                "output": output,
+            },
+        },
+    ]
+    messages = build_messages(
+        [SourceEntry(i, row) for i, row in enumerate(rows)], "conversation", "codex"
+    )
+    assert len(messages) == 1
+    assert messages[0].parts[0].output == {"text": output, "truncated": False}
+
+
+def test_codex_injected_context_does_not_split_a_streamed_answer():
+    rows = [
+        {"type": "event_msg", "payload": {"type": "agent_message", "message": "Hello"}},
+        conversation("codex", "user", "<environment_context>" + INTERNAL, "injected"),
+        {
+            "type": "event_msg",
+            "payload": {"type": "task_complete", "last_agent_message": "Hello"},
+        },
+    ]
+    messages = build_messages(
+        [SourceEntry(i, row) for i, row in enumerate(rows)], "conversation", "codex"
+    )
+    assert projected_text(messages) == [("agent", "Hello")]

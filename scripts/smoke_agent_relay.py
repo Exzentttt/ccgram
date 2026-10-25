@@ -22,8 +22,10 @@ FAKE_TOKEN = "123456:isolated-smoke-not-a-real-token"
 
 
 def control(*args: str) -> dict:
+    window = os.environ.get("AGTERM_WINDOW_ID")
+    addressing = ["--window", window] if window else []
     result = subprocess.run(
-        ["agtermctl", *args, "--json"],
+        ["agtermctl", *args, *addressing, "--json"],
         check=False,
         capture_output=True,
         text=True,
@@ -300,8 +302,19 @@ async def close_owned(mux, target_id, name, workspace_id):
     owned = next((w for w in windows if target_id and w.matches(target_id)), None)
     if owned and (owned.window_name != name or not await mux.kill_window(target_id)):
         raise RuntimeError("Owned smoke session could not safely be closed")
-    remaining = await mux.list_windows_for_reconciliation()
-    if remaining == []:
+    tree = control("tree").get("tree")
+    workspaces = tree.get("workspaces") if isinstance(tree, dict) else None
+    if not isinstance(workspaces, list):
+        raise RuntimeError("Cannot confirm smoke workspace for cleanup")
+    workspace = next(
+        (item for item in workspaces if item.get("id") == workspace_id), None
+    )
+    if workspace is None:
+        return
+    sessions = workspace.get("sessions")
+    if not isinstance(sessions, list):
+        raise RuntimeError("Cannot confirm smoke workspace sessions")
+    if not sessions:
         control("workspace", "delete", "--target", workspace_id)
 
 
