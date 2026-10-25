@@ -29,6 +29,7 @@ from telegram.error import RetryAfter
 from ccgram.config import config
 from ccgram.handlers.recovery import auto_restore
 from ccgram.handlers.recovery.recovery_ui import HeadlessUi
+from ccgram.handlers.recovery.restore_notices import skip_text
 from ccgram.handlers.topics import topic_orchestration
 from ccgram.multiplexer.base import WindowRef
 from ccgram.session_protocol.backend import CreationOptions, MultiplexerSessionBackend
@@ -37,6 +38,7 @@ from ccgram.thread_router import ThreadRouter
 
 _AR = "ccgram.handlers.recovery.auto_restore"
 _RC = "ccgram.handlers.recovery.recovery_banner"
+_RN = "ccgram.handlers.recovery.restore_notices"
 _CHAT = -1001
 _USER = 100
 _TOPIC_OPTIONS = frozenset(
@@ -82,6 +84,18 @@ class Env:
         self.ps_start: str | BaseException | None = "T0"
         self.ps_code: int | None = None
         self.ps_run = MagicMock(side_effect=self.fake_ps)
+        self.sent: list[dict[str, Any]] = []
+        self.send_errors: list[BaseException] = []
+
+    async def fake_send(self, **kwargs: Any) -> SimpleNamespace:
+        if self.send_errors:
+            raise self.send_errors.pop(0)
+        self.sent.append(kwargs)
+        return SimpleNamespace(message_id=len(self.sent))
+
+    def notices(self) -> list[tuple[int, str]]:
+        """(topic thread, text) of every message sent, in order."""
+        return [(kw["message_thread_id"], kw["text"]) for kw in self.sent]
 
     def fake_ps(self, argv: list[str], env: dict[str, str]) -> SimpleNamespace:
         if isinstance(self.ps_start, BaseException):
@@ -240,8 +254,11 @@ def env(tmp_path, monkeypatch):
     client = MagicMock()
     client.edit_forum_topic = AsyncMock(side_effect=rename)
     mux = world.mux
+    sender = MagicMock()
+    sender.send_message = AsyncMock(side_effect=world.fake_send)
 
     with (
+        patch(f"{_RN}.PTBTelegramClient", MagicMock(return_value=sender)),
         patch(f"{_AR}.thread_router", world.router),
         patch(f"{_RC}.thread_router", world.router),
         patch(f"{_AR}.multiplexer", mux),
@@ -871,7 +888,7 @@ class TestIdReservation:
             await env.start()
 
         env.adapter.create.assert_not_called()
-        assert not (env.tmp / "auto_restore.json").exists()
+        assert env.ledger["entries"] == []
         assert [
             log["reason"] for log in logs if log["event"] == "auto_restore_skipped"
         ] == ["id_reservation_unavailable"]
@@ -982,7 +999,7 @@ class TestStartupReservation:
         env.can_reserve.return_value = False
 
         with capture_logs() as logs:
-            assert await env.start() is None
+            await env.start()
 
         env.adapter.create.assert_not_called()
         assert [
@@ -1414,3 +1431,204 @@ class TestLaunchCommand:
         assert launch["launch_command"] == "my-claude --flag"
         assert "--resume" in launch["agent_args"]
         assert _UUID in launch["agent_args"]
+
+
+class TestNoticeTexts:
+    @pytest.mark.parametrize(
+        "reason",
+        [
+            "rebound",
+            "duplicate_session",
+            "already_attempted",
+            "listing_unconfirmed",
+            "boot_id_unavailable",
+            "autodelete_dead_topics_enabled",
+            "window_alive",
+            "stale_id_collision_suspected",
+            "provisioning_claim",
+            "no_session",
+            "no_cwd",
+            "chat_unknown",
+        ],
+    )
+    def test_internal_reasons_have_no_text(self, reason) -> None:
+        assert skip_text(reason) is None
+
+    @pytest.mark.parametrize(
+        "reason",
+        [
+            "session_live",
+            "cwd_missing",
+            "session_not_found",
+            "liveness_unconfirmed",
+            "provider_unsupported",
+            "id_reservation_unavailable",
+        ],
+    )
+    def test_user_reasons_start_with_the_warning_marker(self, reason) -> None:
+        assert (skip_text(reason, "/p") or "").startswith("⚠ Not restored")
+
+
+class TestNotices:
+    async def test_a_restored_topic_gets_the_flows_final_text(self, env) -> None:
+        env.dead_topic(7, "@1", session="s1")
+
+        await env.start()
+
+        [(thread, text)] = env.notices()
+        assert thread == 7
+        assert "Session resumed after restart." in text
+        assert env.sent[0]["chat_id"] == _CHAT
+
+    async def test_only_the_final_outcome_is_sent_not_progress(self, env) -> None:
+        env.dead_topic(7, "@1", session="s1")
+
+        await env.start()
+
+        assert len(env.sent) == 1
+
+    async def test_a_failed_creation_is_reported_in_the_topic(self, env) -> None:
+        env.dead_topic(7, "@1", session="s1")
+        env.create_error = ProtocolError(503, "backend_unavailable", "down")
+
+        await env.start()
+
+        [(thread, text)] = env.notices()
+        assert thread == 7
+        assert text.startswith("❌ Not restored")
+        assert "/restore" in text
+
+    async def test_a_cwd_missing_skip_names_the_path(self, env) -> None:
+        env.dead_topic(7, "@1", session="s1", cwd=str(env.tmp / "gone"))
+
+        await env.start()
+
+        [(thread, text)] = env.notices()
+        assert thread == 7
+        assert str(env.tmp / "gone") in text
+
+    @pytest.mark.parametrize(
+        ("setup", "needle"),
+        [
+            ("forget", "session not found"),
+            ("codex_unknown", "unsupported provider"),
+        ],
+    )
+    async def test_plan_skips_with_a_user_reason_are_told(
+        self, env, setup, needle
+    ) -> None:
+        if setup == "forget":
+            env.dead_topic(7, "@1", session="s1")
+            env.forget_sessions()
+        else:
+            env.dead_topic(7, "@1", session="s1", provider="gemini")
+
+        await env.start()
+
+        [(thread, text)] = env.notices()
+        assert thread == 7
+        assert needle in text
+        env.adapter.create.assert_not_called()
+
+    async def test_a_session_live_elsewhere_is_told(self, env) -> None:
+        env.dead_topic(7, "@1", session="s1")
+        env.claude_registry("s1", os.getpid())
+
+        await env.start()
+
+        [(_, text)] = env.notices()
+        assert "already running elsewhere" in text
+
+    async def test_unconfirmed_liveness_suggests_restore(self, env) -> None:
+        env.dead_topic(7, "@1", session="s1")
+        env.claude_registry("s1", os.getpid())
+        env.ps_start = None
+
+        await env.start()
+
+        [(_, text)] = env.notices()
+        assert "/restore" in text
+
+    async def test_a_session_that_went_live_before_its_turn_is_told(self, env) -> None:
+        env.dead_topic(7, "@1", session="s1")
+        env.dead_topic(8, "@2", session="s2")
+
+        async def meanwhile(_seconds):
+            env.claude_registry("s2", os.getpid())
+
+        env.pause.side_effect = meanwhile
+
+        await env.start()
+
+        sent = dict(env.notices())
+        assert "resumed" in sent[7]
+        assert "already running elsewhere" in sent[8]
+
+    async def test_unreservable_ids_tell_every_planned_topic(self, env) -> None:
+        env.reserve_ok = False
+        env.dead_topic(7, "@1", session="s1")
+        env.dead_topic(8, "@2", session="s2")
+
+        await env.start()
+
+        assert sorted(thread for thread, _ in env.notices()) == [7, 8]
+        env.adapter.create.assert_not_called()
+
+    async def test_internal_skip_reasons_send_nothing(self, env) -> None:
+        env.dead_topic(7, "@1", session="dup")
+        env.dead_topic(8, "@2", session="dup")
+        env.live = [WindowRef("@0", "_ccgram", str(env.tmp))]
+        env.router.bind_thread(_USER, 9, "@0", window_name="live", chat_id=_CHAT)
+
+        await env.start()
+
+        assert [thread for thread, _ in env.notices()] == [7]
+
+    async def test_a_bot_restart_in_the_same_boot_does_not_resend(self, env) -> None:
+        env.dead_topic(7, "@1", session="s1", cwd=str(env.tmp / "gone"))
+
+        await env.start()
+        await env.start()
+
+        assert len(env.sent) == 1
+
+    async def test_a_new_boot_may_notify_again(self, env) -> None:
+        env.dead_topic(7, "@1", session="s1", cwd=str(env.tmp / "gone"))
+
+        await env.start()
+        env.boot = "boot-2"
+        await env.start()
+
+        assert len(env.sent) == 2
+
+    async def test_a_restored_topic_is_not_told_again_after_a_restart(
+        self, env
+    ) -> None:
+        env.dead_topic(7, "@1", session="s1")
+
+        await env.start()
+        env.live = [WindowRef("@0", "_ccgram", str(env.tmp))]
+        await env.start()
+
+        assert len(env.sent) == 1
+
+    async def test_a_send_failure_is_logged_and_the_run_goes_on(self, env) -> None:
+        env.dead_topic(7, "@1", session="s1")
+        env.dead_topic(8, "@2", session="s2")
+        env.send_errors = [RuntimeError("network down")]
+
+        with capture_logs() as logs:
+            await env.start()
+
+        assert len(env.created) == 2
+        assert [thread for thread, _ in env.notices()] == [8]
+        assert any(log["event"] == "auto_restore_notice_failed" for log in logs)
+
+    async def test_a_notice_retry_after_is_waited_out(self, env) -> None:
+        env.dead_topic(7, "@1", session="s1")
+        env.send_errors = [RetryAfter(30)]
+
+        await env.start()
+
+        assert [c.args[0] for c in env.pause.await_args_list] == [30.0]
+        assert len(env.created) == 1

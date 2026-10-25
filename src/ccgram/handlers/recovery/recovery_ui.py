@@ -76,14 +76,19 @@ class RecoveryUi(Protocol):
 
 
 class HeadlessUi:
-    """A :class:`RecoveryUi` for runs with no Telegram message to edit."""
+    """A :class:`RecoveryUi` for runs with no Telegram message to edit.
+
+    ``final_text`` keeps the last text the flow showed: its outcome.
+    """
 
     user_data: dict[str, Any] | None = None
 
     def __init__(self) -> None:
         self.retry_after: float | None = None
+        self.final_text: str | None = None
 
     async def edit(self, text: str, **_kwargs: Any) -> None:
+        self.final_text = text
         logger.info("recovery_progress", text=text)
 
     async def answer(self, text: str) -> None:

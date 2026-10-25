@@ -16,6 +16,15 @@ class TestHeadlessUi:
             {"event": "recovery_outcome", "text": "Created", "log_level": "debug"},
         ]
 
+    async def test_final_text_is_the_last_one_shown(self) -> None:
+        ui = HeadlessUi()
+        assert ui.final_text is None
+
+        await ui.edit("working")
+        await ui.edit("done", reply_markup=None)
+
+        assert ui.final_text == "done"
+
     def test_holds_no_recovery_state(self) -> None:
         ui = HeadlessUi()
 

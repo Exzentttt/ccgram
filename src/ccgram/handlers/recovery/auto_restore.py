@@ -28,7 +28,7 @@ import subprocess
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Literal, NamedTuple
 
 import structlog
 
@@ -47,6 +47,7 @@ from ...utils import atomic_write_json, task_done_callback
 from ..topics import topic_orchestration
 from .recovery_banner import create_and_bind_window
 from .recovery_ui import HeadlessUi, ReplacementRequest
+from .restore_notices import CREATION_FAILED, send_notice, skip_text
 
 if TYPE_CHECKING:
     from telegram import Bot
@@ -97,6 +98,7 @@ class _Ledger:
         self._path = path
         self._boot_id = boot_id
         self._rows: dict[str, tuple[RestoreEntry, str]] = {}
+        self._noticed: set[str] = set()
 
     @classmethod
     def load(cls, path: Path, boot_id: str) -> _Ledger:
@@ -110,6 +112,7 @@ class _Ledger:
             if raw["boot_id"] == boot_id:
                 if raw["version"] != _LEDGER_VERSION:
                     raise ValueError(f"unknown ledger version {raw['version']!r}")
+                ledger._noticed = set(raw.get("notices", []))
                 for row in raw["entries"]:
                     status = row.pop("status")
                     entry = RestoreEntry(**row)
@@ -137,12 +140,31 @@ class _Ledger:
         self._rows[key] = (self._rows[key][0], status)
         self._save()
 
+    def claim_notice(self, key: str) -> bool:
+        """Reserve this boot's one skip notice for ``key``; False if taken."""
+        fresh = key not in self._noticed
+        if fresh:
+            self._noticed.add(key)
+            self._save()
+        return fresh
+
     def _save(self) -> None:
         entries = [{**asdict(e), "status": st} for e, st in self._rows.values()]
         atomic_write_json(
             self._path,
-            {"version": _LEDGER_VERSION, "boot_id": self._boot_id, "entries": entries},
+            {
+                "version": _LEDGER_VERSION,
+                "boot_id": self._boot_id,
+                "entries": entries,
+                "notices": sorted(self._noticed),
+            },
         )
+
+
+class _Notice(NamedTuple):
+    chat_id: int
+    thread_id: int
+    text: str
 
 
 @dataclass(frozen=True)
@@ -154,6 +176,22 @@ class _World:
 def _skip(reason: str, where: tuple[int | None, int, str]) -> None:
     log = logger.debug if reason == "window_alive" else logger.info
     log("auto_restore_skip", reason=reason, **dict(zip(_WHERE, where, strict=True)))
+
+
+def _notice_for(reason: str, where: tuple[int | None, int, str]) -> _Notice | None:
+    """The topic's notice when ``reason`` is one a user can act on."""
+    chat_id, thread_id, window_id = where
+    view = window_query.view_window(window_id)
+    text = skip_text(reason, view.cwd if view else "")
+    if text is None or chat_id is None:
+        return None
+    return _Notice(chat_id, thread_id, text)
+
+
+async def _send_skip(notice: _Notice, ledger: _Ledger, bot: Bot) -> float | None:
+    if not ledger.claim_notice(f"{notice.chat_id}:{notice.thread_id}"):
+        return None
+    return await send_notice(bot, notice.chat_id, notice.thread_id, notice.text)
 
 
 def _codex_rollouts(session_id: str) -> list[Path]:
@@ -348,7 +386,7 @@ async def _live_world() -> _World | None:
     return _World(live, frozenset(v.session_id for v in views if v is not None))
 
 
-async def _build_plan(ledger: _Ledger) -> list[RestoreEntry]:
+async def _build_plan(ledger: _Ledger, notices: list[_Notice]) -> list[RestoreEntry]:
     world = await _live_world()
     if world is None:
         logger.warning("auto_restore_listing_unconfirmed")
@@ -357,7 +395,10 @@ async def _build_plan(ledger: _Ledger) -> list[RestoreEntry]:
     for binding in list(thread_router.iter_thread_bindings_with_chat()):
         found = await _entry_for_binding(binding, world, ledger)
         if isinstance(found, str):
-            _skip(found, (binding[1], binding[2], binding[3]))
+            where = (binding[1], binding[2], binding[3])
+            _skip(found, where)
+            if notice := _notice_for(found, where):
+                notices.append(notice)
         elif found.session_id in planned:
             _skip("duplicate_session", found.where)
         else:
@@ -409,7 +450,8 @@ async def _restore_one(
     reason = await _skip_reason_now(entry)
     if reason is not None:
         _skip(reason, entry.where)
-        return None
+        notice = _notice_for(reason, entry.where)
+        return await _send_skip(notice, ledger, bot) if notice else None
     ledger.set_status(entry.key, _ATTEMPTING)
     ui = HeadlessUi()
     try:
@@ -417,24 +459,29 @@ async def _restore_one(
     except Exception:
         logger.exception("auto_restore_failed", key=entry.key)
         ledger.set_status(entry.key, _FAILED)
-        return None
+        return await send_notice(bot, entry.chat_id, entry.thread_id, CREATION_FAILED)
     ledger.set_status(entry.key, _DONE if restored else _FAILED)
     logger.info("auto_restore_done", key=entry.key, restored=restored)
-    return ui.retry_after
+    text = ui.final_text or CREATION_FAILED
+    notice_retry = await send_notice(bot, entry.chat_id, entry.thread_id, text)
+    return notice_retry or ui.retry_after
 
 
 async def _run(
-    plan: list[RestoreEntry],
+    work: list[_Notice | RestoreEntry],
     ledger: _Ledger,
     bot: Bot,
     get_adapter: Callable[[], TelegramSessionAdapter],
 ) -> None:
-    """Restore the plan; wait out a rate limit up to a bounded number of times."""
+    """Tell skipped topics, restore the plan; wait out rate limits a bounded number of times."""
     waits = 0
-    for index, entry in enumerate(plan):
+    for index, item in enumerate(work):
         if index:
             await _pause(GAP_S)
-        retry_after = await _restore_one(entry, ledger, bot, get_adapter)
+        if isinstance(item, _Notice):
+            retry_after = await _send_skip(item, ledger, bot)
+        else:
+            retry_after = await _restore_one(item, ledger, bot, get_adapter)
         if retry_after is None:
             continue
         if waits == MAX_RATE_LIMIT_WAITS:
@@ -489,18 +536,21 @@ async def start_auto_restore(
             logger.warning("boot_id_unavailable")
             return None
         ledger = _Ledger.load(config.config_dir / _LEDGER_FILE, boot_id)
-        plan = await _build_plan(ledger)
+        notices: list[_Notice] = []
+        plan = await _build_plan(ledger, notices)
         if plan and not reserved:
             logger.warning("auto_restore_skipped", reason="id_reservation_unavailable")
-            return None
+            text = skip_text("id_reservation_unavailable") or ""
+            notices += [_Notice(e.chat_id, e.thread_id, text) for e in plan]
+            plan = []
         ledger.add_pending(plan)
     except Exception:
         logger.exception("auto_restore_failed_to_start")
         return None
-    if not plan:
+    if not plan and not notices:
         return None
     task = asyncio.create_task(
-        _run(plan, ledger, bot, get_adapter), name="auto_restore"
+        _run([*notices, *plan], ledger, bot, get_adapter), name="auto_restore"
     )
     task.add_done_callback(task_done_callback)
     return task
