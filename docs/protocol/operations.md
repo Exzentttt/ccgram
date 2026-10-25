@@ -100,6 +100,12 @@ share linked windows, so a lock for each session cannot prevent overlapping
 writers. For work and personal groups, use the
 [single-core group setup](../guides.md#multi-instance-setup).
 
+Setting `CCGRAM_PROTOCOL_LOCK_SCOPE=session` narrows the lock for tmux only: it is
+keyed by the tmux server socket and `TMUX_SESSION_NAME`, so two processes on
+different tmux sessions can run. Never link a window into both sessions: the
+lock then no longer prevents two cores from writing to one target. Other backends
+ignore the setting, log a warning and keep the backend-wide lock.
+
 ## Status refresh and native probes
 
 Native agent status is optional enrichment. Telegram status polling and the

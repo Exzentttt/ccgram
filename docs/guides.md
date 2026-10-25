@@ -486,6 +486,21 @@ Separate `CCGRAM_DIR` or `TMUX_SESSION_NAME` values do not permit a second proce
 with that backend. Separate tmux sessions can share linked windows, so a lock for
 each session would not prevent two cores from controlling the same target.
 
+### Separate processes on different tmux sessions
+
+One process cannot serve two Claude accounts because `CCGRAM_CLAUDE_COMMAND` is set
+per process. For that case, run one process per account, each with its own
+`CCGRAM_DIR`, `TMUX_SESSION_NAME`, and bot token, and set:
+
+```ini
+CCGRAM_PROTOCOL_LOCK_SCOPE=session
+```
+
+The lock is then keyed by the tmux server socket and session name. Two processes on
+the same tmux session still conflict. Never link a window into both sessions: that
+is exactly the overlap the backend-wide lock prevents. Backends other than tmux
+ignore this setting and keep the backend-wide lock.
+
 ### Work and personal groups in one process
 
 Leave `CCGRAM_GROUP_ID` unset to handle multiple Telegram groups with one core:

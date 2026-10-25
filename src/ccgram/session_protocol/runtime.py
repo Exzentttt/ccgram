@@ -96,6 +96,36 @@ class ProtocolRuntime:
                 self.lock.close()
 
 
+def _tmux_socket_identity() -> str:
+    """Server identity the tmux client resolves: ``$TMUX`` socket or the default."""
+    inside = os.environ.get("TMUX", "").split(",", 1)[0]
+    if inside:
+        return inside
+    tmpdir = os.environ.get("TMUX_TMPDIR", "/tmp")
+    return f"{tmpdir}/tmux-{os.getuid()}/default"
+
+
+def _lock_name(multiplexer: Multiplexer) -> str:
+    """Lock file name: backend-wide, or per tmux server+session when opted in.
+
+    Backend-wide is the safe default because linked windows let two cores drive
+    one target. ``CCGRAM_PROTOCOL_LOCK_SCOPE=session`` is for tmux deployments
+    that never link a window into more than one of their sessions.
+    """
+    backend = multiplexer.capabilities.name
+    if os.environ.get("CCGRAM_PROTOCOL_LOCK_SCOPE") != "session":
+        return f"protocol-{backend}.lock"
+    if backend != "tmux":
+        logger.warning(
+            "CCGRAM_PROTOCOL_LOCK_SCOPE=session applies to tmux only; "
+            "keeping the backend-wide lock for %s",
+            backend,
+        )
+        return f"protocol-{backend}.lock"
+    identity = f"{_tmux_socket_identity()}\0{getattr(multiplexer, 'session_name', '')}"
+    return f"protocol-tmux-{hashlib.sha256(identity.encode()).hexdigest()[:16]}.lock"
+
+
 async def start_runtime(
     multiplexer: Multiplexer,
     directory: Path,
@@ -108,9 +138,7 @@ async def start_runtime(
     directory.mkdir(mode=0o700, parents=True, exist_ok=True)
     lock_dir = Path.home() / ".cache" / "ccgram" / "locks"
     lock_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-    # One core per config dir: separate configs may share a multiplexer server.
-    scope = hashlib.sha256(str(directory.resolve()).encode()).hexdigest()[:16]
-    lock_path = lock_dir / f"protocol-{multiplexer.capabilities.name}-{scope}.lock"
+    lock_path = lock_dir / _lock_name(multiplexer)
     resources = ExitStack()
     try:
         fd = os.open(lock_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
@@ -120,7 +148,8 @@ async def start_runtime(
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError as exc:
             raise RuntimeError(
-                "A session protocol core is already using this config directory"
+                "A session protocol core is already using this multiplexer backend "
+                "(or tmux session, with CCGRAM_PROTOCOL_LOCK_SCOPE=session)"
             ) from exc
         store = ProtocolStore(directory / "protocol.sqlite3")
         resources.callback(store.close)

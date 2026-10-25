@@ -95,7 +95,7 @@ async def test_runtime_lock_and_shutdown_are_real(
             await start_if_enabled(runtime.service, runtime.store)
         )
         with pytest.raises(RuntimeError, match="already using"):
-            await start_runtime(mux, tmp_path / "state", "", "test:")
+            await start_runtime(mux, tmp_path / "other-state", "", "test:")
         for _ in range(300):
             runtime.observe_hook(HookEvent("Stop", "test:@1", "conv", {}, 0))
         assert runtime.hooks.qsize() == 256
@@ -104,18 +104,67 @@ async def test_runtime_lock_and_shutdown_are_real(
     assert runtime.task.done()
 
 
-async def test_runtimes_with_different_config_dirs_coexist(tmp_path, monkeypatch):
-    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+def _mux(name: str = "tmux", session: str = "work") -> AsyncMock:
     mux = AsyncMock()
-    mux.capabilities = SimpleNamespace(name="test")
+    mux.capabilities = SimpleNamespace(name=name)
+    mux.session_name = session
     mux.list_windows_for_reconciliation.return_value = []
+    return mux
 
-    first = await start_runtime(mux, tmp_path / "state-a", "", "a:")
+
+@pytest.fixture
+def session_scope(tmp_path, monkeypatch):
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    monkeypatch.setenv("TMUX", f"{tmp_path}/tmux-sock,1,0")
+    monkeypatch.setenv("CCGRAM_PROTOCOL_LOCK_SCOPE", "session")
+
+
+async def test_default_lock_is_backend_wide_across_config_dirs(tmp_path, monkeypatch):
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    monkeypatch.delenv("CCGRAM_PROTOCOL_LOCK_SCOPE", raising=False)
+    first = await start_runtime(_mux(session="a"), tmp_path / "a", "", "a:")
     try:
-        second = await start_runtime(mux, tmp_path / "state-b", "", "b:")
-        await second.close()
         with pytest.raises(RuntimeError, match="already using"):
-            await start_runtime(mux, tmp_path / "state-a" / ".." / "state-a", "", "a:")
+            await start_runtime(_mux(session="b"), tmp_path / "b", "", "b:")
+    finally:
+        await first.close()
+
+
+async def test_session_scope_allows_different_tmux_sessions(tmp_path, session_scope):
+    first = await start_runtime(_mux(session="work"), tmp_path / "a", "", "a:")
+    try:
+        second = await start_runtime(_mux(session="personal"), tmp_path / "b", "", "b:")
+        await second.close()
+    finally:
+        await first.close()
+
+
+async def test_session_scope_conflicts_on_same_tmux_session(tmp_path, session_scope):
+    first = await start_runtime(_mux(session="work"), tmp_path / "a", "", "a:")
+    try:
+        with pytest.raises(RuntimeError, match="already using"):
+            await start_runtime(_mux(session="work"), tmp_path / "b", "", "b:")
+    finally:
+        await first.close()
+
+
+async def test_session_scope_conflicts_on_same_session_other_server(
+    tmp_path, session_scope, monkeypatch
+):
+    first = await start_runtime(_mux(session="work"), tmp_path / "a", "", "a:")
+    try:
+        monkeypatch.setenv("TMUX", f"{tmp_path}/other-sock,1,0")
+        second = await start_runtime(_mux(session="work"), tmp_path / "b", "", "b:")
+        await second.close()
+    finally:
+        await first.close()
+
+
+async def test_session_scope_is_ignored_on_non_tmux_backend(tmp_path, session_scope):
+    first = await start_runtime(_mux("herdr", "work"), tmp_path / "a", "", "a:")
+    try:
+        with pytest.raises(RuntimeError, match="already using"):
+            await start_runtime(_mux("herdr", "personal"), tmp_path / "b", "", "b:")
     finally:
         await first.close()
 

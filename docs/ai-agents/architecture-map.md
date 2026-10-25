@@ -33,7 +33,7 @@ Mobile client (HTTP/WebSocket → shared core):
 1. `api/server.py` validates Host/Origin, device credentials, and request schemas.
 2. Queries and actions use the same session service and executor as Telegram.
 3. WebSocket clients receive snapshots, canonical messages, requests, and bounded replay through the shared event hub.
-4. `bootstrap.py` starts the core even when the optional HTTP listener is disabled. See [protocol implementation](../protocol/implementation.md) for module boundaries and [operations](../protocol/operations.md) for the backend-wide process lock.
+4. `bootstrap.py` starts the core even when the optional HTTP listener is disabled. See [protocol implementation](../protocol/implementation.md) for module boundaries and [operations](../protocol/operations.md) for the backend-wide process lock (tmux can opt into a per-session lock with `CCGRAM_PROTOCOL_LOCK_SCOPE=session`).
 
 Outbound agent output (provider transcript/event → Telegram):
 
