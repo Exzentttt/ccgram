@@ -487,6 +487,33 @@ async def _back_off(
     return waits + 1
 
 
+async def _step(
+    item: _Notice | RestoreEntry,
+    ledger: _Ledger,
+    bot: Bot,
+    get_adapter: Callable[[], TelegramSessionAdapter],
+) -> tuple[float | None, _Notice | None]:
+    """Restore or notify once. Returns the wait owed and the notice that hit a limit."""
+    if isinstance(item, _Notice):
+        retry_after, notice = None, item
+    else:
+        retry_after, notice = await _restore_one(item, ledger, bot, get_adapter)
+    held = await _send(notice, ledger, bot) if notice else None
+    if notice is None or held is None:
+        return retry_after, None
+    return max(retry_after or 0, held), notice
+
+
+async def _resend(held: _Notice, ledger: _Ledger, bot: Bot, waits: int) -> int | None:
+    """Send a held notice once more; None once the wait cap is hit."""
+    again = await _send(held, ledger, bot)
+    if again is None:
+        return waits
+    logger.warning("auto_restore_notice_unsent", key=held.key)
+    # the next send waits out this limit too
+    return await _back_off(again, waits)
+
+
 async def _run(
     work: list[_Notice | RestoreEntry],
     ledger: _Ledger,
@@ -496,30 +523,19 @@ async def _run(
     """Tell skipped topics, restore the plan; wait out rate limits a bounded number of times."""
     waits = restores = 0
     for item in work:
-        retry_after: float | None = None
-        notice = item if isinstance(item, _Notice) else None
         if isinstance(item, RestoreEntry):
             if restores:
                 await _pause(GAP_S)
             restores += 1
-            retry_after, notice = await _restore_one(item, ledger, bot, get_adapter)
-        held = await _send(notice, ledger, bot) if notice else None
-        if notice and held is not None:
-            retry_after = max(retry_after or 0, held)
+        retry_after, held = await _step(item, ledger, bot, get_adapter)
         if retry_after is None:
             continue
-        hold = notice if held is not None else None
-        if (used := await _back_off(retry_after, waits, hold)) is None:
+        if (used := await _back_off(retry_after, waits, held)) is None:
             return
         waits = used
-        if notice and held is not None:
-            again = await _send(notice, ledger, bot)
-            if again is not None:
-                logger.warning("auto_restore_notice_unsent", key=notice.key)
-                # the next send waits out this limit too
-                if (used := await _back_off(again, waits)) is None:
-                    return
-                waits = used
+        if held and (used := await _resend(held, ledger, bot, waits)) is None:
+            return
+        waits = used
 
 
 async def _reserve_stale_ids() -> bool:
