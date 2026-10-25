@@ -473,7 +473,7 @@ Requirements and limits:
 
 - The tmux backend only. herdr and agterm cannot tell one server boot from another, so the feature logs `boot_id_unavailable` and does nothing there.
 - `CCGRAM_AUTODELETE_DEAD_TOPICS=false` is required. With deletion on, status polling would delete the dead topics before they are resumed, so CCGram logs a warning and skips auto-restore.
-- Claude and Codex topics only. Claude needs the session's transcript, `<id>.jsonl`, in the `projects` folder of the configured Claude config directory, under that topic's folder; Codex needs its `rollout-*-<session id>.jsonl` under `~/.codex/sessions`.
+- Claude and Codex topics only. Claude needs the session's transcript, `<id>.jsonl`, in any folder under `projects` in the configured Claude config directory, with the topic's working directory (symlinks resolved) recorded in the transcript; Codex needs its `rollout-*-<session id>.jsonl` under `~/.codex/sessions`.
 
 A topic is restored only when all of these hold: its chat is known; its window is confirmed gone in one window listing; its folder still exists; its session transcript is on disk (found by session id, its working directory read from the transcript itself); no other running window carries that session; and no topic creation or replacement claim covers it. Every skipped topic is logged as an `auto_restore_skip` event with its `reason`.
 

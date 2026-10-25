@@ -154,7 +154,7 @@ def _codex_rollout_exists(session_id: str) -> bool:
 
 def _first_cwd(transcript: Path) -> str:
     """The cwd of the first line carrying one; no line cap, bad JSON skipped."""
-    with transcript.open(encoding="utf-8") as lines:
+    with transcript.open(encoding="utf-8", errors="replace") as lines:
         for line in lines:
             with contextlib.suppress(ValueError):
                 data = json.loads(line)
@@ -169,7 +169,7 @@ def _claude_transcript_exists(entry: RestoreEntry) -> bool:
     for path in config.claude_projects_path.glob(
         f"*/{glob.escape(entry.session_id)}.jsonl"
     ):
-        with contextlib.suppress(OSError, UnicodeDecodeError):
+        with contextlib.suppress(OSError):
             if (cwd := _first_cwd(path)) and Path(cwd).resolve() == wanted:
                 return True
     return False

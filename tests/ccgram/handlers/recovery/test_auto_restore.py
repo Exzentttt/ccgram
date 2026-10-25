@@ -316,6 +316,30 @@ class TestHappyPath:
 
         assert [kw["resume_id"] for _, kw in env.created] == ["long"]
 
+    async def test_an_unreadable_transcript_never_blocks_another_topic(
+        self, env
+    ) -> None:
+        env.dead_topic(1, "@1", session="bad", name="alpha", known_session=False)
+        (env.tmp / "claude" / "projects" / "x" / "bad.jsonl").mkdir(parents=True)
+        env.dead_topic(2, "@2", session="good", name="beta")
+
+        await env.start()
+
+        assert [kw["resume_id"] for _, kw in env.created] == ["good"]
+
+    async def test_a_topic_cwd_that_is_a_symlink_finds_the_transcript(
+        self, env
+    ) -> None:
+        real = Path(env.project("real"))
+        link = env.tmp / "link"
+        link.symlink_to(real)
+        env.dead_topic(1, "@1", session="linked", cwd=str(link), known_session=False)
+        env.transcript(str(real), "linked")
+
+        await env.start()
+
+        assert [kw["resume_id"] for _, kw in env.created] == ["linked"]
+
     async def test_a_transcript_of_another_cwd_does_not_vouch_for_the_session(
         self, env
     ) -> None:
