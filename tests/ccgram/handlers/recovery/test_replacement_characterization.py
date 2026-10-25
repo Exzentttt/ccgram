@@ -647,6 +647,27 @@ class TestPersistenceFailureWhileFailing:
             *_UNCERTAIN,
         ]
 
+    async def test_flush_error_while_aborting_still_reports_the_failure(
+        self, flow
+    ) -> None:
+        flow.adapter.create = AsyncMock(
+            side_effect=ProtocolError(
+                400, "invalid_request", "Directory does not exist: /gone"
+            )
+        )
+        flow.session.flush_state.side_effect = [None, RuntimeError("disk full")]
+
+        await flow.tap_fresh()
+
+        assert flow.parent.mock_calls == [
+            *_CLAIM,
+            *_STALE_CHECKED,
+            _CREATE_NORMAL,
+            *_ABORTED,
+            call.edit("❌ Directory does not exist: /gone"),
+            call.answer("Failed"),
+        ]
+
 
 class TestSessionServiceMissing:
     async def test_failing_adapter_lookup_surfaces_at_the_create_step(

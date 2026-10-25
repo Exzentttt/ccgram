@@ -336,7 +336,7 @@ def _abort_provisioning_claim(claim_id: str) -> None:
         return
     try:
         session_manager.flush_state()
-    except BaseException:  # noqa: BLE001 (called from except blocks about to re-raise the original failure: a persistence failure must be logged, never replace that exception)
+    except BaseException:  # noqa: BLE001 (the claim is already released in memory; a failed flush is logged, never raised: on except paths it would replace the original failure, on the normal failure path it would skip the user-facing failure message)
         logger.warning("Could not persist aborted provisioning claim")
 
 
