@@ -76,8 +76,10 @@ adding a broker or interfaces around every import.
 
 On event-stream backends, `EventStreamMonitor` updates `agent_status_cache` and
 awaits its required `on_window_died(window_id)` callback after clearing cached
-status. Bootstrap snapshots current thread bindings before awaiting the existing
-Telegram death-policy handler, because deletion can unbind recipients. The same handler serves push and polling.
+status. Bootstrap binds that callback to the public
+`handlers/polling/window_death.py:handle_window_death` entrypoint. This Telegram
+adapter snapshots current recipients before awaiting the existing death-policy
+handler, because deletion can unbind them. The same handler serves push and polling.
 It checks exact chat identity, pending creation, and authoritative absence before
 deleting a topic. It retains the topic when `autodelete_dead_topics` is disabled. Its
 pre-await marker prevents concurrent push/poll duplicate work. A failed callback
@@ -95,12 +97,40 @@ Signal registration, re-raise, watchdog exit codes, and restart execution remain
 runner responsibilities.
 
 Behavior checks live in `test_event_stream_monitor.py`, `test_bootstrap.py`,
-`handlers/polling/test_window_tick.py`, `test_main.py`, and
+`handlers/polling/test_window_death.py`, `handlers/polling/test_window_tick.py`,
+`test_main.py`, and
 `test_error_handler.py` under `tests/ccgram/`.
 `test_runtime_boundaries.py` rejects presentation imports in the neutral monitor
-and CLI imports in the bot, including nested/lazy forms. Archfit mirrors these
-repaired dependency directions with fail rules. Module ownership, public-surface
-declarations, and volatility labels are separate from these code repairs.
+and CLI imports in the bot, including nested/lazy forms. Bootstrap must use the
+public Telegram entrypoint instead of importing private polling implementation.
+Archfit mirrors these directions with fail rules and declares only the narrow
+`window_death` module public, not other polling internals. Module ownership and
+volatility labels stay unchanged.
+
+### Shared core and planned mobile clients
+
+The [iOS design](architecture-design/2026-10-20-ios-app.md) is a thin client of
+`ccgram/1`, not of Telegram topics. Shared session IDs, canonical messages,
+requests, safe/idempotent actions, and replay remain in `session_protocol/`.
+The [implemented contract](protocol/implementation.md) and `protocol/v1/`
+schemas take precedence over older module names in the design.
+
+The monitor reports an internal native-target fact. It does not publish a mobile
+wire event or define the protocol session lifecycle. `LocalSessionService.refresh`
+owns target discovery, request closure, and `session.removed` events. Telegram
+topic cleanup stays in its adapter. Mobile replay never holds Telegram delivery
+receipts or watermarks.
+
+Current push subscriptions cover Telegram-bound targets. Mobile-only targets use
+the shared service's refresh loop independently. If push coverage expands,
+composition must source targets from the shared core, not treat Telegram
+bindings as the global session registry. The monitor's injected target provider
+and callback allow that without adding mobile DTOs to observation.
+
+The clean-interpreter import check rejects transitive Telegram/handler imports
+from the neutral monitor. Existing protocol boundary, fixture, and replay-isolation
+tests protect the shared core. Native iOS UI, APNs, and Telegram-free process
+startup remain later phases, not new scaffolding in this refactor.
 
 ## State Flow: Topic → Target → Session
 

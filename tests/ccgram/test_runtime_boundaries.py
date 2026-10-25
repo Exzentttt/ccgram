@@ -7,6 +7,17 @@ from pathlib import Path
 import pytest
 
 _SOURCE = Path(__file__).resolve().parents[2] / "src" / "ccgram"
+_FORBIDDEN = {
+    "event_stream_monitor": (
+        "ccgram.handlers",
+        "ccgram.telegram",
+        "ccgram.thread_router",
+        "ccgram.bot",
+        "telegram",
+    ),
+    "bot": ("ccgram.main",),
+    "bootstrap": ("ccgram.handlers.polling.window_tick",),
+}
 
 
 def _forbidden_imports(source: str, forbidden: tuple[str, ...]) -> list[str]:
@@ -27,40 +38,35 @@ def _forbidden_imports(source: str, forbidden: tuple[str, ...]) -> list[str]:
     return violations
 
 
-@pytest.mark.parametrize(
-    ("module", "forbidden"),
-    [
-        (
-            "event_stream_monitor",
-            (
-                "ccgram.handlers",
-                "ccgram.telegram",
-                "ccgram.thread_router",
-                "ccgram.bot",
-                "telegram",
-            ),
-        ),
-        ("bot", ("ccgram.main",)),
-    ],
-)
-def test_runtime_dependency_direction(module, forbidden):
+@pytest.mark.parametrize("module", _FORBIDDEN)
+def test_runtime_dependency_direction(module):
     source = (_SOURCE / f"{module}.py").read_text()
-    violations = _forbidden_imports(source, forbidden)
+    violations = _forbidden_imports(source, _FORBIDDEN[module])
     assert not violations, f"{module}.py: " + "\n".join(violations)
 
 
 @pytest.mark.parametrize(
-    ("source", "forbidden", "rejected"),
+    ("module", "source", "rejected"),
     [
-        ("import ccgram.main as runner", ("ccgram.main",), True),
-        ("from .main import _shutdown_signal", ("ccgram.main",), True),
-        ("def callback():\n    from . import main", ("ccgram.main",), True),
-        ("from ccgram import main as runner", ("ccgram.main",), True),
-        ("from .handlers import polling", ("ccgram.handlers",), True),
-        ("import telegram", ("telegram",), True),
-        ("from .telegram_client import TelegramClient", ("ccgram.telegram",), True),
-        ("from .multiplexer import base", ("ccgram.handlers", "telegram"), False),
+        ("bot", "import ccgram.main as runner", True),
+        ("bot", "from .main import _shutdown_signal", True),
+        ("bot", "def callback():\n    from . import main", True),
+        ("bot", "from ccgram import main as runner", True),
+        ("event_stream_monitor", "from .handlers import polling", True),
+        ("event_stream_monitor", "import telegram", True),
+        ("event_stream_monitor", "from .telegram_client import TelegramClient", True),
+        ("event_stream_monitor", "from .multiplexer import base", False),
+        (
+            "bootstrap",
+            "from .handlers.polling.window_tick import _handle_dead_window_notification",
+            True,
+        ),
+        (
+            "bootstrap",
+            "from .handlers.polling.window_death import handle_window_death",
+            False,
+        ),
     ],
 )
-def test_audit_rejects_planted_imports(source, forbidden, rejected):
-    assert bool(_forbidden_imports(source, forbidden)) is rejected
+def test_audit_rejects_planted_imports(module, source, rejected):
+    assert bool(_forbidden_imports(source, _FORBIDDEN[module])) is rejected

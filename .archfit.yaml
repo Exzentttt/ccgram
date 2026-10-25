@@ -74,6 +74,9 @@ modules:
     paths:
       - ccgram.handlers
       - ccgram.handlers.*
+    # One supported entrypoint for neutral death facts, not all polling internals.
+    public:
+      - ccgram.handlers.polling.window_death
     layer: adapter
     owner: alexei-led
     subdomain: core # the orchestration that makes ccgram ccgram
@@ -442,6 +445,12 @@ rules:
     type: forbidden_dependency
     from: ccgram.event_stream_monitor
     to: ccgram.thread_router
+    gate: fail
+  # Composition uses the supported adapter entrypoint, not private policy helpers.
+  - id: no-bootstrap-to-polling-implementation
+    type: forbidden_dependency
+    from: ccgram.bootstrap
+    to: ccgram.handlers.polling.window_tick**
     gate: fail
   # The runner supplies live lifecycle facts; the bot must not import CLI state.
   - id: no-bot-to-main

@@ -7,7 +7,6 @@ import pytest
 from ccgram import bootstrap
 from ccgram.event_stream_monitor import EventStreamMonitor
 from ccgram.multiplexer.base import MuxEvent
-from ccgram.thread_router import ThreadRouter
 from ccgram.session_protocol.models import ProtocolError
 
 
@@ -73,42 +72,20 @@ class TestStartEventStream:
 
         monitor.assert_not_called()
 
-    async def test_death_callback_routes_only_current_matching_bindings(self):
+    async def test_death_callback_awaits_public_telegram_entrypoint(self):
         app = _make_app()
-        router = ThreadRouter(
-            schedule_save=lambda: None,
-            has_window_state=lambda _wid: False,
-        )
-        router.bind_thread(7, 42, "old")
-        router.bind_thread(7, 99, "other")
-
-        async def delete_binding(_bot, user_id, thread_id, window_id):
-            assert router.unbind_thread(user_id, thread_id) == window_id
-
-        notify = AsyncMock(side_effect=delete_binding)
+        notify = AsyncMock()
         with (
             patch("ccgram.bootstrap.multiplexer") as mux,
-            patch("ccgram.thread_router.thread_router", router),
             patch.object(EventStreamMonitor, "start"),
-            patch(
-                "ccgram.handlers.polling.window_tick.apply._handle_dead_window_notification",
-                notify,
-            ),
+            patch("ccgram.handlers.polling.window_death.handle_window_death", notify),
         ):
             mux.capabilities.supports_event_stream = True
             monitor = bootstrap.start_event_stream(app)
             assert isinstance(monitor, EventStreamMonitor)
-            router.bind_thread(7, 42, "target")
-            router.bind_thread(8, 43, "target")
-
-            await monitor._dispatch(MuxEvent("window_died", "old"))
-            notify.assert_not_awaited()
             await monitor._dispatch(MuxEvent("window_died", "target"))
 
-        assert notify.await_args_list == [
-            call(app.bot, 7, 42, "target"),
-            call(app.bot, 8, 43, "target"),
-        ]
+        notify.assert_awaited_once_with(app.bot, "target")
 
 
 class TestEnsureMultiplexerSession:

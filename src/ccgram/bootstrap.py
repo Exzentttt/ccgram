@@ -360,16 +360,11 @@ def start_event_stream(application: Application) -> object | None:
     def _bound_window_ids() -> set[str]:
         return {wid for _u, _t, wid in thread_router.iter_thread_bindings()}
 
-    # Lazy: polling owns destructive topic policy; bootstrap owns its routing.
-    from .handlers.polling.window_tick.apply import _handle_dead_window_notification
+    # Lazy: the Telegram adapter owns recipient routing and destructive topic policy.
+    from .handlers.polling.window_death import handle_window_death
 
     async def on_window_died(window_id: str) -> None:
-        # Topic deletion unbinds recipients during await; do not iterate live maps.
-        for user_id, thread_id, bound_wid in list(thread_router.iter_thread_bindings()):
-            if bound_wid == window_id:
-                await _handle_dead_window_notification(
-                    application.bot, user_id, thread_id, window_id
-                )
+        await handle_window_death(application.bot, window_id)
 
     monitor = EventStreamMonitor(_bound_window_ids, on_window_died=on_window_died)
     monitor.start()
