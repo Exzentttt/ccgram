@@ -974,6 +974,21 @@ class TestStartupReservation:
         ]
         assert not [log for log in logs if log["log_level"] == "warning"]
 
+    async def test_a_backend_without_reservation_skips_a_planned_restore(
+        self, env, monkeypatch
+    ) -> None:
+        monkeypatch.setattr(config, "auto_restore_on_start", True)
+        env.dead_topic(1, "@1", session="s1")
+        env.can_reserve.return_value = False
+
+        with capture_logs() as logs:
+            assert await env.start() is None
+
+        env.adapter.create.assert_not_called()
+        assert [
+            log["reason"] for log in logs if log["event"] == "auto_restore_skipped"
+        ] == ["id_reservation_unavailable"]
+
     async def test_a_live_listing_needs_no_backend_capability(self, env) -> None:
         env.dead_topic(1, "@1", name="proj1")
         assert env.live is not None
@@ -1340,6 +1355,27 @@ class TestLedger:
         await env.start()
 
         assert len(env.created) == 1
+
+
+class TestSubprocessSeams:
+    async def test_lsof_gets_exactly_its_argv(self, tmp_path) -> None:
+        spawn = AsyncMock()
+        target = tmp_path / "rollout.jsonl"
+
+        with patch.object(asyncio, "create_subprocess_exec", spawn):
+            await auto_restore._spawn_lsof(target)
+
+        assert spawn.call_args.args == ("lsof", "-t", "--", str(target))
+
+    def test_ps_gets_exactly_its_argv_in_a_fixed_locale(self) -> None:
+        done = subprocess.CompletedProcess([], 0, stdout="x\n", stderr="")
+
+        with patch.object(subprocess, "run", return_value=done) as run:
+            assert auto_restore._ps_start(4242) == "x"
+
+        assert run.call_args.args == (["ps", "-o", "lstart=", "-p", "4242"],)
+        env = run.call_args.kwargs["env"]
+        assert (env["TZ"], env["LC_ALL"]) == ("UTC", "C")
 
 
 class TestLaunchCommand:

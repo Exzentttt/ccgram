@@ -10,8 +10,9 @@ such a binding is never resumed into. At every start, flag on or off, if a
 binding is dead the window-id counter advances past every bound id, so no new
 window takes another topic's old id. A session running outside the bot's tmux
 session (Claude pid registry, Codex rollout open per ``lsof``) is never resumed.
-The plan is saved to a ledger keyed by the server boot id: one attempt per (chat, topic, session) per boot, and the next start
-finishes a plan a crash cut short.
+The plan is saved to a ledger keyed by the server boot id: one attempt per
+(chat, topic, session) per boot, and the next start finishes a plan a crash
+cut short.
 
 Public surface: :func:`start_auto_restore`.
 """
