@@ -1811,3 +1811,45 @@ class TestNotices:
 
         await env.start()
         assert [thread for thread, _ in env.notices()] == [7]
+
+    async def test_a_resend_limited_again_is_waited_before_the_next_send(
+        self, env
+    ) -> None:
+        for thread in (1, 2):
+            env.dead_topic(
+                thread,
+                f"@{thread}",
+                cwd=str(env.tmp / f"gone{thread}"),
+                session=f"s{thread}",
+            )
+        env.send_errors = [RetryAfter(5), RetryAfter(7)]
+        sent_at_pause: list[int] = []
+
+        async def record(_seconds):
+            sent_at_pause.append(len(env.sent))
+
+        env.pause.side_effect = record
+
+        await env.start()
+
+        assert [c.args[0] for c in env.pause.await_args_list] == [5.0, 7.0]
+        assert sent_at_pause == [0, 0]
+        assert [thread for thread, _ in env.notices()] == [2]
+
+    async def test_giving_up_logs_the_notice_it_held_back(self, env) -> None:
+        for thread in range(1, 5):
+            env.dead_topic(
+                thread,
+                f"@{thread}",
+                cwd=str(env.tmp / f"gone{thread}"),
+                session=f"s{thread}",
+            )
+        env.send_errors = [RetryAfter(5), None] * 3 + [RetryAfter(5)]
+
+        with capture_logs() as logs:
+            await env.start()
+
+        unsent = [
+            log["key"] for log in logs if log["event"] == "auto_restore_notice_unsent"
+        ]
+        assert unsent == [f"{_CHAT}:4"]

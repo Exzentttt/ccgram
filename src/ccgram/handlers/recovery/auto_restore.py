@@ -98,7 +98,7 @@ class _Ledger:
         self._path = path
         self._boot_id = boot_id
         self._rows: dict[str, tuple[RestoreEntry, str]] = {}
-        self._noticed: set[str] = set()
+        self.noticed: set[str] = set()
 
     @classmethod
     def load(cls, path: Path, boot_id: str) -> _Ledger:
@@ -112,7 +112,7 @@ class _Ledger:
             if raw["boot_id"] == boot_id:
                 if raw["version"] != _LEDGER_VERSION:
                     raise ValueError(f"unknown ledger version {raw['version']!r}")
-                ledger._noticed = set(raw.get("notices", []))
+                ledger.noticed = set(raw.get("notices", []))
                 for row in raw["entries"]:
                     status = row.pop("status")
                     entry = RestoreEntry(**row)
@@ -125,7 +125,7 @@ class _Ledger:
         except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
             logger.warning("auto_restore_ledger_unreadable", error=str(exc))
             ledger._rows.clear()
-            ledger._noticed.clear()
+            ledger.noticed.clear()
         return ledger
 
     def status(self, key: str) -> str | None:
@@ -141,11 +141,8 @@ class _Ledger:
         self._rows[key] = (self._rows[key][0], status)
         self._save()
 
-    def has_notice(self, key: str) -> bool:
-        return key in self._noticed
-
     def add_notice(self, key: str) -> None:
-        self._noticed.add(key)
+        self.noticed.add(key)
         self._save()
 
     def _save(self) -> None:
@@ -156,7 +153,7 @@ class _Ledger:
                 "version": _LEDGER_VERSION,
                 "boot_id": self._boot_id,
                 "entries": entries,
-                "notices": sorted(self._noticed),
+                "notices": sorted(self.noticed),
             },
         )
 
@@ -192,12 +189,8 @@ def _notice_for(reason: str, where: tuple[int | None, int, str]) -> _Notice | No
 
 
 async def _send(notice: _Notice, ledger: _Ledger, bot: Bot) -> float | None:
-    """Send a notice (a skip notice once per topic per boot); returns a retry-after.
-
-    A topic counts as told only after the send went through, so a cancel or a
-    dropped notice leaves it for the next start.
-    """
-    if notice.once and ledger.has_notice(notice.key):
+    """Send a notice (a skip notice once per boot); the topic counts as told after."""
+    if notice.once and notice.key in ledger.noticed:
         return None
     retry_after = await send_notice(bot, *notice.topic, notice.text)
     if retry_after is None and notice.once:
@@ -478,6 +471,22 @@ async def _restore_one(
     return ui.retry_after, _Notice(entry.where[:2], text, once=False)
 
 
+async def _back_off(
+    retry_after: float, waits: int, held: _Notice | None = None
+) -> int | None:
+    """Wait out a rate limit; None once the cap is hit (``held`` is then left unsent)."""
+    if waits == MAX_RATE_LIMIT_WAITS:
+        logger.warning("auto_restore_rate_limited_giving_up", waits=waits)
+        if held:
+            logger.warning("auto_restore_notice_unsent", key=held.key)
+        return None
+    logger.warning(
+        "auto_restore_rate_limited", retry_after=retry_after, waits=waits + 1
+    )
+    await _pause(min(retry_after, MAX_RATE_LIMIT_WAIT_S))
+    return waits + 1
+
+
 async def _run(
     work: list[_Notice | RestoreEntry],
     ledger: _Ledger,
@@ -485,8 +494,7 @@ async def _run(
     get_adapter: Callable[[], TelegramSessionAdapter],
 ) -> None:
     """Tell skipped topics, restore the plan; wait out rate limits a bounded number of times."""
-    waits = 0
-    restores = 0
+    waits = restores = 0
     for item in work:
         retry_after: float | None = None
         notice = item if isinstance(item, _Notice) else None
@@ -496,20 +504,22 @@ async def _run(
             restores += 1
             retry_after, notice = await _restore_one(item, ledger, bot, get_adapter)
         held = await _send(notice, ledger, bot) if notice else None
-        if held is not None:
+        if notice and held is not None:
             retry_after = max(retry_after or 0, held)
         if retry_after is None:
             continue
-        if waits == MAX_RATE_LIMIT_WAITS:
-            logger.warning("auto_restore_rate_limited_giving_up", waits=waits)
+        hold = notice if held is not None else None
+        if (used := await _back_off(retry_after, waits, hold)) is None:
             return
-        waits += 1
-        logger.warning(
-            "auto_restore_rate_limited", retry_after=retry_after, waits=waits
-        )
-        await _pause(min(retry_after, MAX_RATE_LIMIT_WAIT_S))
-        if notice and held is not None and await _send(notice, ledger, bot) is not None:
-            logger.warning("auto_restore_notice_unsent", key=notice.key)
+        waits = used
+        if notice and held is not None:
+            again = await _send(notice, ledger, bot)
+            if again is not None:
+                logger.warning("auto_restore_notice_unsent", key=notice.key)
+                # the next send waits out this limit too
+                if (used := await _back_off(again, waits)) is None:
+                    return
+                waits = used
 
 
 async def _reserve_stale_ids() -> bool:

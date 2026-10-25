@@ -76,10 +76,7 @@ class RecoveryUi(Protocol):
 
 
 class HeadlessUi:
-    """A :class:`RecoveryUi` for runs with no Telegram message to edit.
-
-    ``final_text`` keeps the last text the flow showed: its outcome.
-    """
+    """A :class:`RecoveryUi` with no message to edit; ``final_text`` is the last text shown."""
 
     user_data: dict[str, Any] | None = None
 
