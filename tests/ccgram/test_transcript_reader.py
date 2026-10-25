@@ -569,3 +569,42 @@ async def test_read_keeps_entries_when_file_is_appended_during_read(tmp_path) ->
 
     assert stable is not None
     assert not stable.reset_generation
+
+
+_REWRITTEN = _LINE.replace('"x"', '"Y"')
+
+
+async def test_parser_rebuild_rejects_same_inode_rewrite_that_grows(tmp_path) -> None:
+    reader, session_file = _rebuild_reader(tmp_path, _LINE * 2)
+    expected = session_file.stat()
+    with session_file.open("r+") as transcript:
+        transcript.write(_REWRITTEN * 3)
+    assert session_file.stat().st_ino == expected.st_ino
+    reader._parser_rebuild_pending.add("sess")
+
+    assert not await _rebuild(reader, session_file, expected)
+    assert "sess" in reader._parser_rebuild_pending
+
+
+async def test_read_detects_rewrite_combined_with_growth_during_read(tmp_path) -> None:
+    reader, session_file = _rebuild_reader(tmp_path, _LINE * 6)
+    tracked = reader._state.get_session("sess")
+    assert tracked is not None
+    tracked.last_byte_offset = len(_LINE.encode()) * 4
+    reader._file_markers.clear()
+    original = reader._read_new_lines
+
+    async def read_then_rewrite_and_append(*args):
+        entries = await original(*args)
+        with session_file.open("r+") as transcript:
+            transcript.write(_REWRITTEN)
+            transcript.seek(0, os.SEEK_END)
+            transcript.write(_LINE)
+        return entries
+
+    with patch.object(reader, "_read_new_lines", read_then_rewrite_and_append):
+        stable = await reader._read_session_entries(
+            "sess", tracked, session_file, "@1", check_marker=True
+        )
+
+    assert stable is None or stable.reset_generation

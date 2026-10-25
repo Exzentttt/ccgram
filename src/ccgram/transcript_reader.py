@@ -568,6 +568,31 @@ class TranscriptReader:
                 self._startup_file_boundaries.pop(session_id, None)
         return _GenerationCheck(changed and not consumed_intact, consumed_intact)
 
+    async def _ctime_change_is_rewrite(
+        self,
+        session_id: str,
+        file_path: Path,
+        before: Any,
+        after: Any,
+        *,
+        check_marker: bool,
+    ) -> bool:
+        """True when a ctime change during a read means a rewrite, not an append.
+
+        An append bumps ctime too. Without growth the change is a rewrite; with
+        growth the cached prefix digest decides when one exists to verify.
+        """
+        if before.st_ctime_ns == after.st_ctime_ns:
+            return False
+        if after.st_size <= before.st_size:
+            return True
+        saved = self._file_prefixes.get(session_id)
+        if not check_marker or saved is None or saved[0] > before.st_size:
+            return False
+        return not await self._consumed_prefix_intact(
+            session_id, saved[0], file_path, after
+        )
+
     async def _read_session_entries(
         self,
         session_id: str,
@@ -591,11 +616,8 @@ class TranscriptReader:
                 after.st_dev,
                 after.st_ino,
             )
-            # An append bumps ctime too; only a ctime change without growth
-            # signals an in-place rewrite.
-            rewritten_in_place = (
-                before.st_ctime_ns != after.st_ctime_ns
-                and after.st_size <= before.st_size
+            rewritten_in_place = await self._ctime_change_is_rewrite(
+                session_id, file_path, before, after, check_marker=check_marker
             )
             marker_changed = False
             saved = self._file_markers.get(session_id) if check_marker else None
@@ -683,6 +705,15 @@ class TranscriptReader:
         if len(raw) != size or any(
             (stat.st_dev, stat.st_ino) != generation or stat.st_size < size
             for stat in (before, after)
+        ):
+            return False
+        # Same inode can still hold rewritten bytes; compare with the digest
+        # cached for this exact size when there is one.
+        saved = self._file_prefixes.get(session_id)
+        if (
+            saved is not None
+            and saved[0] == size
+            and hashlib.sha256(raw).digest() != saved[1]
         ):
             return False
 
