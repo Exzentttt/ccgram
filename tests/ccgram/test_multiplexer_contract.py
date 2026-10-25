@@ -21,6 +21,7 @@ from unittest.mock import AsyncMock, patch
 from ccgram.multiplexer import (
     UnknownMultiplexerError,
     _reset_multiplexer_for_testing,
+    can_reserve_window_ids,
     get_multiplexer,
     install_multiplexer,
     reserve_window_ids_past,
@@ -452,6 +453,19 @@ async def test_the_proxy_reports_no_reservation_for_other_backends(name: str) ->
     install_multiplexer(_backend_or_skip(name))
     try:
         assert await reserve_window_ids_past(["@1"]) is False
+    finally:
+        _reset_multiplexer_for_testing()
+
+
+@pytest.mark.parametrize(
+    ("name", "expected"), [("tmux", True), ("herdr", False), ("agterm", False)]
+)
+def test_only_a_backend_with_window_id_counter_can_reserve(
+    name: str, expected: bool
+) -> None:
+    install_multiplexer(_backend_or_skip(name))
+    try:
+        assert can_reserve_window_ids() is expected
     finally:
         _reset_multiplexer_for_testing()
 

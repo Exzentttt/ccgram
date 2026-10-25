@@ -73,25 +73,32 @@ class Env:
         self.adapter.create = AsyncMock(side_effect=self.create)
         self.adapter.close = AsyncMock(return_value=(True, "Closed"))
         self.lsof_result: tuple[int, bytes] | BaseException = (1, b"")
+        self.lsof_script: list[tuple[int, bytes]] = []
+        self.lsof_procs: list[MagicMock] = []
+        self.can_reserve = MagicMock(return_value=True)
         self.lsof_hangs = False
         self.lsof_calls: list[tuple[Any, ...]] = []
         self.lsof_exec = AsyncMock(side_effect=self.fake_lsof)
         self.ps_start: str | BaseException | None = "T0"
+        self.ps_code: int | None = None
         self.ps_run = MagicMock(side_effect=self.fake_ps)
 
-    def fake_ps(self, *_args: Any, **_kwargs: Any) -> SimpleNamespace:
+    def fake_ps(self, argv: list[str], env: dict[str, str]) -> SimpleNamespace:
         if isinstance(self.ps_start, BaseException):
             raise self.ps_start
         out = "" if self.ps_start is None else f"{self.ps_start}\n"
-        return SimpleNamespace(returncode=1 if self.ps_start is None else 0, stdout=out)
+        code = self.ps_code if self.ps_code is not None else int(self.ps_start is None)
+        return SimpleNamespace(returncode=code, stdout=out)
 
-    async def fake_lsof(self, *argv: str, **_kwargs: Any) -> MagicMock:
+    async def fake_lsof(self, path: Path) -> MagicMock:
+        argv = (path,)
         self.lsof_calls.append(argv)
         if isinstance(self.lsof_result, BaseException):
             raise self.lsof_result
-        code, out = self.lsof_result
+        code, out = self.lsof_script.pop(0) if self.lsof_script else self.lsof_result
         proc = MagicMock(returncode=None)
         proc.wait = AsyncMock()
+        self.lsof_procs.append(proc)
 
         async def communicate():
             if self.lsof_hangs:
@@ -167,10 +174,11 @@ class Env:
             self.next_id = max(self.next_id, highest + 1)
         return self.reserve_ok
 
-    def codex_rollout(self, session: str) -> None:
-        day = Path.home() / ".codex" / "sessions" / "2026" / "10" / "26"
-        day.mkdir(parents=True, exist_ok=True)
-        (day / f"rollout-2026-10-26T10-00-00-{session}.jsonl").write_text("{}\n")
+    def codex_rollout(self, session: str, day: str = "26") -> None:
+        day_dir = Path.home() / ".codex" / "sessions" / "2026" / "10" / day
+        day_dir.mkdir(parents=True, exist_ok=True)
+        name = f"rollout-2026-10-{day}T10-00-00-{session}.jsonl"
+        (day_dir / name).write_text("{}\n")
 
     def bound(self, thread: int) -> str | None:
         return self.router.get_window_for_chat_thread(_CHAT, thread)
@@ -213,6 +221,7 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setattr(
         config, "claude_projects_path", tmp_path / "claude" / "projects"
     )
+    monkeypatch.setattr(config, "claude_config_dir", tmp_path / "claude")
     monkeypatch.setattr(config, "auto_restore_on_start", True)
     monkeypatch.setattr(config, "autodelete_dead_topics", False)
     world = Env(tmp_path)
@@ -240,8 +249,9 @@ def env(tmp_path, monkeypatch):
         patch(f"{_AR}.list_windows_for_reconciliation", listing),
         patch(f"{_AR}.window_query.view_window", view_window),
         patch(f"{_AR}._pause", world.pause),
-        patch(f"{_AR}.asyncio.create_subprocess_exec", world.lsof_exec),
-        patch(f"{_AR}.subprocess.run", world.ps_run),
+        patch(f"{_AR}._spawn_lsof", world.lsof_exec),
+        patch(f"{_AR}._run_ps", world.ps_run),
+        patch(f"{_AR}.can_reserve_window_ids", world.can_reserve),
         patch(f"{_RC}.session_manager"),
         patch(f"{_RC}.PTBTelegramClient", MagicMock(return_value=client)),
         patch(f"{_RC}._stale_recovery_offer", world.stale),
@@ -622,6 +632,7 @@ class TestSkips:
 
         env.adapter.create.assert_not_called()
         assert _skips(logs) == ["session_live"]
+        assert env.ledger["entries"] == []  # refused at planning, not at create
 
     async def test_claude_registry_entry_of_a_dead_pid_does_not_block(
         self, env
@@ -637,6 +648,37 @@ class TestSkips:
 
         assert len(env.created) == 1
 
+    @pytest.mark.parametrize("pid", [0, -1, 2**70])
+    async def test_a_registry_pid_outside_the_pid_range_never_counts(
+        self, env, pid: int
+    ) -> None:
+        env.dead_topic(1, "@1", session="sess-1")
+        env.claude_registry("sess-1", pid)
+
+        await env.start()
+
+        assert len(env.created) == 1
+
+    def test_a_pid_we_may_not_signal_is_alive_one_that_is_gone_is_not(
+        self, monkeypatch
+    ) -> None:
+        kill = MagicMock(side_effect=PermissionError)
+        monkeypatch.setattr(auto_restore.os, "kill", kill)
+        assert auto_restore._pid_alive(7) is True
+        kill.side_effect = ProcessLookupError
+        assert auto_restore._pid_alive(7) is False
+
+    async def test_ps_that_fails_but_prints_a_time_is_not_trusted(self, env) -> None:
+        env.dead_topic(1, "@1", session="sess-1")
+        env.claude_registry("sess-1", os.getpid())
+        env.ps_code = 1
+
+        with capture_logs() as logs:
+            await env.start()
+
+        env.adapter.create.assert_not_called()
+        assert _skips(logs) == ["liveness_unconfirmed"]
+
     async def test_a_reused_pid_with_another_start_time_does_not_block(
         self, env
     ) -> None:
@@ -646,7 +688,8 @@ class TestSkips:
         await env.start()
 
         assert len(env.created) == 1
-        assert env.ps_run.call_args.kwargs["env"]["TZ"] == "UTC"
+        ps_env = env.ps_run.call_args.args[1]
+        assert (ps_env["TZ"], ps_env["LC_ALL"]) == ("UTC", "C")
 
     @pytest.mark.parametrize(
         ("registered", "ps_start"),
@@ -680,7 +723,8 @@ class TestSkips:
 
         env.adapter.create.assert_not_called()
         assert _skips(logs) == ["session_live"]
-        assert env.lsof_calls[0][:3] == ("lsof", "-t", "--")
+        assert env.lsof_calls[0][0].name.endswith("-cdx-1.jsonl")
+        assert env.ledger["entries"] == []
 
     @pytest.mark.parametrize(
         "outcome",
@@ -702,6 +746,47 @@ class TestSkips:
 
         env.adapter.create.assert_not_called()
         assert _skips(logs) == ["liveness_unconfirmed"]
+
+    async def test_one_open_rollout_wins_over_an_unknown_one(self, env) -> None:
+        env.dead_topic(1, "@1", session="cdx-1", provider="codex")
+        env.codex_rollout("cdx-1", day="25")
+        env.codex_rollout("cdx-1", day="26")
+        env.lsof_script = [(2, b""), (0, b"4242\n")]
+
+        with capture_logs() as logs:
+            await env.start()
+
+        env.adapter.create.assert_not_called()
+        assert _skips(logs) == ["session_live"]
+
+    async def test_a_timed_out_lsof_is_killed_and_reaped(
+        self, env, monkeypatch
+    ) -> None:
+        env.dead_topic(1, "@1", session="cdx-1", provider="codex")
+        env.codex_rollout("cdx-1")
+        env.lsof_hangs = True
+        monkeypatch.setattr(auto_restore, "_LSOF_TIMEOUT_S", 0.01)
+
+        await env.start()
+
+        proc = env.lsof_procs[0]
+        proc.kill.assert_called_once_with()
+        proc.wait.assert_awaited_once_with()
+
+    async def test_an_attempted_entry_never_probes_for_liveness(self, env) -> None:
+        env.dead_topic(1, "@1", session="cdx-1", provider="codex")
+        env.codex_rollout("cdx-1")
+        await env.start()
+        assert len(env.lsof_calls) == 2  # plan + re-check of the first run
+        env.live[:] = env.live[:1]  # the resumed window dies again, same boot
+        env.router.bind_thread(_USER, 1, "@1", window_name="proj1", chat_id=_CHAT)
+        env.lsof_calls.clear()
+
+        with capture_logs() as logs:
+            await env.start()
+
+        assert _skips(logs) == ["already_attempted"]
+        assert env.lsof_calls == []
 
     async def test_codex_rollout_not_open_is_resumed(self, env) -> None:
         env.dead_topic(1, "@1", session="cdx-1", provider="codex")
@@ -864,6 +949,63 @@ class TestStartupReservation:
         await env.start()
 
         env.reserve_call.assert_not_called()
+
+    async def test_an_unconfirmed_listing_reserves(self, env) -> None:
+        env.dead_topic(1, "@1")
+        env.live = None
+
+        await env.start()
+
+        assert env.reserved == [["@1"]]
+
+    async def test_a_backend_without_reservation_logs_info_not_a_warning(
+        self, env
+    ) -> None:
+        env.dead_topic(1, "@1")
+        env.can_reserve.return_value = False
+
+        with capture_logs() as logs:
+            await env.start()
+
+        env.reserve_call.assert_not_called()
+        events = [log for log in logs if log["event"] == "window_id_reservation"]
+        assert [(e["log_level"], e["reason"]) for e in events] == [
+            ("info", "not_applicable")
+        ]
+        assert not [log for log in logs if log["log_level"] == "warning"]
+
+    async def test_a_live_listing_needs_no_backend_capability(self, env) -> None:
+        env.dead_topic(1, "@1", name="proj1")
+        assert env.live is not None
+        env.live.append(WindowRef("@1", "proj1", env.states["@1"].cwd))
+        env.can_reserve.return_value = False
+
+        with capture_logs() as logs:
+            await env.start()
+
+        assert not [
+            log
+            for log in logs
+            if log["event"] == "window_id_reservation"
+            and log.get("reason") == "not_applicable"
+        ]
+
+    async def test_a_failing_reservation_is_logged_and_resumes_nothing(
+        self, env, monkeypatch
+    ) -> None:
+        monkeypatch.setattr(config, "auto_restore_on_start", True)
+        env.dead_topic(1, "@1", session="s1")
+        env.reserve_call.side_effect = RuntimeError("tmux gone")
+
+        with capture_logs() as logs:
+            await env.start()
+
+        failed = [log for log in logs if log["event"] == "window_id_reservation"]
+        assert [(e["reserved"], e["error"]) for e in failed] == [(False, "tmux gone")]
+        assert [
+            log["reason"] for log in logs if log["event"] == "auto_restore_skipped"
+        ] == ["id_reservation_unavailable"]
+        env.adapter.create.assert_not_called()
 
     async def test_no_bindings_reserves_nothing(self, env) -> None:
         await env.start()

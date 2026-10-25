@@ -9,8 +9,8 @@ ids restart with the server, so a stale id may already name a live window, and
 such a binding is never resumed into. At every start, flag on or off, if a
 binding is dead the window-id counter advances past every bound id, so no new
 window takes another topic's old id. A session running outside the bot's tmux
-session (Claude pid registry, Codex rollout open per ``lsof``) is never resumed. The plan is saved to a ledger keyed by the server
-boot id: one attempt per (chat, topic, session) per boot, and the next start
+session (Claude pid registry, Codex rollout open per ``lsof``) is never resumed.
+The plan is saved to a ledger keyed by the server boot id: one attempt per (chat, topic, session) per boot, and the next start
 finishes a plan a crash cut short.
 
 Public surface: :func:`start_auto_restore`.
@@ -33,7 +33,11 @@ import structlog
 
 from ... import window_query
 from ...config import config
-from ...multiplexer import multiplexer, reserve_window_ids_past
+from ...multiplexer import (
+    can_reserve_window_ids,
+    multiplexer,
+    reserve_window_ids_past,
+)
 from ...multiplexer.base import WindowRef
 from ...multiplexer.reconciliation import list_windows_for_reconciliation
 from ...providers.codex import codex_sessions_dir
@@ -166,27 +170,37 @@ def _pid_alive(pid: int) -> bool:
     return True
 
 
+def _run_ps(argv: list[str], env: dict[str, str]) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        argv, env=env, capture_output=True, text=True, timeout=5, check=False
+    )
+
+
+async def _spawn_lsof(path: Path) -> asyncio.subprocess.Process:
+    return await asyncio.create_subprocess_exec(
+        "lsof",
+        "-t",
+        "--",
+        str(path),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+
+
 def _ps_start(pid: int) -> str | None:
     """Process start time as the registry writes it; None when ps cannot say."""
     env = {**os.environ, "TZ": "UTC", "LC_ALL": "C"}
     try:
-        done = subprocess.run(
-            ["ps", "-o", "lstart=", "-p", str(pid)],
-            env=env,
-            capture_output=True,
-            text=True,
-            timeout=5,
-            check=False,
-        )
+        done = _run_ps(["ps", "-o", "lstart=", "-p", str(pid)], env)
     except OSError, subprocess.TimeoutExpired:
         return None
-    return done.stdout.strip() or None if done.returncode == 0 else None
+    return (done.stdout.strip() or None) if done.returncode == 0 else None
 
 
 def _claude_registry_live(session_id: str) -> bool | None:
     """True/False from the pid registry; None when an entry cannot be settled."""
     unknown = False
-    registry = config.claude_projects_path.parent / "sessions"
+    registry = config.claude_config_dir / "sessions"
     for path in registry.glob("*.json"):  # never the *.key files beside them
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
@@ -194,7 +208,7 @@ def _claude_registry_live(session_id: str) -> bool | None:
             if data["sessionId"] != session_id or pid <= 0 or not _pid_alive(pid):
                 continue
             started = data.get("procStart")
-        except OSError, ValueError, KeyError, TypeError:
+        except OSError, ValueError, KeyError, TypeError, OverflowError:
             continue
         # A reboot leaves stale entries whose pids other processes now hold.
         actual = _ps_start(pid) if started else None
@@ -209,15 +223,13 @@ async def _rollout_open(path: Path) -> bool | None:
     """Whether any process has the file open; None when lsof cannot say."""
     proc = None
     try:
-        argv = ("lsof", "-t", "--", str(path))
-        proc = await asyncio.create_subprocess_exec(
-            *argv, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL
-        )
+        proc = await _spawn_lsof(path)
         out, _ = await asyncio.wait_for(proc.communicate(), _LSOF_TIMEOUT_S)
     except OSError, TimeoutError:
         if proc is not None:
             with contextlib.suppress(ProcessLookupError):
                 proc.kill()
+                await proc.wait()
         return None
     if proc.returncode == 0 and out.strip():
         return True
@@ -290,11 +302,9 @@ async def _unrestorable(
         return "provisioning_claim"
     if entry.session_id in world.live_sessions:
         return "session_already_live"
-    if reason := await _outside_liveness(entry):
-        return reason
     if ledger.status(entry.key) in _ATTEMPTED:
         return "already_attempted"
-    return None
+    return await _outside_liveness(entry)
 
 
 async def _entry_for_binding(
@@ -442,9 +452,12 @@ async def _reserve_stale_ids() -> bool:
         bound = [wid for *_, wid in thread_router.iter_thread_bindings_with_chat()]
         live = await list_windows_for_reconciliation(multiplexer) if bound else []
         stale = live is None or not all(any(w.matches(b) for w in live) for b in bound)
+        if stale and not can_reserve_window_ids():
+            logger.info("window_id_reservation", reason="not_applicable")
+            return False
         reserved = await reserve_window_ids_past(bound) if stale else True
-    except Exception:
-        logger.exception("window_id_reservation_failed")
+    except Exception as exc:
+        logger.exception("window_id_reservation", reserved=False, error=str(exc))
         return False
     log = logger.info if reserved else logger.warning
     log("window_id_reservation", stale=stale, reserved=reserved, bound=len(bound))

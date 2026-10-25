@@ -30,6 +30,7 @@ from ccgram.multiplexer.registry import (
 __all__ = [
     "Multiplexer",
     "UnknownMultiplexerError",
+    "can_reserve_window_ids",
     "get_active_multiplexer",
     "get_multiplexer",
     "install_multiplexer",
@@ -88,6 +89,11 @@ class _MultiplexerProxy:
 
 
 multiplexer: Multiplexer = cast("Multiplexer", _MultiplexerProxy())
+
+
+def can_reserve_window_ids() -> bool:
+    """Whether the wired backend can reserve window ids (tmux only)."""
+    return isinstance(get_active_multiplexer(), WindowIdReserver)
 
 
 async def reserve_window_ids_past(window_ids: Iterable[str]) -> bool:
