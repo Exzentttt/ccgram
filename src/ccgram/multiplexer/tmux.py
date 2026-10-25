@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import re
 import structlog
 import subprocess
 from collections.abc import AsyncGenerator, Sequence
@@ -71,6 +72,9 @@ __all__ = [
 ]
 
 logger = structlog.get_logger()
+
+_RESERVE_SESSION = "_ccgram-reserve"
+_RESERVE_MAX_WINDOWS = 10_000
 
 # Backward-compat alias: callers still import ``TmuxWindow`` from this module.
 # ``WindowRef`` is field-compatible (Task 1), so the alias is exact.
@@ -1116,6 +1120,41 @@ class TmuxManager:
         except LibTmuxException:
             return None
         return (result.stdout[0].strip() or None) if result.stdout else None
+
+    async def reserve_window_ids_above(self, highest: int) -> bool:
+        """Burn window ids in a throwaway session until the next one exceeds ``highest``.
+
+        tmux window ids are server-global and only grow, so afterwards no new
+        window can take an id at or below ``highest``. The session is named
+        with a leading underscore, which window discovery never adopts.
+        """
+        try:
+            return await asyncio.to_thread(self._reserve_window_ids, highest)
+        except LibTmuxException:
+            logger.warning("Window id reservation failed", exc_info=True)
+            return False
+
+    def _reserve_window_ids(self, highest: int) -> bool:
+        target = f"={_RESERVE_SESSION}"
+        self.server.cmd("kill-session", "-t", target)  # a leftover of a crash
+        last = self._created_window_number("new-session", "-d", "-s", _RESERVE_SESSION)
+        for _ in range(_RESERVE_MAX_WINDOWS):
+            if last is None or last > highest:
+                break
+            last = self._created_window_number("new-window", "-d", "-t", f"{target}:")
+        killed = self.server.cmd("kill-session", "-t", target)
+        if killed.stderr:
+            logger.warning(
+                "Window id reservation session not removed: %s", killed.stderr
+            )
+        return last is not None and last > highest
+
+    def _created_window_number(self, *args: str) -> int | None:
+        result = self.server.cmd(*args, "-P", "-F", "#{window_id}")
+        match = (
+            re.fullmatch(r"@(\d+)", result.stdout[0].strip()) if result.stdout else None
+        )
+        return int(match[1]) if match else None
 
     async def pane_dims(self, window_id: str) -> PaneDims | None:
         """Return the active pane's column/row dimensions, or None on failure."""

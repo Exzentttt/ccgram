@@ -53,6 +53,7 @@ CONTRACT_METHODS = (
     "get_pane_title",
     "stamp_pane_title",
     "server_boot_id",
+    "reserve_window_ids_above",
 )
 
 
@@ -427,3 +428,9 @@ async def test_tmux_does_not_prove_foreign_ids_absent(
 async def test_backends_without_a_server_clock_report_no_boot_id(name: str) -> None:
     """Only tmux can say when its server started; the others must say None."""
     assert await _backend_or_skip(name).server_boot_id() is None
+
+
+@pytest.mark.parametrize("name", ["herdr", "agterm"])
+async def test_backends_that_cannot_advance_window_ids_say_so(name: str) -> None:
+    """Auto-restore must not create windows where a stale id could collide."""
+    assert await _backend_or_skip(name).reserve_window_ids_above(10) is False

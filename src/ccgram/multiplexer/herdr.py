@@ -1063,6 +1063,11 @@ class HerdrManager:
         """Always None — no server clock to tell one boot from another."""
         return None
 
+    async def reserve_window_ids_above(self, highest: int) -> bool:
+        """Always False — window ids cannot be advanced on this backend."""
+        del highest
+        return False
+
     async def pane_dims(self, window_id: str) -> PaneDims | None:
         try:
             record = await self.guard_session_target(window_id)

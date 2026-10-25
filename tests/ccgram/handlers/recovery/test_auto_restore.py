@@ -48,7 +48,9 @@ class Env:
         self.boot = "boot-1"
         self.live: list[WindowRef] | None = [WindowRef("@0", "_ccgram", str(tmp_path))]
         self.states: dict[str, SimpleNamespace] = {}
-        self.claude_sessions: dict[str, list[str]] = {}
+        self.transcripts: list[Path] = []
+        self.reserved: list[int] = []
+        self.reserve_ok = True
         self.next_ids: list[str] = []
         self.created: list[tuple[dict, dict]] = []
         self.rename_error: Exception | None = None
@@ -61,6 +63,7 @@ class Env:
         self.pause = AsyncMock()
         self.mux = MagicMock()
         self.mux.server_boot_id = AsyncMock(side_effect=lambda: self.boot)
+        self.mux.reserve_window_ids_above = AsyncMock(side_effect=self.reserve)
         self.adapter = MagicMock()
         self.adapter.create = AsyncMock(side_effect=self.create)
         self.adapter.close = AsyncMock(return_value=(True, "Closed"))
@@ -98,7 +101,22 @@ class Env:
             approval_mode=opts["mode"],
         )
         if session and opts["known_session"] and provider == "claude":
-            self.claude_sessions.setdefault(cwd, []).append(session)
+            self.transcript(cwd, session)
+
+    def transcript(self, cwd: str, session: str) -> None:
+        folder = self.tmp / "claude" / "projects" / cwd.replace("/", "-")
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / f"{session}.jsonl").write_text("{}\n")
+        self.transcripts.append(folder / f"{session}.jsonl")
+
+    def forget_sessions(self) -> None:
+        for path in self.transcripts:
+            path.unlink()
+        self.transcripts.clear()
+
+    async def reserve(self, highest: int) -> bool:
+        self.reserved.append(highest)
+        return self.reserve_ok
 
     def codex_rollout(self, session: str) -> None:
         day = Path.home() / ".codex" / "sessions" / "2026" / "10" / "26"
@@ -113,6 +131,7 @@ class Env:
             raise self.create_error
         self.created.append((data, kwargs))
         wid = self.next_ids.pop(0)
+        assert int(wid[1:]) > max(self.reserved, default=0), "id below a stale id"
         title = Path(data["directory"]).name
         assert self.live is not None
         self.live.append(WindowRef(wid, title, data["directory"]))
@@ -142,6 +161,9 @@ class Env:
 def env(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     monkeypatch.setattr(config, "config_dir", tmp_path)
+    monkeypatch.setattr(
+        config, "claude_projects_path", tmp_path / "claude" / "projects"
+    )
     monkeypatch.setattr(config, "auto_restore_on_start", True)
     monkeypatch.setattr(config, "autodelete_dead_topics", False)
     world = Env(tmp_path)
@@ -151,12 +173,6 @@ def env(tmp_path, monkeypatch):
 
     def view_window(wid):
         return world.states.get(wid)
-
-    def scan(cwd, provider_name="claude"):
-        return [
-            SimpleNamespace(session_id=sid, provider_name="claude")
-            for sid in world.claude_sessions.get(cwd, [])
-        ]
 
     async def rename(**_kwargs):
         if world.rename_error is not None:
@@ -173,7 +189,6 @@ def env(tmp_path, monkeypatch):
         patch(f"{_AR}.multiplexer", mux),
         patch(f"{_AR}.list_windows_for_reconciliation", listing),
         patch(f"{_AR}.window_query.view_window", view_window),
-        patch(f"{_AR}.scan_sessions_for_cwd", scan),
         patch(f"{_AR}._pause", world.pause),
         patch(f"{_RC}.session_manager"),
         patch(f"{_RC}.PTBTelegramClient", MagicMock(return_value=client)),
@@ -265,6 +280,30 @@ class TestHappyPath:
         assert env.bound(1) == "@7"
         env.stale.assert_not_called()
         assert env.ledger_status() == {1: "done"}
+
+    async def test_an_old_session_among_many_newer_ones_is_still_found(
+        self, env
+    ) -> None:
+        env.dead_topic(1, "@1", session="old-one")
+        for n in range(8):  # the resume picker lists only the newest few
+            env.transcript(env.states["@1"].cwd, f"newer-{n}")
+        env.next_ids = ["@7"]
+
+        await env.start()
+
+        assert [kw["resume_id"] for _, kw in env.created] == ["old-one"]
+
+    async def test_other_transcripts_in_the_folder_do_not_vouch_for_the_session(
+        self, env
+    ) -> None:
+        env.dead_topic(1, "@1", session="gone", known_session=False)
+        env.transcript(env.states["@1"].cwd, "someone-else")
+
+        with capture_logs() as logs:
+            await env.start()
+
+        env.adapter.create.assert_not_called()
+        assert _skips(logs) == ["session_not_found"]
 
     async def test_codex_topic_resumes_when_its_rollout_exists(self, env) -> None:
         env.dead_topic(1, "@1", session="cdx-1", provider="codex")
@@ -472,68 +511,181 @@ class TestSkips:
         assert _skips(logs) == ["duplicate_session"]
 
 
-class TestIdCollisions:
-    async def test_a_new_window_taking_another_topics_old_id_does_not_lose_it(
+class TestIdReservation:
+    async def test_ids_are_reserved_past_every_binding_before_the_first_create(
         self, env
     ) -> None:
-        # tmux ids restart: A's new window is @2, which B was bound to.
-        env.dead_topic(1, "@1", session="sess-A", name="alpha", mode="yolo")
-        env.dead_topic(2, "@2", session="sess-B", name="beta", mode="normal")
-        env.next_ids = ["@2", "@3"]
+        env.dead_topic(1, "@1", session="sess-A", name="alpha")
+        env.dead_topic(2, "@2", session="sess-B", name="beta")
+        env.dead_topic(3, "@5", session="sess-C", name="gamma", known_session=False)
+        env.next_ids = ["@7", "@8"]
 
         await env.start()
 
-        (_, a_kwargs), (b_data, b_kwargs) = env.created
-        assert a_kwargs["resume_id"] == "sess-A"
-        assert b_kwargs == {
-            "approval_mode": "normal",
-            "resume_id": "sess-B",
-            "continue_session": False,
-        }
-        assert b_data["directory"].endswith("/beta")
-        assert env.bound(1) == "@2"
-        assert env.bound(2) == "@3"
-        assert env.ledger_status() == {1: "done", 2: "done"}
+        assert env.reserved == [5]  # the skipped topic's id counts too
+        assert [env.bound(t) for t in (1, 2, 3)] == ["@7", "@8", "@5"]
 
-    async def test_plan_members_are_not_rechecked_for_liveness(self, env) -> None:
-        env.dead_topic(1, "@1", session="sess-A")
-        env.dead_topic(2, "@2", session="sess-B")
-        env.next_ids = ["@2", "@3"]
+    async def test_a_failed_resume_never_retires_another_topic_for_deletion(
+        self, env
+    ) -> None:
+        env.dead_topic(1, "@1", session="sess-A", name="alpha")
+        env.dead_topic(2, "@2", session="sess-B", name="beta")
+        env.next_ids = ["@7", "@8"]
+        original = env.create
+        calls: list[str] = []
+
+        async def create(data, **kwargs):
+            calls.append(kwargs["resume_id"])
+            if len(calls) == 2:
+                raise ProtocolError(400, "invalid_request", "directory does not exist")
+            return await original(data, **kwargs)
+
+        env.adapter.create = AsyncMock(side_effect=create)
 
         await env.start()
 
-        # B's old id @2 is a live window by the time B runs; the plan proved
-        # it dead once, and only our own create changed that.
-        assert len(env.created) == 2
-        env.stale.assert_not_called()
+        assert list(env.router.iter_retired_topics()) == []
+        assert env.bound(2) == "@2"
+
+    async def test_an_unavailable_reservation_creates_nothing(self, env) -> None:
+        env.dead_topic(1, "@1", session="s1")
+        env.reserve_ok = False
+
+        with capture_logs() as logs:
+            assert await env.start() is None
+
+        env.adapter.create.assert_not_called()
+        assert not (env.tmp / "auto_restore.json").exists()
+        assert [
+            log["reason"] for log in logs if log["event"] == "auto_restore_skipped"
+        ] == ["id_reservation_unavailable"]
+
+    async def test_an_empty_plan_reserves_nothing(self, env) -> None:
+        env.dead_topic(1, "@1", known_session=False)
+
+        await env.start()
+
+        env.mux.reserve_window_ids_above.assert_not_called()
 
 
-class TestRateLimit:
-    async def test_the_first_retry_after_stops_the_run(self, env) -> None:
-        for thread in (1, 2, 3):
-            env.dead_topic(thread, f"@{thread}", session=f"s{thread}")
-        env.next_ids = ["@7", "@8", "@9"]
-        env.rename_error = RetryAfter(30)
+class TestChangesDuringTheRun:
+    @pytest.fixture()
+    def second_topic(self, env):
+        env.dead_topic(1, "@1", session="sess-A", name="alpha")
+        env.dead_topic(2, "@2", session="sess-B", name="beta")
+        env.next_ids = ["@7", "@8"]
+        return env.states["@2"].cwd
+
+    def start_session_b(self, env, cwd: str, *, bind: bool):
+        async def meanwhile(_seconds):
+            assert env.live is not None
+            env.live.append(WindowRef("@9", "beta", cwd))
+            env.states["@9"] = SimpleNamespace(
+                session_id="sess-B",
+                cwd=cwd,
+                provider_name="claude",
+                approval_mode="normal",
+            )
+            if bind:
+                env.router.bind_thread(
+                    _USER, 2, "@9", window_name="beta", chat_id=_CHAT
+                )
+
+        env.pause.side_effect = meanwhile
+
+    async def test_a_topic_the_user_resumed_by_hand_is_not_resumed_again(
+        self, env, second_topic
+    ) -> None:
+        self.start_session_b(env, second_topic, bind=True)
 
         with capture_logs() as logs:
             await env.start()
 
-        assert len(env.created) == 1
-        assert env.ledger_status() == {1: "done", 2: "pending", 3: "pending"}
-        assert any(log["event"] == "auto_restore_rate_limited" for log in logs)
+        assert [kw["resume_id"] for _, kw in env.created] == ["sess-A"]
+        assert env.bound(2) == "@9"
+        assert _skips(logs) == ["rebound"]
 
-    async def test_the_next_start_continues_where_it_stopped(self, env) -> None:
-        for thread in (1, 2, 3):
+    async def test_a_session_started_meanwhile_is_not_started_twice(
+        self, env, second_topic
+    ) -> None:
+        self.start_session_b(env, second_topic, bind=False)
+
+        with capture_logs() as logs:
+            await env.start()
+
+        assert [kw["resume_id"] for _, kw in env.created] == ["sess-A"]
+        assert _skips(logs) == ["session_live"]
+
+    async def test_an_old_id_taken_meanwhile_is_never_resumed_into(
+        self, env, second_topic
+    ) -> None:
+        async def meanwhile(_seconds):
+            assert env.live is not None
+            env.live.append(WindowRef("@2", "unrelated", second_topic))
+
+        env.pause.side_effect = meanwhile
+
+        with capture_logs() as logs:
+            await env.start()
+
+        assert [kw["resume_id"] for _, kw in env.created] == ["sess-A"]
+        assert _skips(logs) == ["stale_id_collision_suspected"]
+
+
+class TestRateLimit:
+    @pytest.fixture()
+    def five_topics(self, env):
+        for thread in range(1, 6):
             env.dead_topic(thread, f"@{thread}", session=f"s{thread}")
-        env.next_ids = ["@7", "@8", "@9"]
+        env.next_ids = ["@7", "@8", "@9", "@10", "@11"]
         env.rename_error = RetryAfter(30)
+
+    async def test_a_retry_after_is_waited_out_and_the_run_goes_on(self, env) -> None:
+        for thread in (1, 2):
+            env.dead_topic(thread, f"@{thread}", session=f"s{thread}")
+        env.next_ids = ["@7", "@8"]
+        env.rename_error = RetryAfter(30)
+
+        await env.start()
+
+        assert len(env.created) == 2
+        assert [c.args[0] for c in env.pause.await_args_list] == [
+            30.0,
+            auto_restore.GAP_S,
+            30.0,
+        ]
+
+    async def test_a_long_retry_after_wait_is_capped(self, env) -> None:
+        env.dead_topic(1, "@1", session="s1")
+        env.next_ids = ["@7"]
+        env.rename_error = RetryAfter(3600)
+
+        await env.start()
+
+        env.pause.assert_awaited_once_with(auto_restore.MAX_RATE_LIMIT_WAIT_S)
+
+    async def test_the_run_gives_up_after_three_waits(self, env, five_topics) -> None:
+        with capture_logs() as logs:
+            await env.start()
+
+        assert len(env.created) == 4
+        assert env.ledger_status()[5] == "pending"
+        assert any(
+            log["event"] == "auto_restore_rate_limited_giving_up" for log in logs
+        )
+
+    async def test_the_next_start_continues_where_it_stopped(
+        self, env, five_topics
+    ) -> None:
         await env.start()
 
         env.rename_error = None
         await env.start()
 
-        assert [kw["resume_id"] for _, kw in env.created] == ["s1", "s2", "s3"]
-        assert env.ledger_status() == {1: "done", 2: "done", 3: "done"}
+        assert [kw["resume_id"] for _, kw in env.created] == [
+            f"s{n}" for n in range(1, 6)
+        ]
+        assert set(env.ledger_status().values()) == {"done"}
 
 
 class TestFailures:
@@ -635,18 +787,16 @@ class TestLedger:
         assert env.ledger["boot_id"] == "boot-2"
         assert env.bound(1) == "@7"
 
-    async def test_a_crash_after_a_commits_restores_the_evicted_topic_from_the_ledger(
+    async def test_a_crash_between_topics_leaves_the_rest_for_the_next_start(
         self, env
     ) -> None:
         env.dead_topic(1, "@1", session="sess-A", name="alpha")
         env.dead_topic(2, "@2", session="sess-B", name="beta", mode="yolo")
-        env.next_ids = ["@2", "@3"]
+        env.next_ids = ["@7", "@8"]
         env.pause.side_effect = asyncio.CancelledError  # the "crash" after A
 
         with pytest.raises(asyncio.CancelledError):
             await env.start()
-        assert env.bound(1) == "@2"
-        assert env.bound(2) is None  # A's commit evicted B
         assert env.ledger_status() == {1: "done", 2: "pending"}
         env.pause.side_effect = None
 
@@ -657,38 +807,75 @@ class TestLedger:
         assert kwargs["resume_id"] == "sess-B"
         assert kwargs["approval_mode"] == "yolo"
         assert data["directory"].endswith("/beta")
-        assert env.bound(2) == "@3"
-
-    async def test_a_pending_row_is_dropped_once_its_topic_has_a_live_window(
-        self, env
-    ) -> None:
-        env.dead_topic(1, "@1", session="sess-A")
-        env.next_ids = ["@7"]
-        await env.start()
-        raw = env.ledger  # pretend the "done" write was lost
-        raw["entries"][0]["status"] = "pending"
-        (env.tmp / "auto_restore.json").write_text(json.dumps(raw))
-
-        await env.start()
-
-        assert len(env.created) == 1
-        assert env.ledger["entries"] == []
+        assert env.bound(2) == "@8"
 
     async def test_a_ledger_row_whose_session_vanished_is_not_restored(
         self, env
     ) -> None:
         env.dead_topic(1, "@1", session="sess-A", name="alpha")
         env.dead_topic(2, "@2", session="sess-B", name="beta")
-        env.next_ids = ["@2", "@3"]
+        env.next_ids = ["@7", "@8"]
         env.pause.side_effect = asyncio.CancelledError
         with pytest.raises(asyncio.CancelledError):
             await env.start()
         env.pause.side_effect = None
-        env.claude_sessions.clear()
+        env.forget_sessions()
 
         await env.start()
 
         assert len(env.created) == 1
+
+    def write_ledger(self, env, **fields) -> None:
+        body = {"version": 1, "boot_id": "boot-1", "entries": []} | fields
+        (env.tmp / "auto_restore.json").write_text(json.dumps(body))
+
+    async def test_the_ledger_file_carries_a_version(self, env) -> None:
+        env.dead_topic(1, "@1", session="s1")
+        env.next_ids = ["@7"]
+
+        await env.start()
+
+        assert env.ledger["version"] == 1
+
+    async def test_an_unknown_ledger_version_is_discarded_with_a_warning(
+        self, env
+    ) -> None:
+        env.dead_topic(1, "@1", session="s1")
+        env.next_ids = ["@7"]
+        self.write_ledger(env, version=2)
+
+        with capture_logs() as logs:
+            await env.start()
+
+        assert len(env.created) == 1
+        assert any(log["event"] == "auto_restore_ledger_unreadable" for log in logs)
+
+    async def test_a_row_that_is_not_an_object_never_breaks_startup(self, env) -> None:
+        env.dead_topic(1, "@1", session="s1")
+        env.next_ids = ["@7"]
+        self.write_ledger(env, entries=["junk"])
+
+        with capture_logs() as logs:
+            await env.start()
+
+        assert len(env.created) == 1
+        assert any(log["event"] == "auto_restore_ledger_unreadable" for log in logs)
+
+    async def test_a_row_with_an_unknown_status_counts_as_attempted(self, env) -> None:
+        env.dead_topic(1, "@1", session="s1")
+        env.next_ids = ["@7"]
+        env.create_error = ProtocolError(400, "invalid_request", "bad")
+        await env.start()
+        env.create_error = None
+        raw = env.ledger
+        raw["entries"][0]["status"] = "bogus"
+        (env.tmp / "auto_restore.json").write_text(json.dumps(raw))
+
+        with capture_logs() as logs:
+            await env.start()
+
+        assert env.created == []
+        assert _skips(logs) == ["already_attempted"]
 
     async def test_a_corrupt_ledger_starts_empty(self, env) -> None:
         env.dead_topic(1, "@1", session="s1")

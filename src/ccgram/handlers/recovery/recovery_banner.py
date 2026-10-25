@@ -25,7 +25,6 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable
 from dataclasses import dataclass, replace
-from datetime import timedelta
 from functools import partial
 from http import HTTPStatus
 from pathlib import Path
@@ -46,6 +45,7 @@ from ...providers import get_provider, get_provider_for_window
 from ...session import session_manager
 from ...session_map import session_map_sync
 from ...telegram_client import PTBTelegramClient
+from ...telegram_rate_limiter import retry_after_seconds
 from ...thread_router import thread_router
 from ...multiplexer import multiplexer as tmux_manager
 from ...multiplexer.base import canonical_window_id
@@ -776,10 +776,7 @@ class _Replacement:
             )
         except TelegramError as e:
             if isinstance(e, RetryAfter):
-                wait = e.retry_after
-                self.ui.note_rate_limit(
-                    wait.total_seconds() if isinstance(wait, timedelta) else float(wait)
-                )
+                self.ui.note_rate_limit(retry_after_seconds(e))
             logger.debug("Failed to rename topic: %s", e)
 
         await self.ui.edit(f"✅ {launch.message}\n\n{self.req.success_label}")

@@ -473,15 +473,19 @@ Requirements and limits:
 
 - The tmux backend only. herdr and agterm cannot tell one server boot from another, so the feature logs `boot_id_unavailable` and does nothing there.
 - `CCGRAM_AUTODELETE_DEAD_TOPICS=false` is required. With deletion on, status polling would delete the dead topics before they are resumed, so CCGram logs a warning and skips auto-restore.
-- Claude and Codex topics only. Claude needs the session in this account's transcript store for the topic's folder; Codex needs its `rollout-*-<session id>.jsonl` under `~/.codex/sessions`.
+- Claude and Codex topics only. Claude needs the session's transcript, `<id>.jsonl`, in the `projects` folder of the configured Claude config directory, under that topic's folder; Codex needs its `rollout-*-<session id>.jsonl` under `~/.codex/sessions`.
 
 A topic is restored only when all of these hold: its chat is known; its window is confirmed gone in one window listing; its folder still exists; its session is on disk; no other running window carries that session; and no topic creation or replacement claim covers it. Every skipped topic is logged as an `auto_restore_skip` event with its `reason`.
 
 tmux window ids restart with the server, so a topic's old id may now belong to a live window, including CCGram's own `_ccgram`. Such a topic is never resumed into or rebound: it is skipped with reason `stale_id_collision_suspected` and left to a manual `/restore`.
 
-The run is one plan, built before anything is created and saved to `auto_restore.json` in the CCGram config directory. Topics are resumed one at a time, three seconds apart, and the run stops at the first Telegram rate limit; the next start continues. Each (chat, topic, session) is attempted once per tmux server boot, so a failing topic is not retried on every restart. A restored topic's row is kept until the boot changes, so a window you kill on purpose later in the same boot is not resumed again at the next restart. If CCGram stops mid-run, the next start finishes the plan from the saved data, including a topic whose binding an earlier resume replaced by reusing its old window id.
+Before the first resume, CCGram advances tmux's window-id counter past the highest window number any topic binding still holds, so a resumed window can never take another topic's old id. It does this by creating and closing windows in a throwaway tmux session named `_ccgram-reserve`; the leading underscore keeps it out of window discovery. If the counter cannot be advanced and confirmed, CCGram logs `auto_restore_skipped` with reason `id_reservation_unavailable` and resumes nothing.
 
-Known limitation: status polling may post the dead-window banner in a topic shortly before auto-restore rebinds it.
+The run is one plan, built before anything is created and saved to `auto_restore.json` in the CCGram config directory. Topics are resumed one at a time, three seconds apart. Right before each resume the topic is checked again: if it has been rebound (you pressed **Resume** or ran `/restore`) it is skipped as `rebound`, and if its session has started in some window since, as `session_live`. On a Telegram rate limit the run waits out the delay (at most 300 seconds, at most three times) and goes on; after that it stops and the next start continues.
+
+Each (chat, topic, session) is attempted once per tmux server boot, so a failing topic is not retried on every restart. A restored topic's row is kept until the boot changes, so a window you kill on purpose later in the same boot is not resumed again at the next restart. The file carries a `version`; a file CCGram cannot read, or of another version, is discarded with an `auto_restore_ledger_unreadable` warning (that boot's attempts may then be repeated once), and a row with an unknown status counts as attempted.
+
+Known limitation: a message you send to a dead topic, or `/restore` you run, while the run is working through the plan can still race with it; the re-check narrows that window but cannot close it.
 
 ## Session Closure and Topic Deletion
 

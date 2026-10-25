@@ -6,10 +6,12 @@ still on disk, through the replacement flow the Resume button uses.
 
 One confirmed window listing builds a plan before anything is created: window
 ids restart with the server, so a stale id may already name a live window, and
-such a binding is never resumed into. The plan is saved to a ledger keyed by the
-server boot id, which makes an attempt once per (chat, topic, session) per boot
-and lets the next start finish a plan a crash cut short, including a topic whose
-binding an earlier create evicted by reusing its old window id.
+such a binding is never resumed into. Before the first create the multiplexer
+advances its window-id counter past every stale id any binding holds, so no new
+window can take another topic's old id and no binding is evicted by the run.
+The plan is saved to a ledger keyed by the server boot id, which makes an
+attempt once per (chat, topic, session) per boot and lets the next start finish
+a plan a crash cut short.
 
 Public surface: :func:`start_auto_restore`.
 """
@@ -19,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import glob
 import json
+import re
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -31,14 +34,12 @@ from ...config import config
 from ...multiplexer import multiplexer
 from ...multiplexer.base import WindowRef
 from ...multiplexer.reconciliation import list_windows_for_reconciliation
-from ...providers import get_provider_for_window, is_known_provider
 from ...providers.codex import codex_sessions_dir
 from ...thread_router import thread_router
 from ...utils import atomic_write_json, task_done_callback
 from ..topics import topic_orchestration
 from .recovery_banner import _create_and_bind_window
 from .recovery_ui import HeadlessUi, ReplacementRequest
-from .resume_picker import scan_sessions_for_cwd
 
 if TYPE_CHECKING:
     from telegram import Bot
@@ -48,10 +49,15 @@ if TYPE_CHECKING:
 logger = structlog.get_logger()
 
 GAP_S = 3.0
+MAX_RATE_LIMIT_WAITS = 3
+MAX_RATE_LIMIT_WAIT_S = 300.0
 _LEDGER_FILE = "auto_restore.json"
+_LEDGER_VERSION = 1
 _PENDING, _ATTEMPTING, _DONE, _FAILED = "pending", "attempting", "done", "failed"
-_WHERE = ("chat_id", "thread_id", "window_id")
+_STATUSES = frozenset({_PENDING, _ATTEMPTING, _DONE, _FAILED})
 _ATTEMPTED = frozenset({_ATTEMPTING, _DONE, _FAILED})
+_WHERE = ("chat_id", "thread_id", "window_id")
+_TMUX_WINDOW_ID = re.compile(r"@(\d+)")
 
 
 @dataclass(frozen=True)
@@ -82,37 +88,54 @@ class _Ledger:
 
     def __init__(self, path: Path, boot_id: str) -> None:
         self._path = path
-        self.boot_id = boot_id
-        self.rows: dict[str, tuple[RestoreEntry, str]] = {}
+        self._boot_id = boot_id
+        self._rows: dict[str, tuple[RestoreEntry, str]] = {}
 
     @classmethod
     def load(cls, path: Path, boot_id: str) -> _Ledger:
-        """Read the ledger; another boot's rows (or an unreadable file) are void."""
+        """Read the ledger; another boot's rows (or an unreadable file) are void.
+
+        A row with an unknown status counts as attempted: it is never retried.
+        """
         ledger = cls(path, boot_id)
         try:
             raw = json.loads(path.read_text(encoding="utf-8"))
             if raw["boot_id"] == boot_id:
+                if raw["version"] != _LEDGER_VERSION:
+                    raise ValueError(f"unknown ledger version {raw['version']!r}")
                 for row in raw["entries"]:
                     status = row.pop("status")
                     entry = RestoreEntry(**row)
-                    ledger.rows[entry.key] = (entry, status)
+                    ledger._rows[entry.key] = (
+                        entry,
+                        status if status in _STATUSES else _FAILED,
+                    )
         except FileNotFoundError:
             pass
-        except (OSError, ValueError, KeyError, TypeError) as exc:
+        except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
             logger.warning("auto_restore_ledger_unreadable", error=str(exc))
-            ledger.rows.clear()
+            ledger._rows.clear()
         return ledger
 
     def status(self, key: str) -> str | None:
-        return self.rows[key][1] if key in self.rows else None
+        return self._rows[key][1] if key in self._rows else None
+
+    def add_pending(self, entries: list[RestoreEntry]) -> None:
+        """Record planned entries that have no row yet, then save."""
+        for entry in entries:
+            self._rows.setdefault(entry.key, (entry, _PENDING))
+        self._save()
 
     def set_status(self, key: str, status: str) -> None:
-        self.rows[key] = (self.rows[key][0], status)
-        self.save()
+        self._rows[key] = (self._rows[key][0], status)
+        self._save()
 
-    def save(self) -> None:
-        entries = [{**asdict(e), "status": st} for e, st in self.rows.values()]
-        atomic_write_json(self._path, {"boot_id": self.boot_id, "entries": entries})
+    def _save(self) -> None:
+        entries = [{**asdict(e), "status": st} for e, st in self._rows.values()]
+        atomic_write_json(
+            self._path,
+            {"version": _LEDGER_VERSION, "boot_id": self._boot_id, "entries": entries},
+        )
 
 
 @dataclass(frozen=True)
@@ -131,18 +154,21 @@ def _codex_rollout_exists(session_id: str) -> bool:
     return any(codex_sessions_dir().glob(f"**/{pattern}"))
 
 
+def _claude_transcript_exists(entry: RestoreEntry) -> bool:
+    # Same path SessionResolver._build_session_file_path builds.
+    encoded_cwd = entry.cwd.replace("/", "-")
+    return (
+        config.claude_projects_path / encoded_cwd / f"{entry.session_id}.jsonl"
+    ).is_file()
+
+
 async def _session_exists(entry: RestoreEntry) -> bool | None:
     """Whether this account still holds the session; None if unresumable here."""
-    name = entry.provider_name
-    if name == "codex":
+    if entry.provider_name == "claude":
+        return await asyncio.to_thread(_claude_transcript_exists, entry)
+    if entry.provider_name == "codex":
         return await asyncio.to_thread(_codex_rollout_exists, entry.session_id)
-    if not is_known_provider(name):
-        return None
-    caps = get_provider_for_window("", provider_name=name).capabilities
-    if not (caps.supports_resume and caps.supports_resume_picker):
-        return None
-    sessions = await asyncio.to_thread(scan_sessions_for_cwd, entry.cwd, name)
-    return any(s.session_id == entry.session_id for s in sessions)
+    return None
 
 
 async def _unrestorable(
@@ -200,58 +226,44 @@ async def _entry_for_binding(
     return await _unrestorable(entry, world, ledger) or entry
 
 
-def _bound_to_live_window(entry: RestoreEntry, world: _World) -> bool:
-    bound = thread_router.get_window_for_chat_thread(entry.chat_id, entry.thread_id)
-    return bound is not None and any(w.matches(bound) for w in world.live)
+async def _live_world() -> _World | None:
+    """One confirmed window listing, or None when tmux cannot confirm it."""
+    live = await list_windows_for_reconciliation(multiplexer)
+    if live is None:
+        return None
+    views = (window_query.view_window(w.window_id) for w in live)
+    return _World(live, frozenset(v.session_id for v in views if v is not None))
 
 
-async def _collect(
-    planned: dict[str, RestoreEntry], world: _World, ledger: _Ledger
-) -> None:
-    """Fill ``planned`` (by session id: a session runs once) from live bindings,
-    then from pending ledger rows whose topic lost its binding."""
+async def _build_plan(ledger: _Ledger) -> list[RestoreEntry]:
+    world = await _live_world()
+    if world is None:
+        logger.warning("auto_restore_listing_unconfirmed")
+        return []
+    planned: dict[str, RestoreEntry] = {}  # by session id: a session runs once
     for binding in list(thread_router.iter_thread_bindings_with_chat()):
         found = await _entry_for_binding(binding, world, ledger)
         if isinstance(found, str):
             _skip(found, (binding[1], binding[2], binding[3]))
+        elif found.session_id in planned:
+            _skip("duplicate_session", found.where)
         else:
-            _admit(found, planned)
-    for entry, status in list(ledger.rows.values()):
-        if status != _PENDING or entry.session_id in planned:
-            continue
-        if thread_router.get_window_for_chat_thread(entry.chat_id, entry.thread_id):
-            continue
-        reason = await _unrestorable(entry, world, ledger)
-        if reason is None:
-            _admit(entry, planned)
-        else:
-            _skip(reason, entry.where)
-
-
-def _admit(entry: RestoreEntry, planned: dict[str, RestoreEntry]) -> None:
-    if entry.session_id in planned:
-        _skip("duplicate_session", entry.where)
-    else:
-        planned[entry.session_id] = entry
-
-
-async def _build_plan(ledger: _Ledger) -> list[RestoreEntry]:
-    live = await list_windows_for_reconciliation(multiplexer)
-    if live is None:
-        logger.warning("auto_restore_listing_unconfirmed")
-        return []
-    sessions = (window_query.view_window(w.window_id) for w in live)
-    world = _World(live, frozenset(v.session_id for v in sessions if v is not None))
-    for key, (entry, status) in list(ledger.rows.items()):
-        if status == _PENDING and _bound_to_live_window(entry, world):
-            del ledger.rows[key]
-    planned: dict[str, RestoreEntry] = {}
-    await _collect(planned, world, ledger)
+            planned[found.session_id] = found
     return list(planned.values())
 
 
-async def _pause() -> None:
-    await asyncio.sleep(GAP_S)
+def _highest_window_number() -> int:
+    """The largest tmux window number any binding (planned or not) still holds."""
+    numbers = (
+        int(match[1])
+        for _user, _chat, _thread, window_id in thread_router.iter_thread_bindings_with_chat()
+        if (match := _TMUX_WINDOW_ID.fullmatch(window_id))
+    )
+    return max(numbers, default=0)
+
+
+async def _pause(seconds: float) -> None:
+    await asyncio.sleep(seconds)
 
 
 def _request(entry: RestoreEntry) -> ReplacementRequest:
@@ -269,13 +281,32 @@ def _request(entry: RestoreEntry) -> ReplacementRequest:
     )
 
 
+async def _skip_reason_now(entry: RestoreEntry) -> str | None:
+    """Re-check a planned entry against the world as it is right now."""
+    bound = thread_router.get_window_for_chat_thread(entry.chat_id, entry.thread_id)
+    if bound != entry.old_window_id:
+        return "rebound"
+    world = await _live_world()
+    if world is None:
+        return "listing_unconfirmed"
+    if any(w.matches(entry.old_window_id) for w in world.live):
+        return "stale_id_collision_suspected"
+    if entry.session_id in world.live_sessions:
+        return "session_live"
+    return None
+
+
 async def _restore_one(
     entry: RestoreEntry,
     ledger: _Ledger,
     bot: Bot,
     get_adapter: Callable[[], TelegramSessionAdapter],
-) -> bool:
-    """Run one replacement. Returns True when the whole run must stop."""
+) -> float | None:
+    """Run one replacement. Returns Telegram's retry-after seconds, if it asked."""
+    reason = await _skip_reason_now(entry)
+    if reason is not None:
+        _skip(reason, entry.where)
+        return None
     ledger.set_status(entry.key, _ATTEMPTING)
     ui = HeadlessUi()
     try:
@@ -283,13 +314,10 @@ async def _restore_one(
     except Exception:
         logger.exception("auto_restore_failed", key=entry.key)
         ledger.set_status(entry.key, _FAILED)
-        return False
+        return None
     ledger.set_status(entry.key, _DONE if restored else _FAILED)
     logger.info("auto_restore_done", key=entry.key, restored=restored)
-    if ui.retry_after is None:
-        return False
-    logger.warning("auto_restore_rate_limited", retry_after=ui.retry_after)
-    return True
+    return ui.retry_after
 
 
 async def _run(
@@ -298,11 +326,22 @@ async def _run(
     bot: Bot,
     get_adapter: Callable[[], TelegramSessionAdapter],
 ) -> None:
+    """Restore the plan; wait out a rate limit up to a bounded number of times."""
+    waits = 0
     for index, entry in enumerate(plan):
         if index:
-            await _pause()
-        if await _restore_one(entry, ledger, bot, get_adapter):
+            await _pause(GAP_S)
+        retry_after = await _restore_one(entry, ledger, bot, get_adapter)
+        if retry_after is None:
+            continue
+        if waits == MAX_RATE_LIMIT_WAITS:
+            logger.warning("auto_restore_rate_limited_giving_up", waits=waits)
             return
+        waits += 1
+        logger.warning(
+            "auto_restore_rate_limited", retry_after=retry_after, waits=waits
+        )
+        await _pause(min(retry_after, MAX_RATE_LIMIT_WAIT_S))
 
 
 async def start_auto_restore(
@@ -326,9 +365,12 @@ async def start_auto_restore(
             return None
         ledger = _Ledger.load(config.config_dir / _LEDGER_FILE, boot_id)
         plan = await _build_plan(ledger)
-        for entry in plan:
-            ledger.rows.setdefault(entry.key, (entry, _PENDING))
-        ledger.save()
+        if plan and not await multiplexer.reserve_window_ids_above(
+            _highest_window_number()
+        ):
+            logger.warning("auto_restore_skipped", reason="id_reservation_unavailable")
+            return None
+        ledger.add_pending(plan)
     except Exception:
         logger.exception("auto_restore_failed_to_start")
         return None
