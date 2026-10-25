@@ -17,6 +17,11 @@ from typing import Any
 from .models import Message, Part
 
 _PART_FIELDS = frozenset(part_field.name for part_field in fields(Part)) - {"id"}
+_CHAT_ROLES = ("user", "assistant")
+_CODEX_USER_CONTEXT_RE = re.compile(
+    r"^(?:<(?:environment_context|permissions|user_instructions)(?:\s|>)|"
+    r"# AGENTS\.md instructions for )"
+)
 
 _ANTIGRAVITY_METADATA_RE = re.compile(
     r"<(ADDITIONAL_METADATA|USER_SETTINGS_CHANGE|USER_INFORMATION|USER_RULES|SKILLS|PLUGINS|SUBAGENTS|MESSAGING|CONVERSATION_TRANSCRIPT|ARTIFACTS|SLASH_COMMANDS|GUIDELINES|COMMUNICATION_STYLE)>[\s\S]*?</\1>",
@@ -258,11 +263,20 @@ def _codex(entry: SourceEntry, state: _CodexState) -> TranscriptRecord | None:
     timestamp = raw.get("timestamp")
     key = str(data.get("id") or f"o{entry.offset}")
     kind = data.get("type")
-    if raw.get("type") == "input_item" and data.get("role") == "user":
+    if raw.get("type") == "input_item":
+        if data.get("role") != "user" or kind not in (None, "message"):
+            return None
         return _codex_message(data, key, timestamp, state)
     if not isinstance(kind, str):
         return None
-    if kind == "message" and data.get("role") in {"user", "assistant", "system"}:
+    if kind == "message" and data.get("role") in _CHAT_ROLES:
+        if data.get("role") == "user":
+            parts, _ = _content(data.get("content"))
+            first_text = next(
+                (part["text"] for part in parts if part.get("type") == "text"), ""
+            )
+            if _CODEX_USER_CONTEXT_RE.match(first_text.lstrip()):
+                return None
         return _codex_message(data, key, timestamp, state)
     return _codex_other_item(data, key, timestamp, state)
 
@@ -491,7 +505,7 @@ def _chat(entry: SourceEntry, provider: str) -> TranscriptRecord | None:
                 ),
             ),
         )
-    if role not in {"user", "assistant", "system"}:
+    if role not in _CHAT_ROLES:
         return None
     parts, results = _content(msg.get("content"))
     if provider == "pi" and role == "assistant" and msg.get("stopReason") == "error":
@@ -514,13 +528,18 @@ def _chat(entry: SourceEntry, provider: str) -> TranscriptRecord | None:
 def _claude(
     entry: SourceEntry, state: TranscriptParserState
 ) -> TranscriptRecord | None:
+    data = entry.data
+    kind = data.get("type")
+    if kind not in _CHAT_ROLES or any(
+        data.get(flag) for flag in ("isMeta", "isSidechain", "isCompactSummary")
+    ):
+        return None
+    message = data.get("message")
+    if not isinstance(message, dict) or message.get("role", kind) != kind:
+        return None
     record = _chat(entry, "claude")
     if record is None:
         return None
-    data = entry.data
-    message = data.get("message")
-    if not isinstance(message, dict):
-        return record
     if record.role == "user":
         content = message.get("content")
         blocks = content if isinstance(content, list) else []
@@ -579,6 +598,8 @@ def _claude_local_command(
 
 def _pi(entry: SourceEntry) -> TranscriptRecord | None:
     data = entry.data
+    if data.get("type") not in ("message", "bashExecution"):
+        return None
     message = data.get("message")
     message = message if isinstance(message, dict) else None
     execution = (
@@ -631,23 +652,21 @@ def _pi(entry: SourceEntry) -> TranscriptRecord | None:
 
 
 def _antigravity_role(data: dict[str, Any], kind: str) -> str | None:
-    role = data.get("role")
-    if role not in {"user", "assistant"}:
-        role_map = {
-            "user": "user",
-            "user_input": "user",
-            "user_explicit": "user",
-            "user_implicit": "user",
-            "planner_response": "assistant",
-            "model": "assistant",
-            "assistant": "assistant",
-            "info": "assistant",
-            "error": "assistant",
-        }
-        role = role_map.get(kind.lower()) or role_map.get(
-            str(data.get("source", "")).lower()
-        )
-    return role if isinstance(role, str) else None
+    role_map = {
+        "user": "user",
+        "user_input": "user",
+        "user_explicit": "user",
+        "user_implicit": "user",
+        "planner_response": "assistant",
+        "model": "assistant",
+        "assistant": "assistant",
+        "info": "assistant",
+        "error": "assistant",
+    }
+    expected = role_map.get(kind.lower())
+    if expected is None or data.get("role", expected) != expected:
+        return None
+    return expected
 
 
 def _antigravity_clean_user_parts(parts: list[dict[str, Any]]) -> None:
@@ -789,9 +808,9 @@ def parse_records(
             if provider == "claude"
             else _pi(entry)
             if provider == "pi"
-            else _chat(entry, provider)
+            else None
         )
-        if record is None:
+        if record is None or record.role not in {"user", "agent"}:
             continue
         if deduplicate_updates and provider == "gemini":
             record = _deduplicate_gemini_record(record, entry, parser_state)

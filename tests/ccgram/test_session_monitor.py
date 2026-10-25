@@ -724,9 +724,14 @@ class TestSettledPrefixWatermarkCommit:
                         "type": "user",
                         "uuid": "result-message",
                         "message": {
-                            "role": "toolResult",
-                            "toolCallId": "tool-1",
-                            "content": "read complete",
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "tool_result",
+                                    "tool_use_id": "tool-1",
+                                    "content": "read complete",
+                                }
+                            ],
                         },
                     }
                 )
@@ -789,9 +794,14 @@ class TestSettledPrefixWatermarkCommit:
             "type": "user",
             "uuid": "result-message",
             "message": {
-                "role": "toolResult",
-                "toolCallId": "tool-1",
-                "content": "read complete",
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "tool-1",
+                        "content": "read complete",
+                    }
+                ],
             },
         }
         session_file.write_text(json.dumps(tool_call) + "\n")
@@ -1155,9 +1165,10 @@ class TestSettledPrefixWatermarkCommit:
             {
                 "type": "user",
                 "message": {
-                    "role": "toolResult",
-                    "toolCallId": "t1",
-                    "content": "done",
+                    "role": "user",
+                    "content": [
+                        {"type": "tool_result", "tool_use_id": "t1", "content": "done"}
+                    ],
                 },
             },
         )
@@ -1228,9 +1239,14 @@ class TestSettledPrefixWatermarkCommit:
             "type": "user",
             "uuid": "result-message",
             "message": {
-                "role": "toolResult",
-                "toolCallId": "tool-1",
-                "content": "skipped result",
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "tool-1",
+                        "content": "skipped result",
+                    }
+                ],
             },
         }
         fresh_output = {
@@ -1487,9 +1503,14 @@ class TestSettledPrefixWatermarkCommit:
                         "type": "user",
                         "uuid": "result-message",
                         "message": {
-                            "role": "toolResult",
-                            "toolCallId": "tool-1",
-                            "content": "replayed result",
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "tool_result",
+                                    "tool_use_id": "tool-1",
+                                    "content": "replayed result",
+                                }
+                            ],
                         },
                     }
                 )
@@ -1580,9 +1601,14 @@ class TestSettledPrefixWatermarkCommit:
             "type": "user",
             "uuid": "result-message",
             "message": {
-                "role": "toolResult",
-                "toolCallId": "tool-1",
-                "content": "read complete",
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "tool-1",
+                        "content": "read complete",
+                    }
+                ],
             },
         }
         later_text = {

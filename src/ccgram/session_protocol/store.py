@@ -293,6 +293,13 @@ class ProtocolStore:
     async def transcript_generation(self, key: str, path: Path) -> int:
         return (await self.transcript_snapshot(key, path)).generation
 
+    def has_transcript_observation(self, key: str) -> bool:
+        """Whether this source has ever had a persisted filesystem observation."""
+        return (
+            self.db.execute("SELECT 1 FROM transcripts WHERE key=?", (key,)).fetchone()
+            is not None
+        )
+
     async def transcript_snapshot(self, key: str, path: Path) -> TranscriptSnapshot:
         row = self.db.execute(
             "SELECT inode, size, prefix_size, prefix_hash, generation FROM transcripts WHERE key=?",

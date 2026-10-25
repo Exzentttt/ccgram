@@ -203,15 +203,19 @@ async def _wait_for_shell_ready(
 
 
 async def agent_process_started(
-    window_id: str, adapter: TelegramSessionAdapter
+    window_id: str,
+    adapter: TelegramSessionAdapter,
+    *,
+    expected_provider: str | None = None,
 ) -> bool | None:
-    """Whether a non-shell process owns the pane right now; None if unknown.
+    """Inspect launch readiness once, without waiting.
 
-    One probe, no waiting: callers decide whether to retry (launch) or leave
-    the claim quarantined (recovery). ``None`` means the backend could not
-    answer, not that the agent is gone.
+    Return None if resolution fails or no foreground argv is reported.
+    Return False for a shell or, with ``expected_provider``, an unavailable
+    target or another provider. True means a non-shell process, also available
+    and matching when ``expected_provider`` is supplied.
     """
-    # Lazy: only needed for hookless providers
+    # Lazy: only launch/recovery flows need process inspection.
     import os
 
     # Lazy: providers package heavy bootstrap
@@ -223,23 +227,30 @@ async def agent_process_started(
         return None
     if not target.foreground_argv:
         return None
+    if expected_provider is not None and (
+        not target.available or target.provider != expected_provider
+    ):
+        return False
     cmd = os.path.basename(target.foreground_argv[0]).lstrip("-")
     return cmd not in KNOWN_SHELLS
 
 
 async def _wait_for_agent_process(
-    window_id: str, adapter: TelegramSessionAdapter, *, attempts: int = 50
+    window_id: str,
+    adapter: TelegramSessionAdapter,
+    *,
+    attempts: int = 50,
+    expected_provider: str | None = None,
 ) -> bool:
-    """Wait for a hookless agent CLI to replace the shell as the pane's process.
+    """Wait for a non-shell foreground, matching the provider when specified.
 
-    Without this, the first poll sees the launch shell and treats the agent as
-    already exited, killing the window before the CLI has started. Returns
-    True once a non-shell process owns the pane; False means the pane still
-    shows a launch shell after the whole budget, so the caller must not bind
-    the topic as if the agent had started.
+    SessionStart can precede terminal readiness. A timeout leaves the launch
+    quarantined rather than sending its first prompt to an unknown process.
     """
     for _ in range(attempts):
-        if await agent_process_started(window_id, adapter):
+        if await agent_process_started(
+            window_id, adapter, expected_provider=expected_provider
+        ):
             return True
         await asyncio.sleep(0.2)
     return False
@@ -699,6 +710,13 @@ async def launch_window(  # noqa: C901, PLR0911, PLR0912, PLR0915
             map_entry_found = await session_map_sync.wait_for_session_map_entry(
                 created_wid, resolve_window_id=window_query.resolve_window_alias
             )
+            if map_entry_found:
+                # SessionStart can arrive before the terminal reports the CLI.
+                map_entry_found = await _wait_for_agent_process(
+                    created_wid,
+                    adapter_for(context.bot_data),
+                    expected_provider=provider_name,
+                )
         elif provider_caps.chat_first_command_path:
             map_entry_found = True
         else:
@@ -706,7 +724,9 @@ async def launch_window(  # noqa: C901, PLR0911, PLR0912, PLR0915
             # a timed-out wait reuses the quarantine path below instead of
             # reporting success for a window the next poll would kill.
             map_entry_found = await _wait_for_agent_process(
-                created_wid, adapter_for(context.bot_data)
+                created_wid,
+                adapter_for(context.bot_data),
+                expected_provider=provider_name,
             )
     except BaseException as exc:  # noqa: BLE001
         created_wid = _follow_supersession(created_wid, claim_id=claim_id)
@@ -724,8 +744,8 @@ async def launch_window(  # noqa: C901, PLR0911, PLR0912, PLR0915
     created_wid = _follow_supersession(created_wid, claim_id=claim_id)
 
     if not map_entry_found:
-        # A hook-registration timeout does not prove that the new terminal is
-        # dead. Re-read presence before deciding whether the target may be
+        # Registration/readiness timeout does not prove the terminal is dead.
+        # Re-read presence before deciding whether the target may be
         # aborted; live or unknown targets remain quarantined for recovery.
         # Lazy: reconciliation imports the active multiplexer backend.
         from ...multiplexer.reconciliation import window_presence
@@ -755,7 +775,7 @@ async def launch_window(  # noqa: C901, PLR0911, PLR0912, PLR0915
                 failure_message="session target is gone",
                 target_already_absent=True,
             )
-            message = "Session did not register with ccgram and is gone"
+            message = "Session target is gone"
             await _abort_topic_creation(query, message, context)
             return WindowLaunchResult(success=False, error_message=message)
 
@@ -763,11 +783,12 @@ async def launch_window(  # noqa: C901, PLR0911, PLR0912, PLR0915
         if claim_id is not None:
             topic_orchestration.clear_pending_creation(created_wid)
         message = (
-            "Session is still starting; ccgram kept it quarantined for recovery. "
-            "Try again after it finishes registering."
+            "Session is still starting or its foreground is unverified; "
+            "ccgram kept it quarantined for recovery. Try again once the selected "
+            "provider is running. Custom launch scripts must exec the provider CLI."
         )
-        # Keep pending thread/text state so the recovery flow can finish the
-        # exact topic once the late hook registration becomes observable.
+        # Retain the exact topic and first-message state while registration or
+        # matching foreground evidence is still unavailable.
         await safe_edit(query, f"⚠ {message}")
         return WindowLaunchResult(success=False, error_message=message)
 
@@ -800,8 +821,8 @@ async def launch_window(  # noqa: C901, PLR0911, PLR0912, PLR0915
         )
         session_manager.flush_state()
 
-    # The target either has a hook record or never needed one. This also clears
-    # the no-thread path, which otherwise has no topic bind to release the guard.
+    # The provider-specific creation checks passed. Release the guard also for
+    # the no-thread path, which has no topic bind to release it.
     topic_orchestration.clear_pending_creation(created_wid)
     if pending_thread_id is None:
         await safe_edit(query, f"✅ {message}")

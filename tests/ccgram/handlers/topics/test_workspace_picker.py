@@ -318,7 +318,12 @@ class TestWorkspaceIdThreaded:
                 )
             )
             adapter.resolve = AsyncMock(
-                return_value=(SimpleNamespace(foreground_argv=("claude",)), None)
+                return_value=(
+                    SimpleNamespace(
+                        foreground_argv=("claude",), provider="claude", available=True
+                    ),
+                    None,
+                )
             )
             mock_mux.stamp_pane_title = AsyncMock()
             mock_mux.capabilities.native_worktrees = False
