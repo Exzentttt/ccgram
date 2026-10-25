@@ -24,7 +24,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from structlog.testing import capture_logs
-from telegram.error import RetryAfter
+from telegram.error import BadRequest, NetworkError, RetryAfter
 
 from ccgram.config import config
 from ccgram.handlers.recovery import auto_restore
@@ -1439,6 +1439,7 @@ class TestNoticeTexts:
         [
             "rebound",
             "duplicate_session",
+            "session_already_live",
             "already_attempted",
             "listing_unconfirmed",
             "boot_id_unavailable",
@@ -1612,17 +1613,30 @@ class TestNotices:
 
         assert len(env.sent) == 1
 
-    async def test_a_send_failure_is_logged_and_the_run_goes_on(self, env) -> None:
+    @pytest.mark.parametrize(
+        "error",
+        [
+            NetworkError("connection reset"),
+            BadRequest("Message thread not found"),
+            RuntimeError("not a telegram error"),
+        ],
+        ids=["network", "topic_deleted", "other"],
+    )
+    async def test_a_send_failure_is_logged_and_the_run_goes_on(
+        self, env, error
+    ) -> None:
         env.dead_topic(7, "@1", session="s1")
         env.dead_topic(8, "@2", session="s2")
-        env.send_errors = [RuntimeError("network down")]
+        # safe_send retries a Telegram error once as plain text
+        env.send_errors = [error, error] if type(error) is NetworkError else [error]
 
         with capture_logs() as logs:
             await env.start()
 
         assert len(env.created) == 2
         assert [thread for thread, _ in env.notices()] == [8]
-        assert any(log["event"] == "auto_restore_notice_failed" for log in logs)
+        failed = [log for log in logs if log["event"] == "auto_restore_notice_failed"]
+        assert [(f["chat_id"], f["thread_id"]) for f in failed] == [(_CHAT, 7)]
 
     async def test_a_notice_retry_after_is_waited_out(self, env) -> None:
         env.dead_topic(7, "@1", session="s1")
@@ -1632,3 +1646,107 @@ class TestNotices:
 
         assert [c.args[0] for c in env.pause.await_args_list] == [30.0]
         assert len(env.created) == 1
+
+    async def test_a_rate_limited_notice_is_resent_once_after_the_wait(
+        self, env
+    ) -> None:
+        env.dead_topic(7, "@1", session="s1")
+        env.send_errors = [RetryAfter(30)]
+
+        await env.start()
+
+        assert len(env.created) == 1
+        assert len(env.sent) == 1
+        assert "Session resumed" in env.sent[0]["text"]
+
+    async def test_a_skip_notice_rate_limited_twice_is_unclaimed(self, env) -> None:
+        env.dead_topic(7, "@1", session="s1", cwd=str(env.tmp / "gone"))
+        env.send_errors = [RetryAfter(1), RetryAfter(1)]
+
+        with capture_logs() as logs:
+            await env.start()
+
+        assert env.sent == []
+        assert env.ledger["notices"] == []
+        assert any(log["event"] == "auto_restore_notice_unsent" for log in logs)
+        await env.start()
+        assert [thread for thread, _ in env.notices()] == [7]
+
+    async def test_a_restore_outcome_rate_limited_twice_does_not_rerun_it(
+        self, env
+    ) -> None:
+        env.dead_topic(7, "@1", session="s1")
+        env.send_errors = [RetryAfter(1), RetryAfter(1)]
+
+        await env.start()
+        env.live = [WindowRef("@0", "_ccgram", str(env.tmp))]
+        await env.start()
+
+        assert len(env.created) == 1
+        assert env.sent == []
+
+    async def test_notices_are_not_paced_but_restores_are(self, env) -> None:
+        env.dead_topic(1, "@1", session="s1", cwd=str(env.tmp / "gone1"))
+        env.dead_topic(2, "@2", session="s2", cwd=str(env.tmp / "gone2"))
+        env.dead_topic(3, "@3", session="s3")
+        env.dead_topic(4, "@4", session="s4")
+
+        await env.start()
+
+        assert len(env.sent) == 4
+        assert [c.args[0] for c in env.pause.await_args_list] == [auto_restore.GAP_S]
+
+    async def test_a_session_live_in_another_window_is_not_announced(self, env) -> None:
+        env.dead_topic(7, "@1", session="s1")
+        assert env.live is not None
+        env.live.append(WindowRef("@5", "elsewhere", str(env.tmp)))
+        env.states["@5"] = SimpleNamespace(
+            session_id="s1", cwd=str(env.tmp), provider_name="claude", approval_mode=""
+        )
+
+        with capture_logs() as logs:
+            await env.start()
+
+        assert "session_already_live" in _skips(logs)
+        assert env.sent == []
+
+    async def test_a_topic_is_queued_once_even_with_two_bindings(self, env) -> None:
+        env.reserve_ok = False
+        env.dead_topic(7, "@1", session="s1")
+        env.router.bind_thread(101, 7, "@2", window_name="proj7", chat_id=_CHAT)
+        env.states["@2"] = SimpleNamespace(
+            session_id="s2",
+            cwd=env.states["@1"].cwd,
+            provider_name="claude",
+            approval_mode="normal",
+        )
+        env.transcript(env.states["@1"].cwd, "s2")
+        spy = AsyncMock(wraps=auto_restore._send_skip)
+
+        with patch(f"{_AR}._send_skip", spy):
+            await env.start()
+
+        assert spy.await_count == 1
+
+    async def test_an_unreadable_ledger_forgets_its_notices_too(self, env) -> None:
+        env.dead_topic(7, "@1", session="s1", cwd=str(env.tmp / "gone"))
+        row = {"version": 1, "boot_id": env.boot, "entries": [{"bogus": 1}]}
+        (env.tmp / "auto_restore.json").write_text(
+            json.dumps({**row, "notices": [f"{_CHAT}:7"]})
+        )
+
+        await env.start()
+
+        assert [thread for thread, _ in env.notices()] == [7]
+
+    async def test_a_creation_failure_notice_is_resent_after_a_rate_limit(
+        self, env
+    ) -> None:
+        env.dead_topic(7, "@1", session="s1")
+        env.create_error = ProtocolError(503, "backend_unavailable", "down")
+        env.send_errors = [RetryAfter(1)]
+
+        await env.start()
+
+        assert [thread for thread, _ in env.notices()] == [7]
+        assert env.sent[0]["text"].startswith("❌ Not restored")
