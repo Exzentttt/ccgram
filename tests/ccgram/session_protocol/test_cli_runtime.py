@@ -95,13 +95,29 @@ async def test_runtime_lock_and_shutdown_are_real(
             await start_if_enabled(runtime.service, runtime.store)
         )
         with pytest.raises(RuntimeError, match="already using"):
-            await start_runtime(mux, tmp_path / "other-state", "", "test:")
+            await start_runtime(mux, tmp_path / "state", "", "test:")
         for _ in range(300):
             runtime.observe_hook(HookEvent("Stop", "test:@1", "conv", {}, 0))
         assert runtime.hooks.qsize() == 256
     finally:
         await runtime.close()
     assert runtime.task.done()
+
+
+async def test_runtimes_with_different_config_dirs_coexist(tmp_path, monkeypatch):
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    mux = AsyncMock()
+    mux.capabilities = SimpleNamespace(name="test")
+    mux.list_windows_for_reconciliation.return_value = []
+
+    first = await start_runtime(mux, tmp_path / "state-a", "", "a:")
+    try:
+        second = await start_runtime(mux, tmp_path / "state-b", "", "b:")
+        await second.close()
+        with pytest.raises(RuntimeError, match="already using"):
+            await start_runtime(mux, tmp_path / "state-a" / ".." / "state-a", "", "a:")
+    finally:
+        await first.close()
 
 
 async def test_store_constructor_failure_releases_lock_with_retained_traceback(

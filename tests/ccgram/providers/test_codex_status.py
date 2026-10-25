@@ -1,5 +1,7 @@
 import json
+from unittest.mock import patch
 
+from ccgram.providers import codex_status
 from ccgram.providers.codex_status import (
     build_codex_status_snapshot,
     has_codex_assistant_output_since,
@@ -148,3 +150,70 @@ def test_has_codex_assistant_output_since_handles_midline_offset(tmp_path) -> No
     first_line = transcript.read_text(encoding="utf-8").splitlines()[0]
     mid_offset = len(first_line) // 2
     assert has_codex_assistant_output_since(str(transcript), mid_offset) is True
+
+
+def _token_entry(total: int) -> dict:
+    return {
+        "timestamp": f"2026-03-02T17:00:{total:02d}.000Z",
+        "type": "event_msg",
+        "payload": {
+            "type": "token_count",
+            "info": {"total_token_usage": {"total_tokens": total}},
+        },
+    }
+
+
+def _append_jsonl(path, entries) -> None:
+    with path.open("a", encoding="utf-8") as handle:
+        for entry in entries:
+            handle.write(json.dumps(entry) + "\n")
+
+
+def test_status_snapshot_parses_only_appended_lines_on_repeat_poll(tmp_path) -> None:
+    transcript = tmp_path / "codex.jsonl"
+    _write_jsonl(transcript, [_token_entry(n) for n in range(1, 21)])
+    build_codex_status_snapshot(str(transcript), display_name="repo")
+
+    _append_jsonl(transcript, [_token_entry(21), _token_entry(22)])
+    with patch(
+        "ccgram.providers.codex_status._parse_json_object",
+        wraps=codex_status._parse_json_object,
+    ) as parse:
+        result = build_codex_status_snapshot(str(transcript), display_name="repo")
+
+    assert parse.call_count == 2
+    assert result is not None
+    assert "transcript entries: `22`" in result
+    assert "total `22`" in result
+
+
+def test_status_snapshot_counts_unterminated_last_line_without_caching_it(
+    tmp_path,
+) -> None:
+    transcript = tmp_path / "codex.jsonl"
+    _write_jsonl(transcript, [_token_entry(1)])
+    with transcript.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(_token_entry(2)))
+
+    first = build_codex_status_snapshot(str(transcript), display_name="repo")
+    with transcript.open("a", encoding="utf-8") as handle:
+        handle.write("\n")
+    second = build_codex_status_snapshot(str(transcript), display_name="repo")
+
+    assert first is not None
+    assert "transcript entries: `2`" in first
+    assert second is not None
+    assert "transcript entries: `2`" in second
+
+
+def test_status_snapshot_rescans_after_truncation(tmp_path) -> None:
+    transcript = tmp_path / "codex.jsonl"
+    _write_jsonl(transcript, [_token_entry(n) for n in range(1, 11)])
+    build_codex_status_snapshot(str(transcript), display_name="repo")
+
+    _write_jsonl(transcript, [_token_entry(50)])
+    result = build_codex_status_snapshot(str(transcript), display_name="repo")
+
+    assert result is not None
+    assert "transcript entries: `1`" in result
+    assert "total `50`" in result

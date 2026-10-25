@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import fcntl
+import hashlib
 import logging
 import os
 from collections.abc import Awaitable, Callable
@@ -107,7 +108,9 @@ async def start_runtime(
     directory.mkdir(mode=0o700, parents=True, exist_ok=True)
     lock_dir = Path.home() / ".cache" / "ccgram" / "locks"
     lock_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-    lock_path = lock_dir / f"protocol-{multiplexer.capabilities.name}.lock"
+    # One core per config dir: separate configs may share a multiplexer server.
+    scope = hashlib.sha256(str(directory.resolve()).encode()).hexdigest()[:16]
+    lock_path = lock_dir / f"protocol-{multiplexer.capabilities.name}-{scope}.lock"
     resources = ExitStack()
     try:
         fd = os.open(lock_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
@@ -117,7 +120,7 @@ async def start_runtime(
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError as exc:
             raise RuntimeError(
-                "A session protocol core is already using this multiplexer backend"
+                "A session protocol core is already using this config directory"
             ) from exc
         store = ProtocolStore(directory / "protocol.sqlite3")
         resources.callback(store.close)

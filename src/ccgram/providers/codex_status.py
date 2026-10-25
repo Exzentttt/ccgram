@@ -7,6 +7,7 @@ messages; this snapshot provides a reliable fallback.
 
 import json
 from collections.abc import Iterator
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -162,6 +163,68 @@ def _format_token_lines(last_token_info: dict[str, Any]) -> list[str]:
     return lines
 
 
+@dataclass(frozen=True)
+class _ScanState:
+    """Aggregates of a transcript prefix, resumable from ``offset``."""
+
+    dev: int = 0
+    ino: int = 0
+    offset: int = 0
+    entry_count: int = 0
+    last_timestamp: str = ""
+    session_meta: dict[str, Any] = field(default_factory=dict)
+    last_token_info: dict[str, Any] = field(default_factory=dict)
+
+
+_MAX_CACHED_SCANS = 32
+_scan_cache: dict[str, _ScanState] = {}
+
+
+def _absorb_entry(state: _ScanState, entry: dict[str, Any]) -> _ScanState:
+    """Return *state* updated with one parsed transcript entry."""
+    timestamp = entry.get("timestamp")
+    updates: dict[str, Any] = {"entry_count": state.entry_count + 1}
+    if isinstance(timestamp, str) and timestamp:
+        updates["last_timestamp"] = timestamp
+    payload = _as_dict(entry.get("payload"))
+    entry_type = entry.get("type")
+    if entry_type == "session_meta" and payload:
+        updates["session_meta"] = payload
+    elif entry_type == "event_msg" and payload.get("type") == "token_count":
+        info = _as_dict(payload.get("info"))
+        if info:
+            updates["last_token_info"] = info
+    return replace(state, **updates)
+
+
+def _scan_transcript(path: Path) -> _ScanState:
+    """Aggregate a transcript, parsing only bytes appended since the last scan.
+
+    Complete lines advance the cached offset. A trailing unterminated line is
+    counted for this result only, so it is re-read once its newline arrives.
+    """
+    key = str(path)
+    stat = path.stat()
+    state = _scan_cache.get(key, _ScanState())
+    if (state.dev, state.ino) != (stat.st_dev, stat.st_ino) or stat.st_size < (
+        state.offset
+    ):
+        state = _ScanState(dev=stat.st_dev, ino=stat.st_ino)
+    with path.open("rb") as handle:
+        handle.seek(state.offset)
+        for raw_line in handle:
+            complete = raw_line.endswith(b"\n")
+            parsed = _parse_json_object(raw_line.decode("utf-8", errors="replace"))
+            if parsed is not None:
+                state = _absorb_entry(state, parsed)
+            if complete:
+                state = replace(state, offset=state.offset + len(raw_line))
+                _scan_cache[key] = state
+    while len(_scan_cache) > _MAX_CACHED_SCANS:
+        del _scan_cache[next(iter(_scan_cache))]
+    return state
+
+
 def build_codex_status_snapshot(
     transcript_path: str,
     *,
@@ -177,32 +240,17 @@ def build_codex_status_snapshot(
     if not path.exists():
         return None
 
-    entry_count = 0
-    last_timestamp = ""
-    session_meta: dict[str, Any] = {}
-    last_token_info: dict[str, Any] = {}
-
     try:
-        for entry in _iter_json_entries(path):
-            entry_count += 1
-            timestamp = entry.get("timestamp")
-            if isinstance(timestamp, str) and timestamp:
-                last_timestamp = timestamp
-
-            payload = _as_dict(entry.get("payload"))
-            entry_type = entry.get("type")
-            if entry_type == "session_meta" and payload:
-                session_meta = payload
-                continue
-            if entry_type == "event_msg" and payload.get("type") == "token_count":
-                info = _as_dict(payload.get("info"))
-                if info:
-                    last_token_info = info
+        scan = _scan_transcript(path)
     except OSError:
         return None
 
-    if entry_count == 0:
+    if scan.entry_count == 0:
         return None
+    entry_count = scan.entry_count
+    last_timestamp = scan.last_timestamp
+    session_meta = scan.session_meta
+    last_token_info = scan.last_token_info
 
     resolved_session = (
         session_id

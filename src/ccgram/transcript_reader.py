@@ -290,6 +290,11 @@ def _prefix_digest(file_path: Path, size: int) -> bytes:
     return digest.digest()
 
 
+def _read_prefix(file_path: Path, size: int) -> bytes:
+    with file_path.open("rb") as transcript:
+        return transcript.read(size)
+
+
 def _tail_marker(file_path: Path, offset: int) -> bytes:
     """Read a small marker immediately before a consumed byte offset."""
     if offset <= 0:
@@ -586,7 +591,12 @@ class TranscriptReader:
                 after.st_dev,
                 after.st_ino,
             )
-            rewritten_in_place = before.st_ctime_ns != after.st_ctime_ns
+            # An append bumps ctime too; only a ctime change without growth
+            # signals an in-place rewrite.
+            rewritten_in_place = (
+                before.st_ctime_ns != after.st_ctime_ns
+                and after.st_size <= before.st_size
+            )
             marker_changed = False
             saved = self._file_markers.get(session_id) if check_marker else None
             if saved is not None and saved[0] == start_offset:
@@ -659,26 +669,19 @@ class TranscriptReader:
         tracked = self._state.get_session(session_id)
         if tracked is None:
             return False
+        size = expected_stat.st_size
         try:
             before = file_path.stat()
-            raw = await asyncio.to_thread(file_path.read_bytes)
+            raw = await asyncio.to_thread(_read_prefix, file_path, size)
             after = file_path.stat()
         except OSError:
             return False
-        expected_generation = (
-            expected_stat.st_dev,
-            expected_stat.st_ino,
-            expected_stat.st_size,
-            expected_stat.st_ctime_ns,
-        )
-        if any(
-            (
-                stat.st_dev,
-                stat.st_ino,
-                stat.st_size,
-                stat.st_ctime_ns,
-            )
-            != expected_generation
+        # JSONL is append-only: the first `size` bytes cannot change while the
+        # inode stays the same and the file does not shrink, so appends that
+        # land during the read do not invalidate the prefix.
+        generation = (expected_stat.st_dev, expected_stat.st_ino)
+        if len(raw) != size or any(
+            (stat.st_dev, stat.st_ino) != generation or stat.st_size < size
             for stat in (before, after)
         ):
             return False

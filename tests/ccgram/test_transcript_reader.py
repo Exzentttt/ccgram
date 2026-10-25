@@ -490,3 +490,82 @@ async def test_replaced_smaller_transcript_resumes_from_eof_no_replay(
     tracked = state.get_session("sess-replaced")
     assert tracked is not None
     assert tracked.parsed_offset == session_file.stat().st_size
+
+
+_LINE = '{"type":"assistant","message":{"content":[{"type":"text","text":"x"}]}}\n'
+
+
+def _rebuild_reader(tmp_path, content: str):
+    session_file = tmp_path / "transcript.jsonl"
+    session_file.write_text(content, newline="\n")
+    state = MonitorState(state_file=tmp_path / "monitor_state.json")
+    state.update_session(
+        TrackedSession("sess", str(session_file), last_byte_offset=len(_LINE.encode()))
+    )
+    return TranscriptReader(state, IdleTracker()), session_file
+
+
+async def _rebuild(reader, session_file, expected_stat) -> bool:
+    return await reader._rebuild_committed_parser_context(
+        "sess",
+        session_file,
+        "claude",
+        expected_stat,
+        supports_incremental_read=True,
+    )
+
+
+async def test_parser_rebuild_accepts_append_after_expected_stat(tmp_path) -> None:
+    reader, session_file = _rebuild_reader(tmp_path, _LINE * 2)
+    expected = session_file.stat()
+    with session_file.open("a") as transcript:
+        transcript.write(_LINE)
+    reader._parser_rebuild_pending.add("sess")
+
+    assert await _rebuild(reader, session_file, expected)
+    assert "sess" not in reader._parser_rebuild_pending
+
+
+async def test_parser_rebuild_rejects_truncated_file(tmp_path) -> None:
+    reader, session_file = _rebuild_reader(tmp_path, _LINE * 2)
+    expected = session_file.stat()
+    session_file.write_text(_LINE, newline="\n")
+    reader._parser_rebuild_pending.add("sess")
+
+    assert not await _rebuild(reader, session_file, expected)
+    assert "sess" in reader._parser_rebuild_pending
+
+
+async def test_parser_rebuild_rejects_replaced_inode(tmp_path) -> None:
+    reader, session_file = _rebuild_reader(tmp_path, _LINE * 2)
+    expected = session_file.stat()
+    replacement = tmp_path / "replacement.jsonl"
+    replacement.write_text(_LINE * 3, newline="\n")
+    replacement.replace(session_file)
+    reader._parser_rebuild_pending.add("sess")
+
+    assert not await _rebuild(reader, session_file, expected)
+    assert "sess" in reader._parser_rebuild_pending
+
+
+async def test_read_keeps_entries_when_file_is_appended_during_read(tmp_path) -> None:
+    reader, session_file = _rebuild_reader(tmp_path, _LINE * 2)
+    tracked = reader._state.get_session("sess")
+    assert tracked is not None
+    reader._file_prefixes.clear()
+    reader._file_markers.clear()
+    original = reader._read_new_lines
+
+    async def read_then_append(*args):
+        entries = await original(*args)
+        with session_file.open("a") as transcript:
+            transcript.write(_LINE)
+        return entries
+
+    with patch.object(reader, "_read_new_lines", read_then_append):
+        stable = await reader._read_session_entries(
+            "sess", tracked, session_file, "@1", check_marker=True
+        )
+
+    assert stable is not None
+    assert not stable.reset_generation
