@@ -1,4 +1,5 @@
 import json
+from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import patch
 
 from ccgram.providers import codex_status
@@ -217,3 +218,36 @@ def test_status_snapshot_rescans_after_truncation(tmp_path) -> None:
     assert result is not None
     assert "transcript entries: `1`" in result
     assert "total `50`" in result
+
+
+def test_status_scan_cache_evicts_least_recently_used(tmp_path) -> None:
+    codex_status._scan_cache.clear()
+    paths = []
+    for n in range(codex_status._MAX_CACHED_SCANS + 1):
+        path = tmp_path / f"codex-{n}.jsonl"
+        _write_jsonl(path, [_token_entry(1)])
+        paths.append(path)
+    for path in paths[: codex_status._MAX_CACHED_SCANS]:
+        build_codex_status_snapshot(str(path), display_name="repo")
+    build_codex_status_snapshot(str(paths[0]), display_name="repo")
+    build_codex_status_snapshot(str(paths[-1]), display_name="repo")
+
+    assert str(paths[0]) in codex_status._scan_cache
+    assert str(paths[1]) not in codex_status._scan_cache
+
+
+def test_status_snapshot_is_consistent_under_concurrent_polls(tmp_path) -> None:
+    transcript = tmp_path / "codex.jsonl"
+    _write_jsonl(transcript, [_token_entry(n) for n in range(1, 31)])
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(
+            pool.map(
+                lambda _: build_codex_status_snapshot(
+                    str(transcript), display_name="repo"
+                ),
+                range(32),
+            )
+        )
+
+    assert all(r is not None and "transcript entries: `30`" in r for r in results)

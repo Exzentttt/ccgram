@@ -6,6 +6,8 @@ messages; this snapshot provides a reliable fallback.
 """
 
 import json
+import threading
+from collections import OrderedDict
 from collections.abc import Iterator
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
@@ -177,7 +179,8 @@ class _ScanState:
 
 
 _MAX_CACHED_SCANS = 32
-_scan_cache: dict[str, _ScanState] = {}
+_scan_cache: OrderedDict[str, _ScanState] = OrderedDict()
+_scan_cache_lock = threading.Lock()
 
 
 def _absorb_entry(state: _ScanState, entry: dict[str, Any]) -> _ScanState:
@@ -197,6 +200,14 @@ def _absorb_entry(state: _ScanState, entry: dict[str, Any]) -> _ScanState:
     return replace(state, **updates)
 
 
+def _store_scan(key: str, state: _ScanState) -> None:
+    with _scan_cache_lock:
+        _scan_cache[key] = state
+        _scan_cache.move_to_end(key)
+        while len(_scan_cache) > _MAX_CACHED_SCANS:
+            _scan_cache.popitem(last=False)
+
+
 def _scan_transcript(path: Path) -> _ScanState:
     """Aggregate a transcript, parsing only bytes appended since the last scan.
 
@@ -205,7 +216,10 @@ def _scan_transcript(path: Path) -> _ScanState:
     """
     key = str(path)
     stat = path.stat()
-    state = _scan_cache.get(key, _ScanState())
+    with _scan_cache_lock:
+        state = _scan_cache.get(key, _ScanState())
+        if key in _scan_cache:
+            _scan_cache.move_to_end(key)
     if (state.dev, state.ino) != (stat.st_dev, stat.st_ino) or stat.st_size < (
         state.offset
     ):
@@ -219,9 +233,7 @@ def _scan_transcript(path: Path) -> _ScanState:
                 state = _absorb_entry(state, parsed)
             if complete:
                 state = replace(state, offset=state.offset + len(raw_line))
-                _scan_cache[key] = state
-    while len(_scan_cache) > _MAX_CACHED_SCANS:
-        del _scan_cache[next(iter(_scan_cache))]
+                _store_scan(key, state)
     return state
 
 
