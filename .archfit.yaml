@@ -1,11 +1,11 @@
 # archfit architecture-drift config for ccgram.
 #
-# Design notes (2026-06-27 review + current code):
-# - VOLATILITY is the coupling lever, not owner. The current design docs record
-#   the calibrated book result: declaring subdomain+volatility moved mean book
-#   balance 2.9 -> 6.0 and critical edges 387 -> 62. Declaring `owner` left
-#   distance unchanged (archfit distance is code_structure-based), so owner is
-#   a hygiene label only.
+# Module ownership and supported public surfaces follow source contracts.
+# Volatility describes expected domain change; history only corroborates it.
+# Under scorer v7 a resolved module boundary has module-boundary distance;
+# owner/deploy metadata do not lower severity. Missing deploy declarations do
+# not establish separate services, and the distributed-monolith label is a
+# structural heuristic rather than an observed runtime topology.
 # - `owner: alexei-led` remains declared on every module for hygiene (single
 #   owner; silences omit-owner warnings) — NOT to influence coupling.
 # - Subdomain/volatility are architect-inferred labels. Current map in docs and
@@ -14,7 +14,7 @@
 #   orchestration; supporting=provider/multiplexer adapters, transcript, Mini
 #   App/mobile API, Telegram adapters, and Git-worktree helpers; generic=config,
 #   utils, provider detection, and concrete backends.
-#   Confirm labels against churn when design changes.
+#   Review labels against domain and implementation changes, not warning counts.
 # - The pytest audits are the enforced drift gate. `archfit` is the whole-graph
 #   mirror and advisory gate: keep `no-import-cycles` as warn because the repo
 #   intentionally uses lazy imports that runtime tests accept.
@@ -74,6 +74,9 @@ modules:
     paths:
       - ccgram.handlers
       - ccgram.handlers.*
+    # One supported entrypoint for neutral death facts, not all polling internals.
+    public:
+      - ccgram.handlers.polling.window_death
     layer: adapter
     owner: alexei-led
     subdomain: core # the orchestration that makes ccgram ccgram
@@ -175,9 +178,9 @@ modules:
     subdomain: core
     volatility: high # design hypothesis: session behavior evolves; protocol/v1 preserves wire compatibility
   # --- Core: session and lifecycle management (the live-session core) ---
-  # Highest-fan-in volatile target cluster from the review (claude_task_state,
-  # session, session_monitor, monitor_state). The 62 residual critical edges
-  # land here — the genuine coupling hotspot, candidate for a read-contract.
+  # Session identity, lifecycle, and monitoring state. Handlers read live state
+  # through session_state_ports; bootstrap supplies presentation callbacks to
+  # neutral monitors rather than letting monitors import handlers.
   session_state:
     paths:
       - ccgram.session
@@ -425,6 +428,35 @@ rules:
     type: forbidden_dependency
     from: ccgram.handlers**
     to: ccgram.providers.process_detection
+    gate: fail
+  # Neutral push observation must not own Telegram transport or recipient routing.
+  # The runtime import audit also covers nested/lazy imports and external types.
+  - id: no-event-stream-to-handlers
+    type: forbidden_dependency
+    from: ccgram.event_stream_monitor
+    to: ccgram.handlers**
+    gate: fail
+  - id: no-event-stream-to-telegram
+    type: forbidden_dependency
+    from: ccgram.event_stream_monitor
+    to: ccgram.telegram**
+    gate: fail
+  - id: no-event-stream-to-routing
+    type: forbidden_dependency
+    from: ccgram.event_stream_monitor
+    to: ccgram.thread_router
+    gate: fail
+  # Composition uses the supported adapter entrypoint, not private policy helpers.
+  - id: no-bootstrap-to-polling-implementation
+    type: forbidden_dependency
+    from: ccgram.bootstrap
+    to: ccgram.handlers.polling.window_tick**
+    gate: fail
+  # The runner supplies live lifecycle facts; the bot must not import CLI state.
+  - id: no-bot-to-main
+    type: forbidden_dependency
+    from: ccgram.bot
+    to: ccgram.main
     gate: fail
   # Advisory (see header): archfit counts lazy/in-function imports as cycle
   # edges; the runtime gate is the clean-interpreter test_import_no_cycles.

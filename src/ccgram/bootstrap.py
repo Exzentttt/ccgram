@@ -351,8 +351,7 @@ def start_event_stream(application: Application) -> object | None:
     """
     if not multiplexer.capabilities.supports_event_stream:
         return None
-    # Lazy: keep the event-stream consumer (and its handler graph) out of the
-    # cold-import path; only event-stream backends ever load it.
+    # Lazy: only event-stream backends need the stream supervisor.
     from .event_stream_monitor import EventStreamMonitor, set_active_event_stream
 
     # Lazy: thread_router proxy, used only to seed the bound-window set.
@@ -361,7 +360,13 @@ def start_event_stream(application: Application) -> object | None:
     def _bound_window_ids() -> set[str]:
         return {wid for _u, _t, wid in thread_router.iter_thread_bindings()}
 
-    monitor = EventStreamMonitor(PTBTelegramClient(application.bot), _bound_window_ids)
+    # Lazy: the Telegram adapter owns recipient routing and destructive topic policy.
+    from .handlers.polling.window_death import handle_window_death
+
+    async def on_window_died(window_id: str) -> None:
+        await handle_window_death(application.bot, window_id)
+
+    monitor = EventStreamMonitor(_bound_window_ids, on_window_died=on_window_died)
     monitor.start()
     set_active_event_stream(monitor)
     logger.info("Event-stream consumer started")
