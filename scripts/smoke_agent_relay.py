@@ -32,9 +32,7 @@ def control(*args: str) -> dict:
         timeout=15,
     )
     if result.returncode:
-        raise RuntimeError(
-            f"agterm {args[0]} {args[1]} failed: {result.stderr.strip()}"
-        )
+        raise RuntimeError(f"agterm {' '.join(args)} failed: {result.stderr.strip()}")
     response = json.loads(result.stdout)
     if not response.get("ok"):
         raise RuntimeError(f"agterm rejected smoke operation: {response.get('error')}")
@@ -201,7 +199,7 @@ async def relay_turns(backend, store, mapping, target_id, client, timeout):
         monitor.commit_delivered_watermarks()
 
 
-async def exercise(args, state, workspace, workspace_id):
+async def exercise(args, state, workspace, workspace_id, executable):
     # Import only after isolated config and the fake Telegram identity are set.
     import ccgram.session  # noqa: F401
     from ccgram.config import config
@@ -216,9 +214,6 @@ async def exercise(args, state, workspace, workspace_id):
 
     if config.config_dir != state or config.telegram_bot_token != FAKE_TOKEN:
         raise RuntimeError("Smoke isolation failed; refusing to create a session")
-    executable = shutil.which(args.provider)
-    if not executable:
-        raise RuntimeError("Requested provider CLI is not installed")
     name = workspace + "-" + args.provider
     command = [
         "/usr/bin/env",
@@ -327,6 +322,9 @@ def main() -> None:
     args.cwd = args.cwd.resolve(strict=True)
     if os.environ.get("AGTERM_ENABLED") != "1":
         parser.error("Run inside agterm")
+    executable = shutil.which(args.provider)
+    if not executable:
+        parser.error("Requested provider CLI is not installed")
     os.umask(0o077)
     state = Path(tempfile.mkdtemp(prefix="ccgram-relay-smoke-"))
     workspace = "ccgram-smoke-" + secrets.token_hex(5)
@@ -343,7 +341,7 @@ def main() -> None:
     from ccgram.session_protocol.models import ProtocolError
 
     try:
-        report = asyncio.run(exercise(args, state, workspace, workspace_id))
+        report = asyncio.run(exercise(args, state, workspace, workspace_id, executable))
     except (
         AssertionError,
         OSError,

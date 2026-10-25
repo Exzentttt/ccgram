@@ -142,3 +142,50 @@ def test_native_control_addresses_the_parent_window(monkeypatch):
     monkeypatch.setattr("subprocess.run", run)
     smoke.control("tree")
     assert commands == [["agtermctl", "tree", "--window", "parent-window", "--json"]]
+
+
+async def test_failing_tree_call_reports_runtime_error_without_deleting(monkeypatch):
+    import pytest
+
+    smoke = load_smoke()
+    commands = []
+
+    class Mux:
+        async def list_windows_for_reconciliation(self):
+            return []
+
+    def run(args, **_kwargs):
+        commands.append(args)
+        return SimpleNamespace(returncode=1, stdout="", stderr="window closed")
+
+    monkeypatch.setattr("subprocess.run", run)
+    with pytest.raises(RuntimeError, match="agterm tree failed: window closed"):
+        await smoke.close_owned(Mux(), "closed-target", "owned", "workspace")
+    assert len(commands) == 1
+    assert commands[0][:2] == ["agtermctl", "tree"]
+
+
+def test_missing_provider_is_rejected_before_creating_workspace_or_state(
+    monkeypatch, tmp_path, capsys
+):
+    import pytest
+
+    smoke = load_smoke()
+    operations = []
+    monkeypatch.setenv("AGTERM_ENABLED", "1")
+    monkeypatch.setattr(
+        "sys.argv", [str(SCRIPT), "--provider", "claude", "--cwd", str(tmp_path)]
+    )
+    monkeypatch.setattr("shutil.which", lambda _name: None)
+
+    def unexpected(*args, **_kwargs):
+        operations.append(args)
+        raise AssertionError("Preflight must not create resources")
+
+    monkeypatch.setattr(smoke, "control", unexpected)
+    monkeypatch.setattr("tempfile.mkdtemp", unexpected)
+    with pytest.raises(SystemExit) as exc:
+        smoke.main()
+    assert exc.value.code == 2
+    assert "provider CLI is not installed" in capsys.readouterr().err
+    assert operations == []
