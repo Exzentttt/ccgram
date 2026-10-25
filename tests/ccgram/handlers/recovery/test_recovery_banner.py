@@ -17,12 +17,18 @@ from ccgram.thread_router import ThreadRouter
 from ccgram.handlers.recovery.recovery_banner import (
     RecoveryBanner,
     RecoveryMode,
+    CallbackUi,
     _create_and_bind_window,
     _recovery_cwd_or_report,
     render_banner,
 )
 
-from ccgram.handlers.user_state import RECOVERY_WINDOW_ID
+from ccgram.handlers.recovery.recovery_ui import ReplacementRequest
+from ccgram.handlers.user_state import (
+    PENDING_THREAD_ID,
+    PENDING_THREAD_TEXT,
+    RECOVERY_WINDOW_ID,
+)
 
 _RC = "ccgram.handlers.recovery.recovery_banner"
 
@@ -301,12 +307,15 @@ class TestRecoveryProvisioning:
         query, context = _create_query()
 
         await _create_and_bind_window(
-            query,
-            100,
-            42,
-            "/tmp/project",
-            context,
-            old_window_id="@0",
+            ReplacementRequest(
+                user_id=100,
+                thread_id=42,
+                cwd="/tmp/project",
+                old_window_id="@0",
+            ),
+            CallbackUi(query, context),
+            context.bot,
+            create_env.adapter,
         )
 
         create_env.router.begin_topic_provisioning.assert_called_once_with(
@@ -345,12 +354,15 @@ class TestRecoveryProbeCancellation:
             pytest.raises(asyncio.CancelledError),
         ):
             await _create_and_bind_window(
-                query,
-                100,
-                42,
-                "/tmp/project",
-                context,
-                old_window_id="@0",
+                ReplacementRequest(
+                    user_id=100,
+                    thread_id=42,
+                    cwd="/tmp/project",
+                    old_window_id="@0",
+                ),
+                CallbackUi(query, context),
+                context.bot,
+                MagicMock(),
             )
 
         assert router.get_window_for_chat_thread(-100, 42) == "@0"
@@ -378,12 +390,15 @@ class TestRecoveryProbeCancellation:
         )
 
         result = await _create_and_bind_window(
-            query,
-            100,
-            42,
-            "/gone",
-            context,
-            old_window_id="@0",
+            ReplacementRequest(
+                user_id=100,
+                thread_id=42,
+                cwd="/gone",
+                old_window_id="@0",
+            ),
+            CallbackUi(query, context),
+            context.bot,
+            create_env.adapter,
         )
 
         assert result is False
@@ -407,12 +422,15 @@ class TestRecoveryProbeCancellation:
         query, context = _create_query()
         task = asyncio.create_task(
             _create_and_bind_window(
-                query,
-                100,
-                42,
-                "/tmp/project",
-                context,
-                old_window_id="@0",
+                ReplacementRequest(
+                    user_id=100,
+                    thread_id=42,
+                    cwd="/tmp/project",
+                    old_window_id="@0",
+                ),
+                CallbackUi(query, context),
+                context.bot,
+                create_env.adapter,
             )
         )
         await started.wait()
@@ -427,3 +445,37 @@ class TestRecoveryProbeCancellation:
             "claim-1", target_confirmed_absent=True
         )
         create_env.router.unbind_thread.assert_not_called()
+
+
+class TestCallbackUi:
+    async def test_edit_and_answer_go_to_the_query(self) -> None:
+        query, context = _create_query()
+        ui = CallbackUi(query, context)
+
+        with patch(f"{_RC}.safe_edit", new_callable=AsyncMock) as edit:
+            await ui.edit("hello", reply_markup=None)
+        await ui.answer("Created")
+
+        edit.assert_awaited_once_with(query, "hello", reply_markup=None)
+        query.answer.assert_awaited_once_with("Created")
+
+    def test_pending_text_is_read_and_cleared_with_the_recovery_state(self) -> None:
+        _, context = _create_query()
+        context.user_data = {
+            PENDING_THREAD_TEXT: "hi",
+            PENDING_THREAD_ID: 42,
+            "unrelated": 1,
+        }
+        ui = CallbackUi(AsyncMock(), context)
+
+        assert ui.pending_text() == "hi"
+        ui.clear_state()
+
+        assert ui.pending_text() is None
+        assert context.user_data == {"unrelated": 1}
+
+    def test_pending_text_is_none_without_user_data(self) -> None:
+        _, context = _create_query()
+        context.user_data = None
+
+        assert CallbackUi(AsyncMock(), context).pending_text() is None

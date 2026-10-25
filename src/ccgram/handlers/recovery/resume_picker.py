@@ -180,7 +180,7 @@ async def _handle_resume_pick(
     # for scan_sessions_for_cwd; the picker only needs banner's window
     # creation helper at the moment of selection.
     # Lazy: resume_picker ↔ recovery_banner cycle
-    from .recovery_banner import _create_and_bind_window
+    from .recovery_banner import _replace_from_callback
 
     idx_str = data[len(CB_RECOVERY_PICK) :]
     try:
@@ -234,7 +234,7 @@ async def _handle_resume_pick(
         await query.answer("Session provider mismatch", show_alert=True)
         return
 
-    await _create_and_bind_window(
+    await _replace_from_callback(
         query,
         user_id,
         thread_id,

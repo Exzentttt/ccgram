@@ -1,0 +1,456 @@
+"""Characterization of the recovery window replacement, driven by its buttons.
+
+Every scenario taps a real Fresh / Resume-pick handler and asserts the exact
+ordered sequence of observable calls: provisioning claim, state flushes,
+backend create arguments, topic binding, UI edits and answers. The inputs are
+the real callback shapes (``rec:f:@0`` data, ``user_data`` recovery keys); the
+outward boundaries (backend, Telegram, multiplexer, router, state store) are
+recorded mocks. The same file passes on the pre-refactor implementation, which
+is what makes it a parity proof rather than a snapshot of the new code.
+"""
+
+from __future__ import annotations
+
+import asyncio
+from types import SimpleNamespace
+from unittest.mock import ANY, AsyncMock, MagicMock, call, patch
+
+import pytest
+
+from ccgram.handlers.callback_data import CB_RECOVERY_FRESH, CB_RECOVERY_PICK
+from ccgram.handlers.recovery.recovery_banner import (
+    _handle_fresh,
+    _stale_recovery_offer as _real_stale_recovery_offer,
+)
+from ccgram.handlers.recovery.resume_picker import _handle_resume_pick
+from ccgram.handlers.status.topic_emoji import format_topic_name_for_mode
+from ccgram.handlers.topics import topic_orchestration
+from ccgram.handlers.user_state import (
+    PENDING_THREAD_ID,
+    PENDING_THREAD_TEXT,
+    RECOVERY_SESSIONS,
+    RECOVERY_WINDOW_ID,
+)
+from ccgram.session_protocol.models import ProtocolError
+from ccgram.window_state_store import CCGRAM_CREATED_WINDOW_ORIGIN
+
+_RC = "ccgram.handlers.recovery.recovery_banner"
+_RP = "ccgram.handlers.recovery.resume_picker"
+_CWD = "/tmp"
+_UNREGISTERED = (
+    "⚠ Session is still starting; ccgram kept it quarantined for recovery. "
+    "Try again after it finishes registering."
+)
+
+
+@pytest.fixture()
+def flow():
+    """One recorded replacement run: ``parent.mock_calls`` is the ordered log."""
+    parent = MagicMock()
+    router, session = parent.router, parent.session
+    router.resolve_chat_id.return_value = -100
+    router.begin_topic_provisioning.return_value = SimpleNamespace(claim_id="claim-1")
+    router.commit_topic_provisioning.return_value = True
+
+    adapter = MagicMock()
+    adapter.create = AsyncMock(
+        return_value=SimpleNamespace(target_id="@5", title="project")
+    )
+    adapter.close = AsyncMock(return_value=(True, "Closed"))
+    parent.attach_mock(adapter, "adapter")
+
+    async def record_edit(target, text, **kwargs):
+        assert target is query, "the progress message must be the tapped query"
+        parent.edit(text, **kwargs)
+
+    edit = AsyncMock(side_effect=record_edit)
+    stale = AsyncMock(return_value=None)
+    parent.attach_mock(stale, "stale")
+    wait = AsyncMock(return_value=True)
+    parent.attach_mock(wait, "wait")
+    presence = AsyncMock(return_value=True)
+    parent.attach_mock(presence, "presence")
+    send = AsyncMock(return_value=(True, "sent"))
+    parent.attach_mock(send, "send")
+
+    provider = MagicMock()
+    provider.capabilities.name = "claude"
+    provider.capabilities.supports_hook = True
+    view = SimpleNamespace(provider_name="claude", approval_mode="normal", cwd=_CWD)
+    window_query = MagicMock()
+    window_query.view_window.return_value = view
+    window_query.resolve_window_alias.side_effect = lambda wid: wid
+
+    query = AsyncMock()
+    answer = AsyncMock()
+    query.answer = answer
+    parent.attach_mock(answer, "answer")
+    query.message = MagicMock()
+    query.message.chat.id = -100999
+    query.message.chat.type = "supergroup"
+    query.message.chat.is_forum = True
+    query.message.is_topic_message = True
+    query.message.message_thread_id = 42
+    update = MagicMock()
+    update.effective_user = MagicMock(id=100)
+    update.message = None
+    update.callback_query = query
+    context = MagicMock()
+    context.bot = AsyncMock()
+    context.user_data = {
+        PENDING_THREAD_ID: 42,
+        PENDING_THREAD_TEXT: "hello",
+        RECOVERY_WINDOW_ID: "@0",
+    }
+    client_factory = MagicMock(return_value=parent.client)
+    parent.client.edit_forum_topic = AsyncMock()
+
+    with (
+        patch(f"{_RC}.tmux_manager"),
+        patch(f"{_RC}.thread_router", router),
+        patch(f"{_RC}.session_manager", session),
+        patch(f"{_RC}.safe_edit", edit),
+        patch(f"{_RC}.window_query", window_query),
+        patch(f"{_RP}.window_query", window_query),
+        patch(f"{_RC}._cwd_for_window", return_value=_CWD),
+        patch(f"{_RC}.get_provider", return_value=provider),
+        patch(f"{_RC}.get_provider_for_window", return_value=provider),
+        patch(f"{_RC}.adapter_for", return_value=adapter),
+        patch(f"{_RC}._stale_recovery_offer", stale),
+        patch(f"{_RC}.session_map_sync.wait_for_session_map_entry", wait),
+        patch(f"{_RC}.send_telegram_to_window", send),
+        patch(f"{_RC}.PTBTelegramClient", client_factory),
+        patch("ccgram.multiplexer.reconciliation.window_presence", presence),
+    ):
+        yield SimpleNamespace(
+            parent=parent,
+            adapter=adapter,
+            stale=stale,
+            wait=wait,
+            presence=presence,
+            view=view,
+            provider=provider,
+            query=query,
+            update=update,
+            context=context,
+            tap_fresh=lambda: _handle_fresh(
+                query, 100, f"{CB_RECOVERY_FRESH}@0", update, context
+            ),
+            tap_pick=lambda: _handle_resume_pick(
+                query, 100, f"{CB_RECOVERY_PICK}0", update, context
+            ),
+        )
+    topic_orchestration.clear_pending_creation("@5")
+
+
+_CLAIM = [
+    call.router.begin_topic_provisioning(
+        100, -100999, thread_id=42, kind="replacement", previous_target_id="@0"
+    ),
+    call.session.flush_state(),
+]
+_STALE_CHECKED = [call.stale("@0")]
+_CREATE_NORMAL = call.adapter.create(
+    {"provider": "claude", "directory": _CWD},
+    approval_mode="normal",
+    resume_id=None,
+    continue_session=False,
+)
+_ATTACHED = [
+    call.router.attach_provisioning_target("claim-1", "@5"),
+    call.session.flush_state(),
+]
+_REGISTERED = [call.wait("@5", resolve_window_id=ANY)]
+_ABORTED = [
+    call.router.abort_topic_provisioning("claim-1", target_confirmed_absent=True),
+    call.session.flush_state(),
+]
+_UNCERTAIN = [
+    call.router.mark_provisioning_uncertain("claim-1"),
+    call.session.flush_state(),
+]
+
+
+def _bound(mode: str, label: str, pending: str | None = "hello") -> list:
+    forwarded = [call.send(100, "@5", 42, pending, -100999, adapter=ANY)]
+    return [
+        call.session.set_window_origin("@5", CCGRAM_CREATED_WINDOW_ORIGIN),
+        call.session.set_window_provider("@5", "claude"),
+        call.session.set_window_approval_mode("@5", mode),
+        call.router.commit_topic_provisioning("claim-1", window_name="project"),
+        call.session.flush_state(),
+        call.router.resolve_chat_id(100, 42),
+        call.client.edit_forum_topic(
+            chat_id=-100,
+            message_thread_id=42,
+            name=format_topic_name_for_mode("project", mode),
+        ),
+        call.edit(f"✅ Created session 'project'\n\n{label}"),
+        *(forwarded if pending else []),
+        call.answer("Created"),
+    ]
+
+
+class TestSuccess:
+    async def test_fresh_creates_binds_renames_and_forwards_the_pending_text(
+        self, flow
+    ) -> None:
+        await flow.tap_fresh()
+
+        assert flow.parent.mock_calls == [
+            *_CLAIM,
+            *_STALE_CHECKED,
+            _CREATE_NORMAL,
+            *_ATTACHED,
+            *_REGISTERED,
+            *_bound("normal", "Fresh session started."),
+        ]
+        assert flow.context.user_data == {}
+        assert not topic_orchestration.is_pending_creation("@5")
+
+    async def test_resume_pick_launches_the_picked_session_in_yolo_mode(
+        self, flow
+    ) -> None:
+        flow.view.approval_mode = "yolo"
+        flow.context.user_data[RECOVERY_SESSIONS] = [
+            {
+                "session_id": "sess-1",
+                "summary": "fix the parser",
+                "mtime": 1.0,
+                "provider_name": "claude",
+            }
+        ]
+
+        await flow.tap_pick()
+
+        assert flow.parent.mock_calls == [
+            *_CLAIM,
+            *_STALE_CHECKED,
+            call.adapter.create(
+                {"provider": "claude", "directory": _CWD},
+                approval_mode="yolo",
+                resume_id="sess-1",
+                continue_session=False,
+            ),
+            *_ATTACHED,
+            *_REGISTERED,
+            *_bound("yolo", "Resuming session: fix the parser"),
+        ]
+
+    async def test_provider_without_hooks_skips_the_registration_wait(
+        self, flow
+    ) -> None:
+        flow.provider.capabilities.supports_hook = False
+        flow.context.user_data.pop(PENDING_THREAD_TEXT)
+
+        await flow.tap_fresh()
+
+        assert flow.parent.mock_calls == [
+            *_CLAIM,
+            *_STALE_CHECKED,
+            _CREATE_NORMAL,
+            *_ATTACHED,
+            *_bound("normal", "Fresh session started.", pending=None),
+        ]
+
+
+class TestCreateFailure:
+    async def test_definitive_failure_aborts_the_claim_and_keeps_the_old_binding(
+        self, flow
+    ) -> None:
+        flow.adapter.create = AsyncMock(
+            side_effect=ProtocolError(
+                400, "invalid_request", "Directory does not exist: /gone"
+            )
+        )
+
+        await flow.tap_fresh()
+
+        assert flow.parent.mock_calls == [
+            *_CLAIM,
+            *_STALE_CHECKED,
+            call.adapter.create(
+                {"provider": "claude", "directory": _CWD},
+                approval_mode="normal",
+                resume_id=None,
+                continue_session=False,
+            ),
+            *_ABORTED,
+            call.edit("❌ Directory does not exist: /gone"),
+            call.answer("Failed"),
+        ]
+        assert flow.context.user_data == {}
+
+    async def test_server_error_leaves_the_claim_uncertain_and_raises(
+        self, flow
+    ) -> None:
+        flow.adapter.create = AsyncMock(
+            side_effect=ProtocolError(503, "backend_unavailable", "unconfirmed")
+        )
+
+        with pytest.raises(ProtocolError):
+            await flow.tap_fresh()
+
+        assert flow.parent.mock_calls == [
+            *_CLAIM,
+            *_STALE_CHECKED,
+            _CREATE_NORMAL,
+            *_UNCERTAIN,
+        ]
+
+    async def test_backend_without_target_id_is_a_failed_create(self, flow) -> None:
+        flow.adapter.create = AsyncMock(
+            return_value=SimpleNamespace(target_id="", title="project")
+        )
+
+        await flow.tap_fresh()
+
+        assert flow.parent.mock_calls == [
+            *_CLAIM,
+            *_STALE_CHECKED,
+            _CREATE_NORMAL,
+            *_UNCERTAIN,
+            call.edit("❌ Backend returned no target ID"),
+            call.answer("Failed"),
+        ]
+        assert flow.context.user_data == {}
+
+
+class TestReadinessTimeout:
+    async def test_unregistered_but_live_target_stays_quarantined(self, flow) -> None:
+        flow.wait.return_value = False
+        flow.presence.return_value = True
+
+        await flow.tap_fresh()
+
+        assert flow.parent.mock_calls == [
+            *_CLAIM,
+            *_STALE_CHECKED,
+            _CREATE_NORMAL,
+            *_ATTACHED,
+            *_REGISTERED,
+            call.presence("@5", ANY),
+            *_UNCERTAIN,
+            call.edit(_UNREGISTERED),
+            call.answer("Still starting"),
+        ]
+        assert flow.context.user_data[PENDING_THREAD_TEXT] == "hello"
+        assert not topic_orchestration.is_pending_creation("@5")
+
+    async def test_unregistered_and_gone_target_aborts_the_claim(self, flow) -> None:
+        flow.wait.return_value = False
+        flow.presence.return_value = False
+
+        await flow.tap_fresh()
+
+        assert flow.parent.mock_calls == [
+            *_CLAIM,
+            *_STALE_CHECKED,
+            _CREATE_NORMAL,
+            *_ATTACHED,
+            *_REGISTERED,
+            call.presence("@5", ANY),
+            *_ABORTED,
+            call.edit("❌ Session did not register with ccgram and is gone"),
+            call.answer("Failed"),
+        ]
+        assert flow.context.user_data == {}
+
+    async def test_unverifiable_presence_quarantines_with_its_own_message(
+        self, flow
+    ) -> None:
+        flow.wait.return_value = False
+        flow.presence.side_effect = OSError("multiplexer down")
+
+        await flow.tap_fresh()
+
+        assert flow.parent.mock_calls[-4:] == [
+            *_UNCERTAIN,
+            call.edit(
+                "⚠ Could not verify the new session; ccgram kept it quarantined "
+                "for recovery."
+            ),
+            call.answer("Still starting"),
+        ]
+
+    async def test_hook_wait_error_closes_the_target_aborts_and_reraises(
+        self, flow
+    ) -> None:
+        flow.wait.side_effect = RuntimeError("hook boom")
+
+        with pytest.raises(RuntimeError, match="hook boom"):
+            await flow.tap_fresh()
+
+        assert flow.parent.mock_calls == [
+            *_CLAIM,
+            *_STALE_CHECKED,
+            _CREATE_NORMAL,
+            *_ATTACHED,
+            *_REGISTERED,
+            call.adapter.close("@5"),
+            *_ABORTED,
+        ]
+
+
+class TestStaleWindowAlive:
+    """The offer is re-read from a confirmed snapshot (real ``_stale_recovery_offer``)."""
+
+    @pytest.fixture()
+    def real_offer(self, flow):
+        flow.stale.side_effect = _real_stale_recovery_offer
+
+    async def test_agent_running_again_refuses_and_creates_nothing(
+        self, flow, real_offer
+    ) -> None:
+        with (
+            patch(
+                "ccgram.multiplexer.reconciliation.window_snapshot",
+                AsyncMock(return_value=(True, SimpleNamespace())),
+            ),
+            patch(
+                "ccgram.handlers.telegram_origin.agent_origin_returned_to_shell",
+                AsyncMock(return_value=False),
+            ),
+        ):
+            await flow.tap_fresh()
+
+        assert flow.parent.mock_calls == [
+            *_CLAIM,
+            *_STALE_CHECKED,
+            *_ABORTED,
+            call.edit(
+                "That session is running again, so it was left alone.",
+                reply_markup=None,
+            ),
+        ]
+        assert flow.context.user_data[PENDING_THREAD_TEXT] == "hello"
+
+    async def test_unreachable_multiplexer_refuses_and_creates_nothing(
+        self, flow, real_offer
+    ) -> None:
+        with patch(
+            "ccgram.multiplexer.reconciliation.window_snapshot",
+            AsyncMock(return_value=(False, None)),
+        ):
+            await flow.tap_fresh()
+
+        assert flow.parent.mock_calls == [
+            *_CLAIM,
+            *_STALE_CHECKED,
+            *_ABORTED,
+            call.edit(
+                "\u26a0 Could not reach the multiplexer, so nothing was changed. "
+                "Try again in a moment.",
+                reply_markup=None,
+            ),
+        ]
+
+    async def test_cancelled_probe_releases_the_claim_and_propagates(
+        self, flow
+    ) -> None:
+        flow.stale.side_effect = asyncio.CancelledError
+
+        with pytest.raises(asyncio.CancelledError):
+            await flow.tap_fresh()
+
+        assert flow.parent.mock_calls == [*_CLAIM, *_STALE_CHECKED, *_ABORTED]
