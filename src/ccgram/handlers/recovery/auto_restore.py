@@ -141,16 +141,11 @@ class _Ledger:
         self._rows[key] = (self._rows[key][0], status)
         self._save()
 
-    def claim_notice(self, key: str) -> bool:
-        """Reserve this boot's one skip notice for ``key``; False if taken."""
-        fresh = key not in self._noticed
-        if fresh:
-            self._noticed.add(key)
-            self._save()
-        return fresh
+    def has_notice(self, key: str) -> bool:
+        return key in self._noticed
 
-    def release_notice(self, key: str) -> None:
-        self._noticed.discard(key)
+    def add_notice(self, key: str) -> None:
+        self._noticed.add(key)
         self._save()
 
     def _save(self) -> None:
@@ -169,6 +164,11 @@ class _Ledger:
 class _Notice(NamedTuple):
     topic: tuple[int, int]
     text: str
+    once: bool = True  # skip notices: one per topic per boot
+
+    @property
+    def key(self) -> str:
+        return "{}:{}".format(*self.topic)
 
 
 @dataclass(frozen=True)
@@ -191,22 +191,17 @@ def _notice_for(reason: str, where: tuple[int | None, int, str]) -> _Notice | No
     return _Notice((chat_id, thread_id), text)
 
 
-async def _deliver(bot: Bot, topic: tuple[int, int], text: str) -> float | None:
-    """Send a notice; after a rate-limit wait resend once. Returns a second retry-after."""
-    if (retry_after := await send_notice(bot, *topic, text)) is None:
-        return None
-    await _pause(min(retry_after, MAX_RATE_LIMIT_WAIT_S))
-    return await send_notice(bot, *topic, text)
+async def _send(notice: _Notice, ledger: _Ledger, bot: Bot) -> float | None:
+    """Send a notice (a skip notice once per topic per boot); returns a retry-after.
 
-
-async def _send_skip(notice: _Notice, ledger: _Ledger, bot: Bot) -> float | None:
-    key = "{}:{}".format(*notice.topic)
-    if not ledger.claim_notice(key):
+    A topic counts as told only after the send went through, so a cancel or a
+    dropped notice leaves it for the next start.
+    """
+    if notice.once and ledger.has_notice(notice.key):
         return None
-    retry_after = await _deliver(bot, notice.topic, notice.text)
-    if retry_after is not None:
-        ledger.release_notice(key)
-        logger.warning("auto_restore_notice_unsent", key=key)
+    retry_after = await send_notice(bot, *notice.topic, notice.text)
+    if retry_after is None and notice.once:
+        ledger.add_notice(notice.key)
     return retry_after
 
 
@@ -463,13 +458,12 @@ async def _restore_one(
     ledger: _Ledger,
     bot: Bot,
     get_adapter: Callable[[], TelegramSessionAdapter],
-) -> float | None:
-    """Run one replacement. Returns Telegram's retry-after seconds, if it asked."""
+) -> tuple[float | None, _Notice | None]:
+    """Run one replacement. Returns the rename's retry-after and the notice to send."""
     reason = await _skip_reason_now(entry)
     if reason is not None:
         _skip(reason, entry.where)
-        notice = _notice_for(reason, entry.where)
-        return await _send_skip(notice, ledger, bot) if notice else None
+        return None, _notice_for(reason, entry.where)
     ledger.set_status(entry.key, _ATTEMPTING)
     ui = HeadlessUi()
     try:
@@ -477,12 +471,11 @@ async def _restore_one(
     except Exception:
         logger.exception("auto_restore_failed", key=entry.key)
         ledger.set_status(entry.key, _FAILED)
-        return await _deliver(bot, entry.where[:2], CREATION_FAILED)
+        return None, _Notice(entry.where[:2], CREATION_FAILED, once=False)
     ledger.set_status(entry.key, _DONE if restored else _FAILED)
     logger.info("auto_restore_done", key=entry.key, restored=restored)
     text = ui.final_text or CREATION_FAILED
-    notice_retry = await _deliver(bot, entry.where[:2], text)
-    return notice_retry or ui.retry_after
+    return ui.retry_after, _Notice(entry.where[:2], text, once=False)
 
 
 async def _run(
@@ -495,13 +488,16 @@ async def _run(
     waits = 0
     restores = 0
     for item in work:
-        if isinstance(item, _Notice):
-            retry_after = await _send_skip(item, ledger, bot)
-        else:
+        retry_after: float | None = None
+        notice = item if isinstance(item, _Notice) else None
+        if isinstance(item, RestoreEntry):
             if restores:
                 await _pause(GAP_S)
             restores += 1
-            retry_after = await _restore_one(item, ledger, bot, get_adapter)
+            retry_after, notice = await _restore_one(item, ledger, bot, get_adapter)
+        held = await _send(notice, ledger, bot) if notice else None
+        if held is not None:
+            retry_after = max(retry_after or 0, held)
         if retry_after is None:
             continue
         if waits == MAX_RATE_LIMIT_WAITS:
@@ -512,6 +508,8 @@ async def _run(
             "auto_restore_rate_limited", retry_after=retry_after, waits=waits
         )
         await _pause(min(retry_after, MAX_RATE_LIMIT_WAIT_S))
+        if notice and held is not None and await _send(notice, ledger, bot) is not None:
+            logger.warning("auto_restore_notice_unsent", key=notice.key)
 
 
 async def _reserve_stale_ids() -> bool:

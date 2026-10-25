@@ -85,11 +85,11 @@ class Env:
         self.ps_code: int | None = None
         self.ps_run = MagicMock(side_effect=self.fake_ps)
         self.sent: list[dict[str, Any]] = []
-        self.send_errors: list[BaseException] = []
+        self.send_errors: list[BaseException | None] = []
 
     async def fake_send(self, **kwargs: Any) -> SimpleNamespace:
-        if self.send_errors:
-            raise self.send_errors.pop(0)
+        if self.send_errors and (error := self.send_errors.pop(0)) is not None:
+            raise error
         self.sent.append(kwargs)
         return SimpleNamespace(message_id=len(self.sent))
 
@@ -1721,9 +1721,9 @@ class TestNotices:
             approval_mode="normal",
         )
         env.transcript(env.states["@1"].cwd, "s2")
-        spy = AsyncMock(wraps=auto_restore._send_skip)
+        spy = AsyncMock(wraps=auto_restore._send)
 
-        with patch(f"{_AR}._send_skip", spy):
+        with patch(f"{_AR}._send", spy):
             await env.start()
 
         assert spy.await_count == 1
@@ -1750,3 +1750,64 @@ class TestNotices:
 
         assert [thread for thread, _ in env.notices()] == [7]
         assert env.sent[0]["text"].startswith("❌ Not restored")
+
+    async def test_notice_waits_count_against_the_rate_limit_cap(self, env) -> None:
+        for thread in range(1, 6):
+            env.dead_topic(
+                thread,
+                f"@{thread}",
+                cwd=str(env.tmp / f"gone{thread}"),
+                session=f"s{thread}",
+            )
+        env.send_errors = [RetryAfter(5), None] * 4
+
+        with capture_logs() as logs:
+            await env.start()
+
+        assert [c.args[0] for c in env.pause.await_args_list] == [5.0, 5.0, 5.0]
+        assert len(env.sent) == 3
+        assert len(env.ledger["notices"]) == 3
+        assert any(
+            log["event"] == "auto_restore_rate_limited_giving_up" for log in logs
+        )
+
+    async def test_the_outcome_notice_and_the_rename_wait_once(self, env) -> None:
+        env.dead_topic(7, "@1", session="s1")
+        env.rename_error = RetryAfter(30)
+        env.send_errors = [RetryAfter(10)]
+
+        await env.start()
+
+        assert [c.args[0] for c in env.pause.await_args_list] == [30.0]
+        assert len(env.sent) == 1
+
+    async def test_the_longer_of_two_waits_is_the_one_waited(self, env) -> None:
+        env.dead_topic(7, "@1", session="s1")
+        env.rename_error = RetryAfter(30)
+        env.send_errors = [RetryAfter(40)]
+
+        await env.start()
+
+        assert [c.args[0] for c in env.pause.await_args_list] == [40.0]
+
+    async def test_a_cancel_during_the_wait_releases_the_skip_notice(self, env) -> None:
+        env.dead_topic(7, "@1", session="s1", cwd=str(env.tmp / "gone"))
+        env.send_errors = [RetryAfter(1)]
+        env.pause.side_effect = asyncio.CancelledError()
+
+        with pytest.raises(asyncio.CancelledError):
+            await env.start()
+
+        env.pause.side_effect = None
+        await env.start()
+        assert [thread for thread, _ in env.notices()] == [7]
+
+    async def test_a_cancel_during_the_send_releases_the_skip_notice(self, env) -> None:
+        env.dead_topic(7, "@1", session="s1", cwd=str(env.tmp / "gone"))
+        env.send_errors = [asyncio.CancelledError()]
+
+        with pytest.raises(asyncio.CancelledError):
+            await env.start()
+
+        await env.start()
+        assert [thread for thread, _ in env.notices()] == [7]
