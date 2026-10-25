@@ -100,9 +100,9 @@ def _tmux_socket_identity() -> str:
     """Server identity the tmux client resolves: ``$TMUX`` socket or the default."""
     inside = os.environ.get("TMUX", "").split(",", 1)[0]
     if inside:
-        return inside
-    tmpdir = os.environ.get("TMUX_TMPDIR", "/tmp")
-    return f"{tmpdir}/tmux-{os.getuid()}/default"
+        return os.path.realpath(inside)
+    tmpdir = os.environ.get("TMUX_TMPDIR") or "/tmp"
+    return os.path.realpath(f"{tmpdir}/tmux-{os.getuid()}/default")
 
 
 def _lock_name(multiplexer: Multiplexer) -> str:

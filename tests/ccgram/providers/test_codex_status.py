@@ -237,6 +237,7 @@ def test_status_scan_cache_evicts_least_recently_used(tmp_path) -> None:
 
 
 def test_status_snapshot_is_consistent_under_concurrent_polls(tmp_path) -> None:
+    """Smoke test only: it also passes without the lock, it does not prove it."""
     transcript = tmp_path / "codex.jsonl"
     _write_jsonl(transcript, [_token_entry(n) for n in range(1, 31)])
 

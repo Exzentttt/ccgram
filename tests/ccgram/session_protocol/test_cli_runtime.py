@@ -1,4 +1,5 @@
 import json
+import os
 import sqlite3
 from pathlib import Path
 from types import SimpleNamespace
@@ -11,7 +12,7 @@ from ccgram.api.runtime import start_if_enabled
 from ccgram.cli import cli
 from ccgram.providers.base import HookEvent
 from ccgram.session_protocol import runtime as runtime_module
-from ccgram.session_protocol.runtime import start_runtime
+from ccgram.session_protocol.runtime import _lock_name, start_runtime
 from ccgram.session_protocol.store import ProtocolStore
 
 
@@ -148,7 +149,7 @@ async def test_session_scope_conflicts_on_same_tmux_session(tmp_path, session_sc
         await first.close()
 
 
-async def test_session_scope_conflicts_on_same_session_other_server(
+async def test_session_scope_allows_same_session_on_other_server(
     tmp_path, session_scope, monkeypatch
 ):
     first = await start_runtime(_mux(session="work"), tmp_path / "a", "", "a:")
@@ -167,6 +168,34 @@ async def test_session_scope_is_ignored_on_non_tmux_backend(tmp_path, session_sc
             await start_runtime(_mux("herdr", "personal"), tmp_path / "b", "", "b:")
     finally:
         await first.close()
+
+
+def test_session_scope_key_is_canonical_across_tmux_env_forms(
+    tmp_path, session_scope, monkeypatch
+):
+    real = tmp_path / "real"
+    real.mkdir()
+    link = tmp_path / "link"
+    link.symlink_to(real)
+    uid = os.getuid()
+    monkeypatch.setenv("TMUX", f"{real}/tmux-{uid}/default,1,0")
+    inside = _lock_name(_mux())
+
+    monkeypatch.delenv("TMUX")
+    monkeypatch.setenv("TMUX_TMPDIR", str(link))
+    assert _lock_name(_mux()) == inside
+
+
+def test_session_scope_key_treats_empty_tmux_tmpdir_as_unset(
+    session_scope, monkeypatch
+):
+    uid = os.getuid()
+    monkeypatch.setenv("TMUX", f"/tmp/tmux-{uid}/default,1,0")
+    inside = _lock_name(_mux())
+
+    monkeypatch.delenv("TMUX")
+    monkeypatch.setenv("TMUX_TMPDIR", "")
+    assert _lock_name(_mux()) == inside
 
 
 async def test_store_constructor_failure_releases_lock_with_retained_traceback(

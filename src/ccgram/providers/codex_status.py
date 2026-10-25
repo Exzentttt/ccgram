@@ -224,6 +224,7 @@ def _scan_transcript(path: Path) -> _ScanState:
         state.offset
     ):
         state = _ScanState(dev=stat.st_dev, ino=stat.st_ino)
+    committed = state
     with path.open("rb") as handle:
         handle.seek(state.offset)
         for raw_line in handle:
@@ -233,7 +234,8 @@ def _scan_transcript(path: Path) -> _ScanState:
                 state = _absorb_entry(state, parsed)
             if complete:
                 state = replace(state, offset=state.offset + len(raw_line))
-                _store_scan(key, state)
+                committed = state
+    _store_scan(key, committed)
     return state
 
 
