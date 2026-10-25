@@ -48,6 +48,7 @@ from ..user_state import (
     RECOVERY_SESSIONS,
     RECOVERY_WINDOW_ID,
 )
+from .recovery_ui import ReplacementRequest
 
 if TYPE_CHECKING:
     from telegram.ext import ContextTypes
@@ -234,14 +235,13 @@ async def _handle_resume_pick(
         await query.answer("Session provider mismatch", show_alert=True)
         return
 
-    await _replace_from_callback(
-        query,
-        user_id,
-        thread_id,
-        cwd,
-        context,
+    request = ReplacementRequest(
+        user_id=user_id,
+        thread_id=thread_id,
+        cwd=cwd,
         resume_id=session_id,
         success_label=f"Resuming session: {picked['summary'][:40]}",
         old_window_id=old_wid,
         provider_name=provider_name,
     )
+    await _replace_from_callback(query, context, request)

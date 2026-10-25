@@ -64,14 +64,12 @@ def flow():
         parent.edit(text, **kwargs)
 
     edit = AsyncMock(side_effect=record_edit)
-    stale = AsyncMock(return_value=None)
-    parent.attach_mock(stale, "stale")
-    wait = AsyncMock(return_value=True)
-    parent.attach_mock(wait, "wait")
-    presence = AsyncMock(return_value=True)
-    parent.attach_mock(presence, "presence")
-    send = AsyncMock(return_value=(True, "sent"))
-    parent.attach_mock(send, "send")
+    parent.stale = AsyncMock(return_value=None)
+    parent.wait = AsyncMock(return_value=True)
+    parent.presence = AsyncMock(return_value=True)
+    parent.send = AsyncMock(return_value=(True, "sent"))
+    parent.safe_send = AsyncMock()
+    adapter_for = MagicMock(return_value=adapter)
 
     provider = MagicMock()
     provider.capabilities.name = "claude"
@@ -82,9 +80,7 @@ def flow():
     window_query.resolve_window_alias.side_effect = lambda wid: wid
 
     query = AsyncMock()
-    answer = AsyncMock()
-    query.answer = answer
-    parent.attach_mock(answer, "answer")
+    parent.answer = query.answer = AsyncMock()
     query.message = MagicMock()
     query.message.chat.id = -100999
     query.message.chat.type = "supergroup"
@@ -115,19 +111,24 @@ def flow():
         patch(f"{_RC}._cwd_for_window", return_value=_CWD),
         patch(f"{_RC}.get_provider", return_value=provider),
         patch(f"{_RC}.get_provider_for_window", return_value=provider),
-        patch(f"{_RC}.adapter_for", return_value=adapter),
-        patch(f"{_RC}._stale_recovery_offer", stale),
-        patch(f"{_RC}.session_map_sync.wait_for_session_map_entry", wait),
-        patch(f"{_RC}.send_telegram_to_window", send),
+        patch(f"{_RC}.adapter_for", adapter_for),
+        patch(f"{_RC}.safe_send", parent.safe_send),
+        patch(f"{_RC}._stale_recovery_offer", parent.stale),
+        patch(f"{_RC}.session_map_sync.wait_for_session_map_entry", parent.wait),
+        patch(f"{_RC}.send_telegram_to_window", parent.send),
         patch(f"{_RC}.PTBTelegramClient", client_factory),
-        patch("ccgram.multiplexer.reconciliation.window_presence", presence),
+        patch("ccgram.multiplexer.reconciliation.window_presence", parent.presence),
     ):
         yield SimpleNamespace(
             parent=parent,
             adapter=adapter,
-            stale=stale,
-            wait=wait,
-            presence=presence,
+            adapter_for=adapter_for,
+            router=router,
+            session=session,
+            window_query=window_query,
+            stale=parent.stale,
+            wait=parent.wait,
+            presence=parent.presence,
             view=view,
             provider=provider,
             query=query,
@@ -141,6 +142,7 @@ def flow():
             ),
         )
     topic_orchestration.clear_pending_creation("@5")
+    topic_orchestration.clear_pending_creation("@6")
 
 
 _CLAIM = [
@@ -171,12 +173,14 @@ _UNCERTAIN = [
 ]
 
 
-def _bound(mode: str, label: str, pending: str | None = "hello") -> list:
-    forwarded = [call.send(100, "@5", 42, pending, -100999, adapter=ANY)]
+def _bound(
+    mode: str, label: str, pending: str | None = "hello", wid: str = "@5"
+) -> list:
+    forwarded = [call.send(100, wid, 42, pending, -100999, adapter=ANY)]
     return [
-        call.session.set_window_origin("@5", CCGRAM_CREATED_WINDOW_ORIGIN),
-        call.session.set_window_provider("@5", "claude"),
-        call.session.set_window_approval_mode("@5", mode),
+        call.session.set_window_origin(wid, CCGRAM_CREATED_WINDOW_ORIGIN),
+        call.session.set_window_provider(wid, "claude"),
+        call.session.set_window_approval_mode(wid, mode),
         call.router.commit_topic_provisioning("claim-1", window_name="project"),
         call.session.flush_state(),
         call.router.resolve_chat_id(100, 42),
@@ -454,3 +458,203 @@ class TestStaleWindowAlive:
             await flow.tap_fresh()
 
         assert flow.parent.mock_calls == [*_CLAIM, *_STALE_CHECKED, *_ABORTED]
+
+
+@pytest.fixture()
+def cancelled_create(flow):
+    """Cancel the tap while the backend create is in flight; create then returns."""
+    started, release = asyncio.Event(), asyncio.Event()
+
+    async def create(*_args, **_kwargs):
+        started.set()
+        await release.wait()
+        return SimpleNamespace(target_id=flow.created_id, title="project")
+
+    flow.created_id = ""
+    flow.adapter.create = AsyncMock(side_effect=create)
+
+    async def tap_and_cancel():
+        task = asyncio.create_task(flow.tap_fresh())
+        await started.wait()
+        task.cancel()
+        release.set()
+        await task
+
+    return tap_and_cancel
+
+
+class TestCancellation:
+    async def test_cancelled_create_without_target_reports_failure_and_reraises(
+        self, flow, cancelled_create
+    ) -> None:
+        with pytest.raises(asyncio.CancelledError):
+            await cancelled_create()
+
+        assert flow.parent.mock_calls == [
+            *_CLAIM,
+            *_STALE_CHECKED,
+            _CREATE_NORMAL,
+            *_UNCERTAIN,
+            call.edit("❌ Backend returned no target ID"),
+            call.answer("Failed"),
+        ]
+        assert flow.context.user_data == {}
+
+    async def test_cancelled_create_with_target_closes_it_and_reraises(
+        self, flow, cancelled_create
+    ) -> None:
+        flow.created_id = "@5"
+
+        with pytest.raises(asyncio.CancelledError):
+            await cancelled_create()
+
+        assert flow.parent.mock_calls == [
+            *_CLAIM,
+            *_STALE_CHECKED,
+            _CREATE_NORMAL,
+            *_ATTACHED,
+            call.adapter.close("@5"),
+            *_ABORTED,
+        ]
+        assert not topic_orchestration.is_pending_creation("@5")
+
+    async def test_cancelled_presence_probe_quarantines_and_reraises(
+        self, flow
+    ) -> None:
+        flow.wait.return_value = False
+        flow.presence.side_effect = asyncio.CancelledError
+
+        with pytest.raises(asyncio.CancelledError):
+            await flow.tap_fresh()
+
+        assert flow.parent.mock_calls == [
+            *_CLAIM,
+            *_STALE_CHECKED,
+            _CREATE_NORMAL,
+            *_ATTACHED,
+            *_REGISTERED,
+            call.presence("@5", ANY),
+            *_UNCERTAIN,
+        ]
+        assert not topic_orchestration.is_pending_creation("@5")
+
+
+class TestCommit:
+    async def test_unbindable_target_stays_quarantined_and_is_not_pending(
+        self, flow
+    ) -> None:
+        flow.router.commit_topic_provisioning.return_value = False
+
+        await flow.tap_fresh()
+
+        assert flow.parent.mock_calls == [
+            *_CLAIM,
+            *_STALE_CHECKED,
+            _CREATE_NORMAL,
+            *_ATTACHED,
+            *_REGISTERED,
+            *_bound("normal", "")[:5],
+            *_UNCERTAIN,
+            call.edit("❌ Session could not be bound to this topic"),
+            call.answer("Failed"),
+        ]
+        assert flow.context.user_data == {}
+        assert not topic_orchestration.is_pending_creation("@5")
+
+    async def test_commit_error_quarantines_clears_pending_and_reraises(
+        self, flow
+    ) -> None:
+        flow.router.commit_topic_provisioning.side_effect = RuntimeError("boom")
+
+        with pytest.raises(RuntimeError, match="boom"):
+            await flow.tap_fresh()
+
+        assert flow.parent.mock_calls == [
+            *_CLAIM,
+            *_STALE_CHECKED,
+            _CREATE_NORMAL,
+            *_ATTACHED,
+            *_REGISTERED,
+            *_bound("normal", "")[:4],
+            *_UNCERTAIN,
+        ]
+        assert not topic_orchestration.is_pending_creation("@5")
+
+
+class TestPendingTextForwarding:
+    async def test_failed_forward_tells_the_user_and_still_succeeds(self, flow) -> None:
+        flow.parent.send.return_value = (False, "window busy")
+
+        await flow.tap_fresh()
+
+        assert flow.parent.mock_calls == [
+            *_CLAIM,
+            *_STALE_CHECKED,
+            _CREATE_NORMAL,
+            *_ATTACHED,
+            *_REGISTERED,
+            *_bound("normal", "Fresh session started.")[:-1],
+            call.router.resolve_chat_id(100, 42),
+            call.safe_send(
+                flow.parent.client,
+                -100,
+                "❌ Failed to send pending message: window busy",
+                message_thread_id=42,
+            ),
+            call.answer("Created"),
+        ]
+        assert flow.context.user_data == {}
+
+
+class TestSupersededTarget:
+    async def test_replaced_window_id_is_followed_through_to_the_binding(
+        self, flow
+    ) -> None:
+        flow.window_query.resolve_window_alias.side_effect = {"@5": "@6"}.get
+
+        await flow.tap_fresh()
+
+        assert flow.parent.mock_calls == [
+            *_CLAIM,
+            *_STALE_CHECKED,
+            _CREATE_NORMAL,
+            *_ATTACHED,
+            *_REGISTERED,
+            call.router.attach_provisioning_target("claim-1", "@6"),
+            call.session.flush_state(),
+            *_bound("normal", "Fresh session started.", wid="@6"),
+        ]
+        assert not topic_orchestration.is_pending_creation("@5")
+        assert not topic_orchestration.is_pending_creation("@6")
+
+
+class TestPersistenceFailureWhileFailing:
+    async def test_flush_error_while_marking_uncertain_keeps_the_original_failure(
+        self, flow
+    ) -> None:
+        flow.adapter.create = AsyncMock(
+            side_effect=ProtocolError(503, "backend_unavailable", "unconfirmed")
+        )
+        flow.session.flush_state.side_effect = [None, RuntimeError("disk full")]
+
+        with pytest.raises(ProtocolError):
+            await flow.tap_fresh()
+
+        assert flow.parent.mock_calls == [
+            *_CLAIM,
+            *_STALE_CHECKED,
+            _CREATE_NORMAL,
+            *_UNCERTAIN,
+        ]
+
+
+class TestSessionServiceMissing:
+    async def test_failing_adapter_lookup_surfaces_at_the_create_step(
+        self, flow
+    ) -> None:
+        flow.adapter_for.side_effect = RuntimeError("not initialized")
+
+        with pytest.raises(RuntimeError, match="not initialized"):
+            await flow.tap_fresh()
+
+        assert flow.parent.mock_calls == [*_CLAIM, *_STALE_CHECKED, *_UNCERTAIN]

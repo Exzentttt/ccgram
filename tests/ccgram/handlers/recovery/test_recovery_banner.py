@@ -287,6 +287,7 @@ def create_env():
             edit=edit,
             provider=provider,
             adapter=adapter,
+            adapter_for=adapter_for,
             client=client_factory.return_value,
         )
 
@@ -315,7 +316,7 @@ class TestRecoveryProvisioning:
             ),
             CallbackUi(query, context),
             context.bot,
-            create_env.adapter,
+            create_env.adapter_for,
         )
 
         create_env.router.begin_topic_provisioning.assert_called_once_with(
@@ -398,7 +399,7 @@ class TestRecoveryProbeCancellation:
             ),
             CallbackUi(query, context),
             context.bot,
-            create_env.adapter,
+            create_env.adapter_for,
         )
 
         assert result is False
@@ -430,7 +431,7 @@ class TestRecoveryProbeCancellation:
                 ),
                 CallbackUi(query, context),
                 context.bot,
-                create_env.adapter,
+                create_env.adapter_for,
             )
         )
         await started.wait()
