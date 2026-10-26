@@ -1,4 +1,4 @@
-"""Thread name of a Codex session from ``session_index.jsonl``: unique or nothing."""
+"""Thread name of a Codex session from ``session_index.jsonl``, with the ids sharing it."""
 
 import json
 
@@ -28,12 +28,12 @@ class TestThreadName:
     def test_the_name_of_the_id(self, index) -> None:
         index(row("a", "alpha"), row("b", "beta"))
 
-        assert codex_thread_name("b") == "beta"
+        assert codex_thread_name("b") == ("beta", ())
 
     def test_the_last_line_of_an_id_wins(self, index) -> None:
         index(row("a", "old"), row("a", "new"))
 
-        assert codex_thread_name("a") == "new"
+        assert codex_thread_name("a") == ("new", ())
 
     def test_an_unknown_id_has_no_name(self, index) -> None:
         index(row("a", "alpha"))
@@ -51,16 +51,16 @@ class TestThreadName:
 
         assert codex_thread_name("a") is None
 
-    def test_a_name_shared_with_another_id_is_ambiguous(self, index) -> None:
-        index(row("a", "same"), row("b", "same"))
+    def test_a_name_shared_with_other_ids_lists_them(self, index) -> None:
+        index(row("a", "same"), row("c", "same"), row("b", "same"), row("d", "x"))
 
-        assert codex_thread_name("a") is None
-        assert codex_thread_name("b") is None
+        assert codex_thread_name("a") == ("same", ("b", "c"))
+        assert codex_thread_name("b") == ("same", ("a", "c"))
 
-    def test_a_name_the_other_id_no_longer_has_is_not_ambiguous(self, index) -> None:
+    def test_a_name_the_other_id_no_longer_has_is_not_shared(self, index) -> None:
         index(row("b", "same"), row("b", "renamed"), row("a", "same"))
 
-        assert codex_thread_name("a") == "same"
+        assert codex_thread_name("a") == ("same", ())
 
     def test_bad_lines_are_skipped(self, index) -> None:
         index(
@@ -71,7 +71,7 @@ class TestThreadName:
             row("a", "ok"),
         )
 
-        assert codex_thread_name("a") == "ok"
+        assert codex_thread_name("a") == ("ok", ())
 
     def test_an_empty_name_is_no_name(self, index) -> None:
         index(row("a", ""))

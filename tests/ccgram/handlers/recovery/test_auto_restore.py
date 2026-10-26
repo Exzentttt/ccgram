@@ -2088,16 +2088,53 @@ class TestAdoptCodexSession:
 
         live.adopt.assert_not_called()
 
-    async def test_a_session_without_a_unique_name_is_not_adopted(
+    def namesakes(self, *ids: str) -> None:
+        index = Path.home() / ".codex" / "session_index.jsonl"
+        rows = [{"id": i, "thread_name": "thread-1"} for i in ("sess-1", *ids)]
+        index.write_text("".join(json.dumps(r) + "\n" for r in rows))
+
+    async def test_a_name_shared_with_a_session_without_rollout_is_adopted(
         self, env, live
     ) -> None:
-        index = Path.home() / ".codex" / "session_index.jsonl"
-        index.write_text(
-            "".join(
-                json.dumps({"id": i, "thread_name": "same"}) + "\n"
-                for i in ("sess-1", "other")
-            )
-        )
+        self.namesakes("old-missing")
+
+        assert await self.call(live) == "2:@2"
+
+    async def test_a_name_shared_with_a_closed_rollout_is_adopted(
+        self, env, live
+    ) -> None:
+        env.codex_rollout("old-closed")
+        self.namesakes("old-closed")
+        env.lsof_script = [(0, b"p1\n"), (1, b"")]
+
+        assert await self.call(live) == "2:@2"
+
+        assert len(env.lsof_calls) == 2
+
+    async def test_a_name_shared_with_an_open_rollout_is_not_adopted(
+        self, env, live
+    ) -> None:
+        env.codex_rollout("other-open")
+        self.namesakes("other-open")
+        env.lsof_script = [(0, b"p1\n"), (0, b"p2\n")]
+
+        assert await self.call(live) is None
+
+        live.adopt.assert_not_called()
+
+    async def test_a_name_shared_with_an_unconfirmed_rollout_is_not_adopted(
+        self, env, live
+    ) -> None:
+        env.codex_rollout("other-unknown")
+        self.namesakes("other-unknown")
+        env.lsof_script = [(0, b"p1\n"), (2, b"")]
+
+        assert await self.call(live) is None
+
+        live.adopt.assert_not_called()
+
+    async def test_a_session_without_a_name_is_not_adopted(self, env, live) -> None:
+        (Path.home() / ".codex" / "session_index.jsonl").write_text("")
 
         assert await self.call(live) is None
 

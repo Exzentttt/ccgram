@@ -87,11 +87,12 @@ def _latest_thread_names(index: Path) -> dict[str, str]:
     return names
 
 
-def codex_thread_name(session_id: str) -> str | None:
-    """The thread name of a session, or None when it cannot identify it alone.
+def codex_thread_name(session_id: str) -> tuple[str, tuple[str, ...]] | None:
+    """The thread name of a session and the other ids whose latest name is the same.
 
-    None when the index is missing or unreadable, holds no name for the id, or
-    gives the same name to another id (the name would not prove which session).
+    None when the index is missing or unreadable, or holds no name for the id.
+    The namesakes are sorted; a name only identifies the session once the caller
+    has ruled out that a namesake is live.
     """
     index = Path.home() / ".codex" / "session_index.jsonl"
     try:
@@ -101,9 +102,9 @@ def codex_thread_name(session_id: str) -> str | None:
     name = names.get(session_id)
     if not name:
         return None
-    if any(other != session_id and n == name for other, n in names.items()):
-        return None
-    return name
+    return name, tuple(
+        sorted(i for i, n in names.items() if n == name and i != session_id)
+    )
 
 
 def _collect_codex_sessions(sessions_dir: Path) -> list[tuple[float, Path]]:

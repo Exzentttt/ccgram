@@ -344,12 +344,16 @@ async def _adopt_codex(
     topic: tuple[int, int, int],
     old_window_id: str,
 ) -> str | None:
-    """Live rollout and a unique thread name first; the pane must then show the name."""
+    """Live rollout and a thread name no live session shares; the pane must then show it."""
     if not cwd or not await _rollout_live(session_id):
         return None
-    name = await asyncio.to_thread(codex_thread_name, session_id)
-    if name is None:
+    found = await asyncio.to_thread(codex_thread_name, session_id)
+    if found is None:
         return None
+    name, namesakes = found
+    for other in namesakes:  # a live namesake could be the one showing the name
+        if await _rollout_live(other) is not False:
+            return None
     return await adopt_live.adopt_codex(view, name, Path(cwd), old_window_id, topic)
 
 
