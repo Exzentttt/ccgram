@@ -10,8 +10,8 @@ such a binding is never resumed into. At every start, flag on or off, if a
 binding is dead the window-id counter advances past every bound id, so no new
 window takes another topic's old id. A session running outside the bot's tmux
 session (Claude pid registry, Codex rollout open per ``lsof``) is never resumed;
-a live Claude session whose window :mod:`adopt_live` can name is reconnected to
-its topic instead.
+a live Claude or Codex session whose window :mod:`adopt_live` can prove is
+reconnected to its topic instead.
 The plan is saved to a ledger keyed by the server boot id: one attempt per
 (chat, topic, session) per boot, and the next start finishes a plan a crash
 cut short.
@@ -43,9 +43,9 @@ from ...multiplexer import (
     reserve_window_ids_past,
     server_view,
 )
-from ...multiplexer.base import WindowRef
+from ...multiplexer.base import ServerView, WindowRef
 from ...multiplexer.reconciliation import list_windows_for_reconciliation
-from ...providers.codex import codex_sessions_dir
+from ...providers.codex import codex_sessions_dir, codex_thread_name
 from ...thread_router import thread_router
 from ...utils import atomic_write_json, task_done_callback
 from ..topics import topic_orchestration
@@ -307,14 +307,19 @@ async def _rollout_open(path: Path) -> bool | None:
     return False if proc.returncode == 1 and not out.strip() else None
 
 
+async def _rollout_live(session_id: str) -> bool | None:
+    """Whether a process holds a rollout of the Codex session open; None if unsure."""
+    paths = await asyncio.to_thread(_codex_rollouts, session_id)
+    opened = [await _rollout_open(path) for path in paths]
+    return True if True in opened else None if None in opened else False
+
+
 async def _outside_liveness(entry: RestoreEntry) -> str | None:
     """Skip reason when the session runs outside the bot's own tmux session."""
     if entry.provider_name == "claude":
         live = await asyncio.to_thread(_claude_registry_live, entry.session_id)
     elif entry.provider_name == "codex":
-        paths = await asyncio.to_thread(_codex_rollouts, entry.session_id)
-        opened = [await _rollout_open(path) for path in paths]
-        live = True if True in opened else None if None in opened else False
+        live = await _rollout_live(entry.session_id)
     else:
         return None
     if live is None:
@@ -322,29 +327,57 @@ async def _outside_liveness(entry: RestoreEntry) -> str | None:
     return "session_live" if live else None
 
 
+async def _adopt_claude(
+    view: ServerView, session_id: str, topic: tuple[int, int, int], old_window_id: str
+) -> str | None:
+    pid, _ = await asyncio.to_thread(_claude_registry_scan, session_id)
+    if pid is None:
+        return None
+    parents = await asyncio.to_thread(_parent_pids)
+    return await adopt_live.adopt(view, pid, parents, old_window_id, topic)
+
+
+async def _adopt_codex(
+    view: ServerView,
+    session_id: str,
+    cwd: str,
+    topic: tuple[int, int, int],
+    old_window_id: str,
+) -> str | None:
+    """Live rollout and a unique thread name first; the pane must then show the name."""
+    if not cwd or not await _rollout_live(session_id):
+        return None
+    name = await asyncio.to_thread(codex_thread_name, session_id)
+    if name is None:
+        return None
+    return await adopt_live.adopt_codex(view, name, Path(cwd), old_window_id, topic)
+
+
 async def adopt_live_session(
     provider_name: str,
     session_id: str,
     topic: tuple[int, int, int],
     old_window_id: str,
+    cwd: str = "",
 ) -> str | None:
-    """Reconnect ``topic`` (user, chat, thread) to the window its live Claude session runs in.
+    """Reconnect ``topic`` (user, chat, thread) to the window its live session runs in.
 
-    Returns the ``session:window`` label, or None when nothing was adopted.
-    Codex is not adopted. A miss is remembered for 30 s, so a message to a topic
-    with no live session elsewhere costs one lookup, not one per message.
-    Never raises: a failure leaves the binding as it was.
+    Claude is found by its registry pid, Codex by its open rollout, unique thread
+    name and a pane in ``cwd`` showing that name. Returns the ``session:window``
+    label, or None when nothing was adopted. A miss is remembered for 30 s, so a
+    message to a topic with no live session elsewhere costs one lookup, not one
+    per message. Never raises: a failure leaves the binding as it was.
     """
-    if provider_name != "claude" or (view := server_view()) is None:
+    if provider_name not in ("claude", "codex") or (view := server_view()) is None:
         return None
     if time.monotonic() < _adopt_misses.get(session_id, 0.0):
         return None
     label = None
     try:
-        pid, _ = await asyncio.to_thread(_claude_registry_scan, session_id)
-        if pid is not None:
-            parents = await asyncio.to_thread(_parent_pids)
-            label = await adopt_live.adopt(view, pid, parents, old_window_id, topic)
+        if provider_name == "claude":
+            label = await _adopt_claude(view, session_id, topic, old_window_id)
+        else:
+            label = await _adopt_codex(view, session_id, cwd, topic, old_window_id)
     except Exception:
         logger.exception("adopt_live_failed", session_id=session_id)
     if label is None:
@@ -361,7 +394,7 @@ async def adopt_for_topic(
         return None
     topic = (user_id, chat_id, thread_id)
     return await adopt_live_session(
-        view.provider_name, view.session_id, topic, old_window_id
+        view.provider_name, view.session_id, topic, old_window_id, view.cwd
     )
 
 
@@ -371,7 +404,7 @@ async def _adopted_notice(entry: RestoreEntry, reason: str | None) -> _Notice | 
         return None
     topic = (entry.user_id, entry.chat_id, entry.thread_id)
     label = await adopt_live_session(
-        entry.provider_name, entry.session_id, topic, entry.old_window_id
+        entry.provider_name, entry.session_id, topic, entry.old_window_id, entry.cwd
     )
     return None if label is None else _Notice(topic[1:], adopt_text(label))
 

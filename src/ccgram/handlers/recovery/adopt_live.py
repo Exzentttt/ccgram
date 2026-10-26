@@ -9,10 +9,17 @@ is rebound to it. A window of a bot session (marked by the bot itself, or a
 reserve session) or already bound to a topic is never a candidate. Nothing is
 killed, respawned or sent keys; a failed rebind unlinks the window again.
 
-Public surface: :func:`adopt`.
+A Codex session has no pid to follow (its rollout is held by a shared daemon), so
+:func:`adopt_codex` proves identity from the screen: a pane running ``codex`` in
+the topic's folder whose capture shows the session's thread name; exactly one
+window must prove it.
+
+Public surface: :func:`adopt`, :func:`adopt_codex`.
 """
 
 from __future__ import annotations
+
+from pathlib import Path
 
 import structlog
 
@@ -34,12 +41,18 @@ def _ancestors(pid: int, parents: dict[int, int]) -> set[int]:
     return chain
 
 
+def _taken_windows(panes: list[ServerPane]) -> set[str]:
+    """Windows of bot sessions or bound to a topic: never candidates."""
+    taken = {p.window_id for p in panes if p.bot_owned}
+    taken.update(wid for *_, wid in session_query.iter_bound_topics())
+    return taken
+
+
 def _candidate_windows(
     panes: list[ServerPane], pid: int, parents: dict[int, int]
 ) -> set[str]:
     """Windows of non-bot sessions, bound to no topic, with a pane above ``pid``."""
-    taken = {p.window_id for p in panes if p.bot_owned}
-    taken.update(wid for *_, wid in session_query.iter_bound_topics())
+    taken = _taken_windows(panes)
     chain = _ancestors(pid, parents)
     return {
         p.window_id for p in panes if p.pane_pid in chain and p.window_id not in taken
@@ -68,6 +81,24 @@ async def _link_and_rebind(
     return False
 
 
+async def _adopt_single(
+    view: ServerView,
+    panes: list[ServerPane],
+    found: set[str],
+    old_window_id: str,
+    topic: tuple[int, int, int],
+) -> str | None:
+    """Link and rebind when exactly one window qualified; the label, else None."""
+    if len(found) != 1:
+        logger.info("adopt_ambiguous", candidates=len(found))
+        return None
+    (window_id,) = found
+    if not await _link_and_rebind(view, window_id, old_window_id, topic):
+        return None
+    session = min(p.session_name for p in panes if p.window_id == window_id)
+    return f"{session}:{window_id}"
+
+
 async def adopt(
     view: ServerView,
     pid: int,
@@ -85,11 +116,53 @@ async def adopt(
         logger.warning("adopt_listing_unavailable")
         return None
     found = _candidate_windows(panes, pid, parents)
-    if len(found) != 1:
-        logger.info("adopt_ambiguous", candidates=len(found))
+    return await _adopt_single(view, panes, found, old_window_id, topic)
+
+
+def _codex_candidates(panes: list[ServerPane], cwd: Path) -> list[ServerPane]:
+    """Free ``codex`` panes in ``cwd``, one per pane id."""
+    taken = _taken_windows(panes)
+    wanted = cwd.resolve()
+    seen: dict[str, ServerPane] = {}
+    for p in panes:
+        if (
+            p.current_command == "codex"
+            and p.window_id not in taken
+            and p.current_path
+            and Path(p.current_path).resolve() == wanted
+        ):
+            seen.setdefault(p.pane_id, p)
+    return list(seen.values())
+
+
+async def _windows_showing(
+    view: ServerView, candidates: list[ServerPane], thread_name: str
+) -> set[str]:
+    """Windows with a candidate pane whose screen shows ``thread_name``."""
+    shown: set[str] = set()
+    for p in candidates:
+        screen = await view.capture_server_pane(p.pane_id)
+        if screen is not None and thread_name in screen:
+            shown.add(p.window_id)
+    return shown
+
+
+async def adopt_codex(
+    view: ServerView,
+    thread_name: str,
+    cwd: Path,
+    old_window_id: str,
+    topic: tuple[int, int, int],
+) -> str | None:
+    """Rebind ``topic`` to the one Codex pane in ``cwd`` showing ``thread_name``.
+
+    Returns the ``session:window`` label, or None when no single pane proved
+    itself or the rebind did not apply.
+    """
+    panes = await view.list_server_panes()
+    if panes is None:
+        logger.warning("adopt_listing_unavailable")
         return None
-    (window_id,) = found
-    if not await _link_and_rebind(view, window_id, old_window_id, topic):
-        return None
-    session = min(p.session_name for p in panes if p.window_id == window_id)
-    return f"{session}:{window_id}"
+    candidates = _codex_candidates(panes, cwd)
+    found = await _windows_showing(view, candidates, thread_name)
+    return await _adopt_single(view, panes, found, old_window_id, topic)

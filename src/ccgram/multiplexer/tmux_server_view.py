@@ -25,10 +25,13 @@ _OWN_WINDOW = "_ccgram"
 
 
 def _pane_format() -> str:
-    """Fields split on ``|``; only the last (session name) is free text."""
+    """Fields split on ``|``; only the last (session name) is free text.
+
+    The folder is free text too, so a ``|`` in it is rewritten to ``_``.
+    """
     main = config.tmux_main_window_name
     own = f"#{{||:#{{==:#{{window_name}},{_OWN_WINDOW}}},#{{==:#{{window_name}},{main}}}}}"
-    return f"#{{window_id}}|#{{pane_id}}|#{{pane_pid}}|#{{{_BOT_OPTION}}}|{own}|#{{session_name}}"
+    return f"#{{window_id}}|#{{pane_id}}|#{{pane_pid}}|#{{{_BOT_OPTION}}}|{own}|#{{pane_current_command}}|#{{s/\\|/_/:pane_current_path}}|#{{session_name}}"
 
 
 class TmuxServerViewMixin:
@@ -84,9 +87,11 @@ class TmuxServerViewMixin:
         lines = await self._tmux("list-panes", "-a", "-F", _pane_format())
         if lines is None:
             return None
-        rows = [line.split("|", 5) for line in lines]
+        rows = [line.split("|", 7) for line in lines]
         owned = {
-            session for *_, mark, own, session in rows if mark == "1" or own == "1"
+            session
+            for *_, mark, own, _cmd, _path, session in rows
+            if mark == "1" or own == "1"
         }
         owned.add(self.session_name)
         return [
@@ -96,10 +101,17 @@ class TmuxServerViewMixin:
                 pane_id,
                 int(pid),
                 session in owned or session.startswith(RESERVE_SESSION_PREFIX),
+                command,
+                path,
             )
-            for window_id, pane_id, pid, _mark, _own, session in rows
+            for window_id, pane_id, pid, _mark, _own, command, path, session in rows
             if pid.isdigit()
         ]
+
+    async def capture_server_pane(self, pane_id: str) -> str | None:
+        """Visible text of a pane of any session (wrapped lines joined)."""
+        lines = await self._tmux("capture-pane", "-p", "-J", "-t", pane_id)
+        return None if lines is None else "\n".join(lines)
 
     async def mark_bot_session(self) -> bool:
         """Set the bot-session option on this session; adoption skips marked sessions."""

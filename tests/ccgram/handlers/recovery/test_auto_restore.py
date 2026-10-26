@@ -1879,7 +1879,9 @@ class TestAdoptLive:
         assert env.notices() == [(1, adopt_text("2:@2"))]
         assert _skips(logs) == ["adopted"]
         assert env.ledger["entries"] == []
-        adopt.assert_awaited_once_with("claude", "sess-1", (_USER, _CHAT, 1), "@1")
+        adopt.assert_awaited_once_with(
+            "claude", "sess-1", (_USER, _CHAT, 1), "@1", env.states["@1"].cwd
+        )
 
     async def test_a_live_session_with_a_missing_folder_is_adopted_too(
         self, env, adopt
@@ -1978,8 +1980,8 @@ class TestAdoptLiveSession:
             live.view, os.getpid(), {9: 1}, "@1", (_USER, _CHAT, 1)
         )
 
-    async def test_codex_is_not_adopted(self, env, live) -> None:
-        assert await self.call("codex") is None
+    async def test_an_unknown_provider_is_not_adopted(self, env, live) -> None:
+        assert await self.call("pi") is None
 
         env.server_view.assert_not_called()
         live.adopt.assert_not_called()
@@ -2032,6 +2034,126 @@ class TestAdoptLiveSession:
         await self.call()
 
         assert live.adopt.await_count == 2
+
+
+class TestAdoptCodexSession:
+    """A Codex session: its rollout must be open, its thread name unique."""
+
+    @pytest.fixture()
+    def live(self, env):
+        env.codex_rollout("sess-1")
+        env.lsof_result = (0, b"p1\n")
+        index = Path.home() / ".codex" / "session_index.jsonl"
+        index.write_text(
+            json.dumps({"id": "sess-1", "thread_name": "thread-1", "updated_at": ""})
+            + "\n"
+        )
+        env.server_view.return_value = view = MagicMock()
+        with patch(
+            f"{_AR}.adopt_live.adopt_codex", AsyncMock(return_value="2:@2")
+        ) as adopt_it:
+            yield SimpleNamespace(view=view, adopt=adopt_it, cwd=str(env.tmp / "p"))
+
+    async def call(self, live, cwd=None):
+        return await auto_restore.adopt_live_session(
+            "codex", "sess-1", (_USER, _CHAT, 1), "@1", live.cwd if cwd is None else cwd
+        )
+
+    async def test_an_open_rollout_with_a_name_is_adopted(self, env, live) -> None:
+        assert await self.call(live) == "2:@2"
+
+        live.adopt.assert_awaited_once_with(
+            live.view, "thread-1", Path(live.cwd), "@1", (_USER, _CHAT, 1)
+        )
+
+    async def test_a_rollout_nobody_holds_open_is_not_adopted(self, env, live) -> None:
+        env.lsof_result = (1, b"")
+
+        assert await self.call(live) is None
+
+        live.adopt.assert_not_called()
+
+    async def test_an_unconfirmed_rollout_is_not_adopted(self, env, live) -> None:
+        env.lsof_result = (2, b"")
+
+        assert await self.call(live) is None
+
+        live.adopt.assert_not_called()
+
+    async def test_a_session_without_a_rollout_is_not_adopted(self, env, live) -> None:
+        for path in (Path.home() / ".codex" / "sessions").rglob("*.jsonl"):
+            path.unlink()
+
+        assert await self.call(live) is None
+
+        live.adopt.assert_not_called()
+
+    async def test_a_session_without_a_unique_name_is_not_adopted(
+        self, env, live
+    ) -> None:
+        index = Path.home() / ".codex" / "session_index.jsonl"
+        index.write_text(
+            "".join(
+                json.dumps({"id": i, "thread_name": "same"}) + "\n"
+                for i in ("sess-1", "other")
+            )
+        )
+
+        assert await self.call(live) is None
+
+        live.adopt.assert_not_called()
+
+    async def test_a_topic_without_a_folder_is_not_adopted(self, env, live) -> None:
+        assert await self.call(live, cwd="") is None
+
+        live.adopt.assert_not_called()
+
+    async def test_without_the_backend_capability_nothing_is_read(
+        self, env, live
+    ) -> None:
+        env.server_view.return_value = None
+
+        assert await self.call(live) is None
+
+        assert env.lsof_calls == []
+
+    async def test_a_failure_is_logged_and_returns_none(self, env, live) -> None:
+        live.adopt.side_effect = RuntimeError("boom")
+
+        with capture_logs() as logs:
+            assert await self.call(live) is None
+
+        assert "adopt_live_failed" in [log["event"] for log in logs]
+
+    async def test_a_miss_is_remembered_for_thirty_seconds(self, env, live) -> None:
+        live.adopt.return_value = None
+        clock = MagicMock(return_value=1000.0)
+
+        with patch(f"{_AR}.time.monotonic", clock):
+            await self.call(live)
+            clock.return_value = 1029.0
+            await self.call(live)
+            assert live.adopt.await_count == 1
+            clock.return_value = 1031.0
+            await self.call(live)
+            assert live.adopt.await_count == 2
+
+    async def test_a_dead_codex_topic_is_adopted_by_the_message_path(
+        self, env, live
+    ) -> None:
+        env.dead_topic(1, "@1", session="sess-1", provider="codex")
+
+        assert await auto_restore.adopt_for_topic(_USER, _CHAT, 1, "@1") == "2:@2"
+
+        assert live.adopt.call_args.args[2] == Path(env.states["@1"].cwd)
+
+    async def test_auto_restore_adopts_a_live_codex_session(self, env, live) -> None:
+        env.dead_topic(1, "@1", session="sess-1", provider="codex")
+
+        await env.start()
+
+        assert env.notices() == [(1, adopt_text("2:@2"))]
+        env.adapter.create.assert_not_called()
 
 
 class TestAdoptForTopic:

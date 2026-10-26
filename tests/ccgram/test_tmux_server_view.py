@@ -104,6 +104,84 @@ class TestListing:
 
 
 @needs_tmux
+class TestPaneDetails:
+    async def test_a_pane_lists_its_command_and_working_folder(
+        self, mux, tmp_path
+    ) -> None:
+        mux.server.new_session(
+            session_name="work",
+            window_name="w",
+            attach=False,
+            start_directory=str(tmp_path),
+            window_command="sleep 300",
+        )
+
+        (found,) = await panes_of(mux, "work")
+
+        assert found.current_command == "sleep"
+        assert Path(found.current_path).resolve() == tmp_path.resolve()
+
+    async def test_a_folder_with_a_pipe_does_not_shift_the_session_name(
+        self, mux, tmp_path
+    ) -> None:
+        odd = tmp_path / "a|b"
+        odd.mkdir()
+        mux.server.new_session(
+            session_name="piped",
+            window_name="w",
+            attach=False,
+            start_directory=str(odd),
+        )
+
+        (found,) = await panes_of(mux, "piped")
+
+        assert found.session_name == "piped"
+        assert not found.bot_owned
+
+
+@needs_tmux
+class TestCapture:
+    async def test_the_visible_text_of_a_pane_of_another_session(self, mux) -> None:
+        mux.server.new_session(
+            session_name="shown",
+            window_name="w",
+            attach=False,
+            window_command="printf 'thread-xyz\\n'; sleep 300",
+        )
+        (found,) = await panes_of(mux, "shown")
+
+        text = None
+        for _ in range(50):
+            text = await mux.capture_server_pane(found.pane_id)
+            if text and "thread-xyz" in text:
+                break
+            await asyncio.sleep(0.1)
+
+        assert text is not None
+        assert "thread-xyz" in text
+
+    async def test_a_missing_pane_captures_nothing(self, mux) -> None:
+        assert await mux.capture_server_pane("%999") is None
+
+    async def test_a_hung_capture_is_killed(self, mux) -> None:
+        proc = MagicMock()
+
+        async def hang():
+            await asyncio.sleep(3600)
+
+        proc.communicate = hang
+        proc.kill = MagicMock()
+        proc.wait = AsyncMock()
+        with (
+            patch.object(tmux_server_view, "_CMD_TIMEOUT_S", 0.05),
+            patch("asyncio.create_subprocess_exec", AsyncMock(return_value=proc)),
+        ):
+            assert await mux.capture_server_pane("%0") is None
+
+        proc.kill.assert_called_once()
+
+
+@needs_tmux
 class TestMarking:
     async def test_the_bot_marks_its_own_session(self, mux) -> None:
         assert await mux.mark_bot_session() is True

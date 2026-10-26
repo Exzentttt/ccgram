@@ -70,6 +70,42 @@ def codex_sessions_dir() -> Path:
     return Path.home() / ".codex" / "sessions"
 
 
+def _latest_thread_names(index: Path) -> dict[str, str]:
+    """Session id -> thread name from the index; the last line of an id wins."""
+    names: dict[str, str] = {}
+    with index.open(encoding="utf-8") as lines:
+        for line in lines:
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(row, dict):
+                continue
+            session_id, name = row.get("id"), row.get("thread_name")
+            if isinstance(session_id, str) and isinstance(name, str):
+                names[session_id] = name
+    return names
+
+
+def codex_thread_name(session_id: str) -> str | None:
+    """The thread name of a session, or None when it cannot identify it alone.
+
+    None when the index is missing or unreadable, holds no name for the id, or
+    gives the same name to another id (the name would not prove which session).
+    """
+    index = Path.home() / ".codex" / "session_index.jsonl"
+    try:
+        names = _latest_thread_names(index)
+    except OSError, UnicodeDecodeError:
+        return None
+    name = names.get(session_id)
+    if not name:
+        return None
+    if any(other != session_id and n == name for other, n in names.items()):
+        return None
+    return name
+
+
 def _collect_codex_sessions(sessions_dir: Path) -> list[tuple[float, Path]]:
     """Collect all JSONL files under sessions_dir, sorted newest-first by mtime."""
     result: list[tuple[float, Path]] = []

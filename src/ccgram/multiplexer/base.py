@@ -630,6 +630,8 @@ class ServerPane(NamedTuple):
     A window linked into two sessions is listed once per session.
     ``bot_owned``: the session is a ccgram bot session (marked by the bot, or a
     window-id reserve session), so its windows are never another session's to adopt.
+    ``current_command`` / ``current_path``: the foreground command and working
+    folder of the pane (a ``|`` in the folder reads as ``_``).
     """
 
     session_name: str
@@ -637,6 +639,8 @@ class ServerPane(NamedTuple):
     pane_id: str
     pane_pid: int
     bot_owned: bool
+    current_command: str = ""
+    current_path: str = ""
 
 
 @runtime_checkable
@@ -645,6 +649,10 @@ class ServerView(Protocol):
 
     async def list_server_panes(self) -> list[ServerPane] | None:
         """Every pane of every session; None when the server cannot say."""
+        ...
+
+    async def capture_server_pane(self, pane_id: str) -> str | None:
+        """Visible text of a pane of any session; None when it cannot be read."""
         ...
 
     async def link_window_into_session(self, window_id: str) -> bool:

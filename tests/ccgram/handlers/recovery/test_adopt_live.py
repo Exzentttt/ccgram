@@ -15,8 +15,12 @@ _AL = "ccgram.handlers.recovery.adopt_live"
 _TOPIC = (100, -1001, 42)
 
 
-def pane(session, window, pid, owned=False) -> ServerPane:
-    return ServerPane(session, window, f"%{window[1:]}", pid, owned)
+def pane(
+    session, window, pid, owned=False, command="", path="", pane_id=None
+) -> ServerPane:
+    return ServerPane(
+        session, window, pane_id or f"%{window[1:]}", pid, owned, command, path
+    )
 
 
 class World:
@@ -179,3 +183,120 @@ class TestRebinding:
         await world.adopt()
 
         world.lifecycle.clear_dead_notification.assert_called_once_with(100, 42)
+
+
+_NAME = "agentspore-oss"
+
+
+@pytest.fixture
+def codex(world, tmp_path):
+    """A topic cwd, one codex pane of a foreign session showing the thread name."""
+    cwd = tmp_path / "proj"
+    cwd.mkdir()
+    world.cwd = cwd
+    world.panes = [
+        pane("ccgram", "@0", 10, True, "python", str(cwd)),
+        pane("2", "@2", 100, command="codex", path=str(cwd)),
+    ]
+    world.screens = {"%2": f"... · {cwd} · {_NAME} · GPT-5 · ..."}
+    world.view.capture_server_pane = AsyncMock(
+        side_effect=lambda pane_id: world.screens.get(pane_id)
+    )
+
+    async def adopt_codex(name=_NAME, where=None):
+        return await adopt_live.adopt_codex(
+            world.view, name, where or world.cwd, "@1", _TOPIC
+        )
+
+    world.adopt_codex = adopt_codex
+    return world
+
+
+class TestCodexIdentity:
+    async def test_the_pane_showing_the_thread_name_is_adopted(self, codex) -> None:
+        assert await codex.adopt_codex() == "2:@2"
+
+        codex.view.link_window_into_session.assert_awaited_once_with("@2")
+        codex.manager.rebind_window.assert_called_once_with("@1", "@2")
+
+    async def test_a_symlinked_working_folder_still_matches(
+        self, codex, tmp_path
+    ) -> None:
+        link = tmp_path / "link"
+        link.symlink_to(codex.cwd)
+
+        assert await codex.adopt_codex(where=link) == "2:@2"
+
+    async def test_a_pane_without_the_thread_name_is_not_adopted(self, codex) -> None:
+        codex.screens["%2"] = "some other thread"
+
+        assert await codex.adopt_codex() is None
+
+        codex.view.link_window_into_session.assert_not_called()
+
+    async def test_an_unreadable_pane_is_not_adopted(self, codex) -> None:
+        codex.screens.clear()
+
+        assert await codex.adopt_codex() is None
+
+    async def test_another_folder_is_not_a_candidate_even_with_the_name(
+        self, codex, tmp_path
+    ) -> None:
+        codex.panes[1] = pane("2", "@2", 100, command="codex", path=str(tmp_path))
+
+        assert await codex.adopt_codex() is None
+
+        codex.view.capture_server_pane.assert_not_called()
+
+    async def test_another_command_is_not_a_candidate(self, codex) -> None:
+        codex.panes[1] = pane("2", "@2", 100, command="zsh", path=str(codex.cwd))
+
+        assert await codex.adopt_codex() is None
+
+    async def test_a_bot_owned_pane_is_not_a_candidate(self, codex) -> None:
+        codex.panes[1] = pane("2", "@2", 100, True, "codex", str(codex.cwd))
+
+        assert await codex.adopt_codex() is None
+
+    async def test_a_window_also_in_a_bot_session_is_excluded(self, codex) -> None:
+        codex.panes.append(pane("ccgram", "@2", 100, True, "codex", str(codex.cwd)))
+
+        assert await codex.adopt_codex() is None
+
+    async def test_a_window_bound_to_another_topic_is_excluded(self, codex) -> None:
+        codex.bound.append("@2")
+
+        assert await codex.adopt_codex() is None
+
+    async def test_two_proven_windows_are_ambiguous(self, codex) -> None:
+        codex.panes.append(pane("3", "@3", 101, command="codex", path=str(codex.cwd)))
+        codex.screens["%3"] = f"x · {_NAME} · y"
+
+        assert await codex.adopt_codex() is None
+
+        codex.view.link_window_into_session.assert_not_called()
+
+    async def test_the_pane_without_the_name_does_not_make_it_ambiguous(
+        self, codex
+    ) -> None:
+        codex.panes.append(pane("3", "@3", 101, command="codex", path=str(codex.cwd)))
+        codex.screens["%3"] = "another codex thread"
+
+        assert await codex.adopt_codex() == "2:@2"
+
+    async def test_a_window_listed_twice_is_one_candidate(self, codex) -> None:
+        codex.panes.append(pane("9", "@2", 100, command="codex", path=str(codex.cwd)))
+
+        assert await codex.adopt_codex() == "2:@2"
+
+    async def test_an_unreadable_listing_adopts_nothing(self, codex) -> None:
+        codex.panes = None
+
+        assert await codex.adopt_codex() is None
+
+    async def test_a_failed_rebind_unlinks_again(self, codex) -> None:
+        codex.rebound = False
+
+        assert await codex.adopt_codex() is None
+
+        codex.view.unlink_window_from_session.assert_awaited_once_with("@2")
