@@ -387,11 +387,12 @@ async def adopt_live_session(
 ) -> str | None:
     """Reconnect ``topic`` (user, chat, thread) to the window its live session runs in.
 
-    Claude is found by its registry pid, Codex by its open rollout, unique thread
-    name and a pane in ``cwd`` showing that name. Returns the ``session:window``
-    label, or None when nothing was adopted. A miss is remembered for 30 s, so a
-    message to a topic with no live session elsewhere costs one lookup, not one
-    per message. Never raises: a failure leaves the binding as it was.
+    Claude is found by its registry pid, Codex by its open rollout, a thread
+    name no other live session shares and a pane in ``cwd`` showing that name.
+    Returns the ``session:window`` label, or None when nothing was adopted. A
+    miss is remembered for 30 s, so a message to a topic with no live session
+    elsewhere costs one lookup, not one per message. Never raises: a failure
+    leaves the binding as it was.
     """
     if provider_name not in ("claude", "codex") or (view := server_view()) is None:
         return None
