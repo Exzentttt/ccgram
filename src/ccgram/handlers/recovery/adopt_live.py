@@ -138,18 +138,23 @@ def _codex_candidates(panes: list[ServerPane], cwd: Path) -> list[ServerPane]:
 def status_line_proves(screen: str, thread_name: str, cwd: Path) -> bool:
     """Whether the Codex status line at the foot of ``screen`` names this thread.
 
-    Only the last four non-blank lines count (a hint line follows the status
-    line). Fields split on `` · ``; the folder field (a path, possibly
+    Among the last four non-blank lines only the bottom-most one with a path
+    field is judged (the hint line below the status line has none; lines above
+    are transcript). Fields split on `` · ``; that path field (possibly
     ``~``-abbreviated) must end in the folder name of ``cwd`` (as given or
-    resolved) and the very next field must equal ``thread_name``. Any other layout proves nothing.
+    resolved) and the very next field must equal ``thread_name``. Any other
+    layout proves nothing.
     """
     folders = {cwd.name, cwd.resolve().name}
     lines = [line for line in screen.splitlines() if line.strip()][-4:]
-    for line in lines:
+    for line in reversed(lines):
         fields = [f.strip() for f in line.split(" · ")]
-        for here, after in zip(fields, fields[1:]):
-            if "/" in here and Path(here).name in folders and after == thread_name:
-                return True
+        if not any("/" in f for f in fields):
+            continue
+        return any(
+            "/" in here and Path(here).name in folders and after == thread_name
+            for here, after in zip(fields, fields[1:])
+        )
     return False
 
 

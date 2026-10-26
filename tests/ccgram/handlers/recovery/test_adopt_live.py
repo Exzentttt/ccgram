@@ -355,3 +355,12 @@ class TestStatusLineProof:
 
         assert proves(old + "a\nb\nc\n")
         assert not proves(old + "a\nb\nc\nd\n")
+
+    def test_only_the_bottom_line_with_a_path_field_is_judged(self) -> None:
+        screen = (
+            "› draft\n  echo: m · ~/p/proj · topic-thread · x\n› Ask Codex\n"
+            "  GPT · ~/p/proj · other-thread · medium\n  ? for shortcuts\n"
+        )
+
+        assert not proves(screen, "topic-thread", Path("/u/p/proj"))
+        assert proves(screen, "other-thread", Path("/u/p/proj"))
