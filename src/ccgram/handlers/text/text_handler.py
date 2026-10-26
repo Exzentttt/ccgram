@@ -52,7 +52,9 @@ from ..messaging_pipeline.message_sender import (
     rate_limit_send_message,
     safe_reply,
 )
+from ..recovery.auto_restore import adopt_for_topic
 from ..recovery.recovery_banner import RecoveryBanner, render_banner
+from ..recovery.restore_notices import adopt_text
 from ..recovery.transcript_discovery import discover_and_register_transcript
 from ...session_protocol.telegram import (
     TelegramSessionAdapter,
@@ -340,6 +342,53 @@ async def _handle_unbound_topic(
     return True
 
 
+async def _readopt_live_session(
+    window_id: str, user_id: int, thread_id: int, message: Message
+) -> bool:
+    """Rebind the topic to its session when it runs in another tmux session."""
+    label = await adopt_for_topic(user_id, message.chat.id, thread_id, window_id)
+    if label is None:
+        return False
+    await safe_reply(message, adopt_text(label))
+    return True
+
+
+async def _unbind_for_directory_browser(
+    window_id: str,
+    user_id: int,
+    thread_id: int,
+    text: str,
+    user_data: dict | None,
+    message: Message,
+) -> None:
+    """A dead window without a valid cwd: unbind and show the directory browser."""
+    # No valid cwd — unbind and fall back to directory browser
+    logger.info(
+        "Dead window %s (no valid cwd), falling back to directory browser"
+        " (user=%d, thread=%d)",
+        window_id,
+        user_id,
+        thread_id,
+    )
+    thread_router.unbind_thread(
+        user_id,
+        thread_id,
+        retirement_reason="system_replacement",
+        cleanup_eligible=True,
+    )
+    lifecycle_strategy.clear_dead_notification(user_id, thread_id)
+    start_path = str(Path.cwd())
+    msg_text, keyboard, subdirs = build_directory_browser(start_path, user_id=user_id)
+    if user_data is not None:
+        user_data[STATE_KEY] = STATE_BROWSING_DIRECTORY
+        user_data[BROWSE_PATH_KEY] = start_path
+        user_data[BROWSE_PAGE_KEY] = 0
+        user_data[BROWSE_DIRS_KEY] = subdirs
+        user_data[PENDING_THREAD_ID] = thread_id
+        user_data[PENDING_THREAD_TEXT] = text
+    await safe_reply(message, msg_text, reply_markup=keyboard)
+
+
 async def _handle_dead_window(
     window_id: str,
     user_id: int,
@@ -376,6 +425,11 @@ async def _handle_dead_window(
             "Send that again in a moment.",
         )
         return True
+
+    if w is None and await _readopt_live_session(
+        window_id, user_id, thread_id, message
+    ):
+        return False
 
     # The dead marker is sticky: tick_window returns early once it is set, so
     # nothing clears it on its own. A window confirmed present and still
@@ -433,33 +487,9 @@ async def _handle_dead_window(
     cwd = view.cwd if view else ""
 
     if not cwd or not Path(cwd).is_dir():
-        # No valid cwd — unbind and fall back to directory browser
-        logger.info(
-            "Dead window %s (no valid cwd), falling back to directory browser"
-            " (user=%d, thread=%d)",
-            window_id,
-            user_id,
-            thread_id,
+        await _unbind_for_directory_browser(
+            window_id, user_id, thread_id, text, user_data, message
         )
-        thread_router.unbind_thread(
-            user_id,
-            thread_id,
-            retirement_reason="system_replacement",
-            cleanup_eligible=True,
-        )
-        lifecycle_strategy.clear_dead_notification(user_id, thread_id)
-        start_path = str(Path.cwd())
-        msg_text, keyboard, subdirs = build_directory_browser(
-            start_path, user_id=user_id
-        )
-        if user_data is not None:
-            user_data[STATE_KEY] = STATE_BROWSING_DIRECTORY
-            user_data[BROWSE_PATH_KEY] = start_path
-            user_data[BROWSE_PAGE_KEY] = 0
-            user_data[BROWSE_DIRS_KEY] = subdirs
-            user_data[PENDING_THREAD_ID] = thread_id
-            user_data[PENDING_THREAD_TEXT] = text
-        await safe_reply(message, msg_text, reply_markup=keyboard)
         return True
 
     # Show recovery UI
@@ -741,6 +771,12 @@ async def handle_text_message(
         adapter=protocol_adapter_for(context.bot_data),
     ):
         return
+
+    # An adopted session lives in a new window; the topic is bound to it now.
+    window_id = (
+        thread_router.get_window_for_thread(user.id, thread_id, message.chat.id)
+        or window_id
+    )
 
     # Shell provider: route through LLM or raw execution
     provider = get_provider_for_window(
