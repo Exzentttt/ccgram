@@ -77,6 +77,26 @@ class TestListing:
 
         assert panes and all(p.bot_owned for p in panes)
 
+    async def test_a_window_name_with_a_pipe_does_not_shift_the_fields(
+        self, mux
+    ) -> None:
+        mux.server.new_session(session_name="pipe", window_name="a|b", attach=False)
+
+        panes = await panes_of(mux, "pipe")
+
+        assert panes and not any(p.bot_owned for p in panes)
+
+    async def test_a_session_with_the_configured_main_window_is_bot_owned(
+        self, mux
+    ) -> None:
+        mux.server.new_session(
+            session_name="legacy", window_name="__main__", attach=False
+        )
+
+        panes = await panes_of(mux, "legacy")
+
+        assert panes and all(p.bot_owned for p in panes)
+
     async def test_a_reserve_session_is_bot_owned_without_a_mark(self, mux) -> None:
         panes = await panes_of(mux, "_ccgram-reserve-x")
 

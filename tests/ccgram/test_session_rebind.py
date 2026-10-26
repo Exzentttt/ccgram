@@ -81,3 +81,15 @@ class TestRebindWindow:
         assert set(window_store.window_states) == {"@1", "@5"}
         assert thread_router.get_window_for_thread(_USER, _THREAD) == "@1"
         assert not (tmp_path / "session_map.json").exists()
+
+    def test_a_bound_topic_without_window_state_reports_what_happened(
+        self, mgr
+    ) -> None:
+        del window_store.window_states["@1"]
+
+        result = mgr.rebind_window("@1", "@9")
+
+        assert (result, thread_router.get_window_for_thread(_USER, _THREAD)) == (
+            False,
+            "@9",
+        )

@@ -350,8 +350,10 @@ class SessionManager:
         For a session that now runs in another window of the same server (the
         caller has just linked it in). Folds through the same owner as the
         identity migration and writes the new window's session_map entry.
-        Returns False, with every store unchanged, when no topic is bound to
-        ``old_window_id`` or the fold did not apply.
+        Returns False with every store unchanged when no topic is bound to
+        ``old_window_id``. Also False when the fold ran but ``old_window_id`` had
+        no window state: the binding has then moved, and no session_map entry
+        is written.
         """
         if old_window_id not in thread_router.all_bound_window_ids():
             return False
