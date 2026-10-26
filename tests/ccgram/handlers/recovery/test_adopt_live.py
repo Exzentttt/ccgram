@@ -199,7 +199,7 @@ def codex(world, tmp_path):
         pane("ccgram", "@0", 10, True, "python", str(cwd)),
         pane("2", "@2", 100, command="codex", path=str(cwd)),
     ]
-    world.screens = {"%2": f"... · {cwd} · {_NAME} · GPT-5 · ..."}
+    world.screens = {"%2": f"... · {cwd} · {_NAME} · GPT-5 · 0.164.0 · ..."}
     world.view.capture_server_pane = AsyncMock(
         side_effect=lambda pane_id: world.screens.get(pane_id)
     )
@@ -271,7 +271,7 @@ class TestCodexIdentity:
 
     async def test_two_proven_windows_are_ambiguous(self, codex) -> None:
         codex.panes.append(pane("3", "@3", 101, command="codex", path=str(codex.cwd)))
-        codex.screens["%3"] = f"x · {codex.cwd} · {_NAME} · y"
+        codex.screens["%3"] = f"x · {codex.cwd} · {_NAME} · 0.164.0"
 
         assert await codex.adopt_codex() is None
 
@@ -351,16 +351,27 @@ class TestStatusLineProof:
         assert not proves("GPT · agentsspore · agentspore-oss · medium")
 
     def test_a_status_line_scrolled_above_the_last_four_lines_does_not(self) -> None:
-        old = "  GPT · ~/p/agentsspore · agentspore-oss · medium\n"
+        old = "  GPT · ~/p/agentsspore · agentspore-oss · 0.164.0\n"
 
         assert proves(old + "a\nb\nc\n")
         assert not proves(old + "a\nb\nc\nd\n")
 
     def test_only_the_bottom_line_with_a_path_field_is_judged(self) -> None:
         screen = (
-            "› draft\n  echo: m · ~/p/proj · topic-thread · x\n› Ask Codex\n"
-            "  GPT · ~/p/proj · other-thread · medium\n  ? for shortcuts\n"
+            "› draft\n  echo: m · ~/p/proj · topic-thread · 0.1.0\n› Ask Codex\n"
+            "  GPT · ~/p/proj · other-thread · 0.164.0\n  ? for shortcuts\n"
         )
 
         assert not proves(screen, "topic-thread", Path("/u/p/proj"))
         assert proves(screen, "other-thread", Path("/u/p/proj"))
+
+    def test_a_mimic_without_the_version_field_does_not(self) -> None:
+        screen = "  echo: m · ~/p/proj · topic-thread · x\n› Ask Codex\n"
+
+        assert not proves(screen, "topic-thread", Path("/u/p/proj"))
+
+    def test_the_version_must_be_a_whole_field(self) -> None:
+        screen = "  m · ~/p/proj · topic-thread · v0.164.0 · x\n"
+
+        assert not proves(screen, "topic-thread", Path("/u/p/proj"))
+        assert proves(screen.replace("v0", "0"), "topic-thread", Path("/u/p/proj"))

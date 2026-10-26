@@ -19,6 +19,7 @@ Public surface: :func:`adopt`, :func:`adopt_codex`.
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import structlog
@@ -30,6 +31,8 @@ from ..polling.polling_state import lifecycle_strategy
 from ..topics import topic_orchestration
 
 logger = structlog.get_logger()
+
+_CODEX_VERSION = re.compile(r"\d+\.\d+\.\d+")
 
 
 def _ancestors(pid: int, parents: dict[int, int]) -> set[int]:
@@ -142,8 +145,9 @@ def status_line_proves(screen: str, thread_name: str, cwd: Path) -> bool:
     field is judged (the hint line below the status line has none; lines above
     are transcript). Fields split on `` · ``; that path field (possibly
     ``~``-abbreviated) must end in the folder name of ``cwd`` (as given or
-    resolved) and the very next field must equal ``thread_name``. Any other
-    layout proves nothing.
+    resolved) and the very next field must equal ``thread_name``. The line must
+    also carry a field that is exactly a Codex version (``0.164.0``), which
+    transcript text mimicking the layout lacks. Any other layout proves nothing.
     """
     folders = {cwd.name, cwd.resolve().name}
     lines = [line for line in screen.splitlines() if line.strip()][-4:]
@@ -151,7 +155,7 @@ def status_line_proves(screen: str, thread_name: str, cwd: Path) -> bool:
         fields = [f.strip() for f in line.split(" · ")]
         if not any("/" in f for f in fields):
             continue
-        return any(
+        return any(_CODEX_VERSION.fullmatch(f) for f in fields) and any(
             "/" in here and Path(here).name in folders and after == thread_name
             for here, after in zip(fields, fields[1:])
         )
