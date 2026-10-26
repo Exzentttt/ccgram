@@ -20,7 +20,7 @@ from __future__ import annotations
 from collections.abc import Iterable
 from typing import Any, cast
 
-from ccgram.multiplexer.base import Multiplexer, WindowIdReserver
+from ccgram.multiplexer.base import Multiplexer, ServerView, WindowIdReserver
 from ccgram.multiplexer.registry import (
     UnknownMultiplexerError,
     get_multiplexer,
@@ -37,6 +37,7 @@ __all__ = [
     "multiplexer",
     "multiplexer_names",
     "reserve_window_ids_past",
+    "server_view",
 ]
 
 
@@ -102,3 +103,9 @@ async def reserve_window_ids_past(window_ids: Iterable[str]) -> bool:
     if isinstance(backend, WindowIdReserver):
         return await backend.reserve_window_ids_past(window_ids)
     return False
+
+
+def server_view() -> ServerView | None:
+    """The wired backend when it can see every session on its server (tmux only)."""
+    backend = get_active_multiplexer()
+    return backend if isinstance(backend, ServerView) else None

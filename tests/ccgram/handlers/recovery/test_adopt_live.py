@@ -1,0 +1,181 @@
+"""Finding the window a Claude session runs in outside the bot's session, and moving the topic."""
+
+from __future__ import annotations
+
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+from structlog.testing import capture_logs
+
+from ccgram.handlers.recovery import adopt_live
+from ccgram.handlers.topics import topic_orchestration
+from ccgram.multiplexer.base import ServerPane
+
+_AL = "ccgram.handlers.recovery.adopt_live"
+_TOPIC = (100, -1001, 42)
+
+
+def pane(session, window, pid, owned=False) -> ServerPane:
+    return ServerPane(session, window, f"%{window[1:]}", pid, owned)
+
+
+class World:
+    def __init__(self) -> None:
+        self.panes = [pane("ccgram", "@0", 10, True), pane("2", "@2", 100)]
+        self.parents = {200: 100, 300: 200, 100: 1, 10: 1}
+        self.bound: list[str] = ["@1"]
+        self.rebound = True
+        self.unlinked = True
+        self.shield_at_unlink: bool | None = None
+        self.manager = MagicMock()
+        self.lifecycle = MagicMock()
+        self.view = MagicMock()
+        self.view.list_server_panes = AsyncMock(side_effect=lambda: self.panes)
+        self.view.link_window_into_session = AsyncMock(return_value=True)
+        self.view.unlink_window_from_session = AsyncMock(side_effect=self._unlink)
+
+    async def _unlink(self, window_id: str) -> bool:
+        self.shield_at_unlink = topic_orchestration.is_pending_creation(window_id)
+        return self.unlinked
+
+    async def adopt(self, pid: int = 300):
+        return await adopt_live.adopt(self.view, pid, self.parents, "@1", _TOPIC)
+
+
+@pytest.fixture
+def world(monkeypatch):
+    w = World()
+    w.manager.rebind_window.side_effect = lambda *_a: w.rebound
+    monkeypatch.setattr(f"{_AL}.session_manager", w.manager)
+    monkeypatch.setattr(
+        f"{_AL}.session_query.iter_bound_topics",
+        lambda: [(100, -1001, 1, b) for b in w.bound],
+    )
+    monkeypatch.setattr(f"{_AL}.lifecycle_strategy", w.lifecycle)
+    yield w
+    topic_orchestration.clear_pending_creation("@2")
+
+
+class TestFinding:
+    async def test_the_pid_chain_reaches_a_foreign_pane(self, world) -> None:
+        assert await world.adopt() == "2:@2"
+
+        world.view.link_window_into_session.assert_awaited_once_with("@2")
+        world.manager.rebind_window.assert_called_once_with("@1", "@2")
+
+    async def test_a_user_session_named_like_the_bot_is_a_candidate(
+        self, world
+    ) -> None:
+        world.panes = [pane("ccgram", "@0", 10, True), pane("ccgram-foo", "@2", 100)]
+
+        assert await world.adopt() == "ccgram-foo:@2"
+
+    async def test_another_bots_marked_session_is_not_a_candidate(self, world) -> None:
+        world.panes = [pane("ccgram", "@0", 10, True), pane("zzz", "@2", 100, True)]
+
+        assert await world.adopt() is None
+
+    async def test_a_window_also_linked_into_a_bot_session_is_excluded(
+        self, world
+    ) -> None:
+        world.panes.append(pane("zzz", "@2", 100, True))
+
+        assert await world.adopt() is None
+
+    async def test_a_window_bound_to_another_topic_is_excluded(self, world) -> None:
+        world.bound.append("@2")
+
+        assert await world.adopt() is None
+
+    async def test_a_pid_outside_every_pane_has_no_window(self, world) -> None:
+        world.parents[999] = 1
+
+        assert await world.adopt(999) is None
+
+    async def test_two_windows_on_the_chain_are_ambiguous(self, world) -> None:
+        world.panes.append(pane("3", "@3", 200))
+
+        with capture_logs() as logs:
+            assert await world.adopt() is None
+
+        assert [
+            log["candidates"] for log in logs if log["event"] == "adopt_ambiguous"
+        ] == [2]
+        world.view.link_window_into_session.assert_not_called()
+
+    async def test_the_label_names_the_lowest_session_when_linked_twice(
+        self, world
+    ) -> None:
+        world.panes.append(pane("4", "@2", 100))
+
+        assert await world.adopt() == "2:@2"
+
+    async def test_a_parent_loop_ends(self, world) -> None:
+        world.parents.update({500: 600, 600: 500})
+
+        assert await world.adopt(500) is None
+
+    async def test_an_unreadable_listing_adopts_nothing(self, world) -> None:
+        world.view.list_server_panes = AsyncMock(return_value=None)
+
+        assert await world.adopt() is None
+
+
+class TestRebinding:
+    async def test_the_poller_is_shielded_while_the_window_is_linked(
+        self, world
+    ) -> None:
+        seen: list[bool] = []
+
+        async def link(window_id: str) -> bool:
+            seen.append(topic_orchestration.is_pending_creation(window_id))
+            return True
+
+        world.view.link_window_into_session = link
+
+        await world.adopt()
+
+        assert seen == [True]
+        assert not topic_orchestration.is_pending_creation("@2")
+
+    async def test_a_failed_link_adopts_nothing_and_drops_the_shield(
+        self, world
+    ) -> None:
+        world.view.link_window_into_session = AsyncMock(return_value=False)
+
+        assert await world.adopt() is None
+
+        world.manager.rebind_window.assert_not_called()
+        assert not topic_orchestration.is_pending_creation("@2")
+
+    async def test_a_failed_rebind_unlinks_the_window_under_the_shield(
+        self, world
+    ) -> None:
+        world.rebound = False
+
+        with capture_logs() as logs:
+            assert await world.adopt() is None
+
+        world.view.unlink_window_from_session.assert_awaited_once_with("@2")
+        assert world.shield_at_unlink is True
+        assert not topic_orchestration.is_pending_creation("@2")
+        assert [
+            log["window_id"] for log in logs if log["event"] == "adopt_rebind_failed"
+        ] == ["@2"]
+
+    async def test_the_shield_stays_while_the_window_cannot_be_unlinked(
+        self, world
+    ) -> None:
+        world.rebound = False
+        world.unlinked = False
+
+        with capture_logs() as logs:
+            assert await world.adopt() is None
+
+        assert topic_orchestration.is_pending_creation("@2")
+        assert "adopt_unlink_failed" in [log["event"] for log in logs]
+
+    async def test_success_clears_the_dead_marker(self, world) -> None:
+        await world.adopt()
+
+        world.lifecycle.clear_dead_notification.assert_called_once_with(100, 42)

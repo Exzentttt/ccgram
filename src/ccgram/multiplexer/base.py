@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncGenerator, Iterable, Sequence
 from dataclasses import dataclass
-from typing import Protocol, runtime_checkable
+from typing import NamedTuple, Protocol, runtime_checkable
 
 
 # ── Value types ────────────────────────────────────────────────────────
@@ -621,4 +621,36 @@ class WindowIdReserver(Protocol):
 
     async def reserve_window_ids_past(self, window_ids: Iterable[str]) -> bool:
         """Advance the counter past ``window_ids``; False if that is unconfirmed."""
+        ...
+
+
+class ServerPane(NamedTuple):
+    """One pane of one session on the multiplexer server.
+
+    A window linked into two sessions is listed once per session.
+    ``bot_owned``: the session is a ccgram bot session (marked by the bot, or a
+    window-id reserve session), so its windows are never another session's to adopt.
+    """
+
+    session_name: str
+    window_id: str
+    pane_id: str
+    pane_pid: int
+    bot_owned: bool
+
+
+@runtime_checkable
+class ServerView(Protocol):
+    """Optional capability: see and link windows of every session on the server."""
+
+    async def list_server_panes(self) -> list[ServerPane] | None:
+        """Every pane of every session; None when the server cannot say."""
+        ...
+
+    async def link_window_into_session(self, window_id: str) -> bool:
+        """Link a window of another session into the bot's, keeping it in both."""
+        ...
+
+    async def unlink_window_from_session(self, window_id: str) -> bool:
+        """Remove the window from the bot's session only; never destroys it."""
         ...

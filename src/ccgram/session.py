@@ -34,7 +34,7 @@ from .session_map import (
 )
 from .state_persistence import StatePersistence
 from .multiplexer import multiplexer as tmux_manager
-from .multiplexer.base import canonical_window_id
+from .multiplexer.base import WindowRef, canonical_window_id
 from .multiplexer.reconciliation import list_windows_for_reconciliation
 from .thread_router import ThreadRouter, install_thread_router, thread_router
 from .user_preferences import (
@@ -343,6 +343,29 @@ class SessionManager:
         if migrations or applied:
             thread_router._rebuild_reverse_index()
             self._save_state()
+
+    def rebind_window(self, old_window_id: str, new_window_id: str) -> bool:
+        """Move the topic bindings and state of ``old_window_id`` to a live window.
+
+        For a session that now runs in another window of the same server (the
+        caller has just linked it in). Folds through the same owner as the
+        identity migration and writes the new window's session_map entry.
+        Returns False, with every store unchanged, when the fold did not apply.
+        """
+        self.reconcile_window_aliases(
+            [WindowRef(new_window_id, "", "", alias_window_ids=(old_window_id,))]
+        )
+        state = self.window_states.get(new_window_id)
+        if state is None or new_window_id not in thread_router.all_bound_window_ids():
+            return False
+        session_map_sync.write_hookless_session_map(
+            window_id=new_window_id,
+            session_id=state.session_id,
+            cwd=state.cwd,
+            transcript_path=state.transcript_path,
+            provider_name=state.provider_name,
+        )
+        return True
 
     async def resolve_stale_ids(self) -> None:
         """Re-resolve persisted window IDs against live tmux windows.

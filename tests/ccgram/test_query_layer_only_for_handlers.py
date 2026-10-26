@@ -60,6 +60,8 @@ ALLOWED_SESSION_MANAGER_ATTRS: frozenset[str] = frozenset(
         "prune_stale_window_states",
         "audit_state",
         "flush_state",
+        # recovery.adopt_live: moves a topic to the window its session runs in.
+        "rebind_window",
     }
 )
 

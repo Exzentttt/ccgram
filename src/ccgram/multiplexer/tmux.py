@@ -49,6 +49,7 @@ from .base import (
     WindowRef,
     WorkspaceRef,
 )
+from .tmux_server_view import TmuxServerViewMixin
 from .vim_state import (
     _vim_locks,
     _vim_state,
@@ -110,7 +111,7 @@ _TMUX_CAPABILITIES = MultiplexerCapabilities(
 )
 
 
-class TmuxManager:
+class TmuxManager(TmuxServerViewMixin):
     """Manages tmux windows for Claude Code sessions.
 
     Satisfies the ``Multiplexer`` Protocol: returns the neutral value types
@@ -1092,6 +1093,7 @@ class TmuxManager:
     async def ensure_session(self) -> None:
         """Ensure the tmux session exists (``get_or_create_session``)."""
         await asyncio.to_thread(self.get_or_create_session)
+        await self.mark_bot_session()
 
     async def capture_scrollback(
         self, window_id: str, lines: int = 200

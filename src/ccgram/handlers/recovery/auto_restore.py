@@ -9,7 +9,9 @@ ids restart with the server, so a stale id may already name a live window, and
 such a binding is never resumed into. At every start, flag on or off, if a
 binding is dead the window-id counter advances past every bound id, so no new
 window takes another topic's old id. A session running outside the bot's tmux
-session (Claude pid registry, Codex rollout open per ``lsof``) is never resumed.
+session (Claude pid registry, Codex rollout open per ``lsof``) is never resumed;
+a live Claude session whose window :mod:`adopt_live` can name is reconnected to
+its topic instead.
 The plan is saved to a ledger keyed by the server boot id: one attempt per
 (chat, topic, session) per boot, and the next start finishes a plan a crash
 cut short.
@@ -25,6 +27,7 @@ import glob
 import json
 import os
 import subprocess
+import time
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -38,6 +41,7 @@ from ...multiplexer import (
     can_reserve_window_ids,
     multiplexer,
     reserve_window_ids_past,
+    server_view,
 )
 from ...multiplexer.base import WindowRef
 from ...multiplexer.reconciliation import list_windows_for_reconciliation
@@ -45,9 +49,10 @@ from ...providers.codex import codex_sessions_dir
 from ...thread_router import thread_router
 from ...utils import atomic_write_json, task_done_callback
 from ..topics import topic_orchestration
+from . import adopt_live
 from .recovery_banner import create_and_bind_window
 from .recovery_ui import HeadlessUi, ReplacementRequest
-from .restore_notices import CREATION_FAILED, send_notice, skip_text
+from .restore_notices import CREATION_FAILED, adopt_text, send_notice, skip_text
 
 if TYPE_CHECKING:
     from telegram import Bot
@@ -66,6 +71,9 @@ _PENDING, _ATTEMPTING, _DONE, _FAILED = "pending", "attempting", "done", "failed
 _STATUSES = frozenset({_PENDING, _ATTEMPTING, _DONE, _FAILED})
 _ATTEMPTED = frozenset({_ATTEMPTING, _DONE, _FAILED})
 _WHERE = ("chat_id", "thread_id", "window_id")
+_ADOPTABLE = frozenset({"session_live", "cwd_missing"})
+_ADOPT_MISS_TTL_S = 30.0
+_adopt_misses: dict[str, float] = {}  # session id -> monotonic time to retry at
 
 
 @dataclass(frozen=True)
@@ -240,8 +248,8 @@ def _ps_start(pid: int) -> str | None:
     return (done.stdout.strip() or None) if done.returncode == 0 else None
 
 
-def _claude_registry_live(session_id: str) -> bool | None:
-    """True/False from the pid registry; None when an entry cannot be settled."""
+def _claude_registry_scan(session_id: str) -> tuple[int | None, bool]:
+    """The confirmed live pid of the session, and whether an entry stayed unsettled."""
     unknown = False
     registry = config.claude_config_dir / "sessions"
     for path in registry.glob("*.json"):  # never the *.key files beside them
@@ -258,8 +266,28 @@ def _claude_registry_live(session_id: str) -> bool | None:
         if actual is None:
             unknown = True
         elif actual == started:
-            return True
-    return None if unknown else False
+            return pid, unknown
+    return None, unknown
+
+
+def _claude_registry_live(session_id: str) -> bool | None:
+    """True/False from the pid registry; None when an entry cannot be settled."""
+    pid, unknown = _claude_registry_scan(session_id)
+    return True if pid is not None else None if unknown else False
+
+
+def _parent_pids() -> dict[int, int]:
+    """pid -> parent pid of every process; empty when ps cannot say."""
+    try:
+        done = _run_ps(["ps", "-A", "-o", "pid=,ppid="], {**os.environ, "LC_ALL": "C"})
+    except OSError, subprocess.TimeoutExpired:
+        return {}
+    table: dict[int, int] = {}
+    for line in done.stdout.splitlines():
+        pid, _, ppid = line.strip().partition(" ")
+        if pid.isdigit() and ppid.strip().isdigit():
+            table[int(pid)] = int(ppid)
+    return table
 
 
 async def _rollout_open(path: Path) -> bool | None:
@@ -292,6 +320,60 @@ async def _outside_liveness(entry: RestoreEntry) -> str | None:
     if live is None:
         return "liveness_unconfirmed"
     return "session_live" if live else None
+
+
+async def adopt_live_session(
+    provider_name: str,
+    session_id: str,
+    topic: tuple[int, int, int],
+    old_window_id: str,
+) -> str | None:
+    """Reconnect ``topic`` (user, chat, thread) to the window its live Claude session runs in.
+
+    Returns the ``session:window`` label, or None when nothing was adopted.
+    Codex is not adopted. A miss is remembered for 30 s, so a message to a topic
+    with no live session elsewhere costs one lookup, not one per message.
+    Never raises: a failure leaves the binding as it was.
+    """
+    if provider_name != "claude" or (view := server_view()) is None:
+        return None
+    if time.monotonic() < _adopt_misses.get(session_id, 0.0):
+        return None
+    label = None
+    try:
+        pid, _ = await asyncio.to_thread(_claude_registry_scan, session_id)
+        if pid is not None:
+            parents = await asyncio.to_thread(_parent_pids)
+            label = await adopt_live.adopt(view, pid, parents, old_window_id, topic)
+    except Exception:
+        logger.exception("adopt_live_failed", session_id=session_id)
+    if label is None:
+        _adopt_misses[session_id] = time.monotonic() + _ADOPT_MISS_TTL_S
+    return label
+
+
+async def adopt_for_topic(
+    user_id: int, chat_id: int, thread_id: int, old_window_id: str
+) -> str | None:
+    """:func:`adopt_live_session` for a topic bound to a window that is gone."""
+    view = window_query.view_window(old_window_id)
+    if view is None or not view.session_id:
+        return None
+    topic = (user_id, chat_id, thread_id)
+    return await adopt_live_session(
+        view.provider_name, view.session_id, topic, old_window_id
+    )
+
+
+async def _adopted_notice(entry: RestoreEntry, reason: str | None) -> _Notice | None:
+    """The notice of a topic reconnected to its live session instead of skipped."""
+    if reason not in _ADOPTABLE:
+        return None
+    topic = (entry.user_id, entry.chat_id, entry.thread_id)
+    label = await adopt_live_session(
+        entry.provider_name, entry.session_id, topic, entry.old_window_id
+    )
+    return None if label is None else _Notice(topic[1:], adopt_text(label))
 
 
 def _first_cwd(transcript: Path) -> str:
@@ -352,8 +434,9 @@ async def _unrestorable(
 
 async def _entry_for_binding(
     binding: tuple[int, int | None, int, str], world: _World, ledger: _Ledger
-) -> RestoreEntry | str:
-    """Build the restore entry for a binding, or the reason it is skipped."""
+) -> RestoreEntry | str | _Notice:
+    """Build the restore entry for a binding, the reason it is skipped, or the
+    notice of a topic reconnected to its live session."""
     user_id, chat_id, thread_id, old_wid = binding
     if chat_id is None:
         return "chat_unknown"
@@ -378,7 +461,11 @@ async def _entry_for_binding(
         approval_mode="yolo" if view.approval_mode == "yolo" else "normal",
         display=display,
     )
-    return await _unrestorable(entry, world, ledger) or entry
+    reason = await _unrestorable(entry, world, ledger)
+    if notice := await _adopted_notice(entry, reason):
+        _skip("adopted", entry.where)
+        return notice
+    return reason or entry
 
 
 async def _live_world() -> _World | None:
@@ -400,7 +487,9 @@ async def _build_plan(
     planned: dict[str, RestoreEntry] = {}  # by session id: a session runs once
     for binding in list(thread_router.iter_thread_bindings_with_chat()):
         found = await _entry_for_binding(binding, world, ledger)
-        if isinstance(found, str):
+        if isinstance(found, _Notice):
+            notices.setdefault(found.topic, found)
+        elif isinstance(found, str):
             where = (binding[1], binding[2], binding[3])
             _skip(found, where)
             if notice := _notice_for(found, where):

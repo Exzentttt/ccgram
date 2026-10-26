@@ -489,6 +489,14 @@ CCGram tells each topic what it did, as a new message in that topic. A restored 
 
 Known limitation: a message you send to a dead topic, or `/restore` you run, while the run is working through the plan can still race with it; the re-check narrows that window but cannot close it.
 
+### Reconnecting a topic to a session running in another tmux session
+
+A reboot can leave your agents running in tmux sessions of their own on CCGram's tmux server (for example terminals an editor revived as sessions `2`, `3`), while the topic is still bound to its dead window. For a **Claude** session CCGram finds that window instead of resuming a second copy: the live pid from Claude Code's `sessions/<pid>.json` registry (the same check as above) is followed up its parent processes to a pane of `tmux list-panes -a`. Exactly one such window is linked into CCGram's session (`link-window -d`, so it stays in your session too), the topic is rebound to it, and the topic gets one message, "Reconnected to the running session in tmux window `2:@2`". The window is never killed, restarted or typed into by the adoption itself, and a window that cannot be told apart (two candidates) is left alone.
+
+This runs in two places: at auto-restore for topics whose session is live elsewhere (including `cwd_missing` when the session is in fact live), instead of the "already running elsewhere" notice, and when you write to a topic whose window is gone, which works with `CCGRAM_AUTO_RESTORE_ON_START` off. A message is delivered to the adopted window. A lookup that finds nothing is not repeated for the same session for 30 seconds.
+
+A window is never taken from a session marked as a CCGram bot session (at startup the bot sets the tmux session option `@ccgram_bot` on its own session; this also protects another CCGram bot on the same tmux server), from a `_ccgram-reserve-*` session, or while it is bound to any topic. A session you merely named like the bot (`ccgram-foo`) is a normal candidate. If the link succeeded but the rebind did not apply, the window is unlinked from CCGram's session again (log `adopt_rebind_failed`). Codex sessions are not reconnected yet.
+
 ## Session Closure and Topic Deletion
 
 CCGram distinguishes an idle agent from a closed terminal session:

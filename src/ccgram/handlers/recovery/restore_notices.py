@@ -25,6 +25,12 @@ _SKIP_TEXTS = {
     "provider_unsupported": "⚠ Not restored: unsupported provider. Use /restore.",
     "id_reservation_unavailable": "⚠ Not restored: window ids not reserved. Use /restore.",
 }
+_ADOPTED = "🔗 Reconnected to the running session in tmux window {label}"
+
+
+def adopt_text(label: str) -> str:
+    """The notice for a topic reconnected to its live session at ``session:window``."""
+    return _ADOPTED.format(label=label)
 
 
 def skip_text(reason: str, cwd: str = "") -> str | None:

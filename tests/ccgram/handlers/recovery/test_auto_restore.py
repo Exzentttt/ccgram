@@ -29,7 +29,7 @@ from telegram.error import BadRequest, NetworkError, RetryAfter
 from ccgram.config import config
 from ccgram.handlers.recovery import auto_restore
 from ccgram.handlers.recovery.recovery_ui import HeadlessUi
-from ccgram.handlers.recovery.restore_notices import skip_text
+from ccgram.handlers.recovery.restore_notices import adopt_text, skip_text
 from ccgram.handlers.topics import topic_orchestration
 from ccgram.multiplexer.base import WindowRef
 from ccgram.session_protocol.backend import CreationOptions, MultiplexerSessionBackend
@@ -78,6 +78,7 @@ class Env:
         self.lsof_script: list[tuple[int, bytes]] = []
         self.lsof_procs: list[MagicMock] = []
         self.can_reserve = MagicMock(return_value=True)
+        self.server_view = MagicMock(return_value=None)
         self.lsof_hangs = False
         self.lsof_calls: list[tuple[Any, ...]] = []
         self.lsof_exec = AsyncMock(side_effect=self.fake_lsof)
@@ -238,6 +239,7 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "claude_config_dir", tmp_path / "claude")
     monkeypatch.setattr(config, "auto_restore_on_start", True)
     monkeypatch.setattr(config, "autodelete_dead_topics", False)
+    monkeypatch.setattr(auto_restore, "_adopt_misses", {})
     world = Env(tmp_path)
 
     async def listing(_backend=None):
@@ -269,6 +271,7 @@ def env(tmp_path, monkeypatch):
         patch(f"{_AR}._spawn_lsof", world.lsof_exec),
         patch(f"{_AR}._run_ps", world.ps_run),
         patch(f"{_AR}.can_reserve_window_ids", world.can_reserve),
+        patch(f"{_AR}.server_view", world.server_view),
         patch(f"{_RC}.session_manager"),
         patch(f"{_RC}.PTBTelegramClient", MagicMock(return_value=client)),
         patch(f"{_RC}._stale_recovery_offer", world.stale),
@@ -1853,3 +1856,201 @@ class TestNotices:
             log["key"] for log in logs if log["event"] == "auto_restore_notice_unsent"
         ]
         assert unsent == [f"{_CHAT}:4"]
+
+
+class TestAdoptLive:
+    """A Claude session running in another tmux session is reconnected, not skipped."""
+
+    @pytest.fixture()
+    def adopt(self):
+        with patch(f"{_AR}.adopt_live_session", AsyncMock(return_value="2:@2")) as m:
+            yield m
+
+    async def test_a_live_session_elsewhere_is_adopted_instead_of_skipped(
+        self, env, adopt
+    ) -> None:
+        env.dead_topic(1, "@1", session="sess-1")
+        env.claude_registry("sess-1", os.getpid())
+
+        with capture_logs() as logs:
+            await env.start()
+
+        env.adapter.create.assert_not_called()
+        assert env.notices() == [(1, adopt_text("2:@2"))]
+        assert _skips(logs) == ["adopted"]
+        assert env.ledger["entries"] == []
+        adopt.assert_awaited_once_with("claude", "sess-1", (_USER, _CHAT, 1), "@1")
+
+    async def test_a_live_session_with_a_missing_folder_is_adopted_too(
+        self, env, adopt
+    ) -> None:
+        env.dead_topic(1, "@1", session="s1", cwd=str(env.tmp / "gone"))
+
+        await env.start()
+
+        assert env.notices() == [(1, adopt_text("2:@2"))]
+
+    async def test_a_failed_adoption_keeps_todays_skip(self, env, adopt) -> None:
+        adopt.return_value = None
+        env.dead_topic(1, "@1", session="sess-1")
+        env.claude_registry("sess-1", os.getpid())
+
+        with capture_logs() as logs:
+            await env.start()
+
+        assert _skips(logs) == ["session_live"]
+        assert env.notices() == [(1, skip_text("session_live"))]
+
+    async def test_a_session_not_live_is_never_offered_to_adoption(
+        self, env, adopt
+    ) -> None:
+        env.dead_topic(1, "@1", session="sess-1")
+
+        await env.start()
+
+        adopt.assert_not_called()
+        env.adapter.create.assert_awaited_once()
+
+    async def test_the_adoption_notice_is_sent_once_per_boot(self, env, adopt) -> None:
+        env.dead_topic(1, "@1", session="sess-1")
+        env.claude_registry("sess-1", os.getpid())
+
+        await env.start()
+        await env.start()
+
+        assert env.notices() == [(1, adopt_text("2:@2"))]
+
+    async def test_a_dead_session_with_a_missing_folder_keeps_its_skip(
+        self, env
+    ) -> None:
+        env.dead_topic(1, "@1", session="s1", cwd=str(env.tmp / "gone"))
+        env.server_view.return_value = MagicMock()
+
+        with (
+            patch(f"{_AR}.adopt_live.adopt", AsyncMock()) as adopt_it,
+            capture_logs() as logs,
+        ):
+            await env.start()
+
+        adopt_it.assert_not_called()
+        assert _skips(logs) == ["cwd_missing"]
+
+    async def test_auto_restore_off_does_not_stop_the_message_path(
+        self, env, monkeypatch
+    ) -> None:
+        monkeypatch.setattr(config, "auto_restore_on_start", False)
+        env.dead_topic(1, "@1", session="sess-1")
+        env.claude_registry("sess-1", os.getpid())
+        env.server_view.return_value = MagicMock()
+        target = "ccgram.handlers.recovery.adopt_live.adopt"
+
+        with patch(target, AsyncMock(return_value="2:@2")) as adopt_it:
+            label = await auto_restore.adopt_for_topic(_USER, _CHAT, 1, "@1")
+
+        assert label == "2:@2"
+        assert adopt_it.call_args.args[3:] == ("@1", (_USER, _CHAT, 1))
+
+
+class TestAdoptLiveSession:
+    """The orchestration around the finder: capability first, pid, cache, no raising."""
+
+    @pytest.fixture()
+    def live(self, env):
+        env.claude_registry("sess-1", os.getpid())
+        env.server_view.return_value = view = MagicMock()
+        with (
+            patch(f"{_AR}._parent_pids", return_value={9: 1}),
+            patch(
+                f"{_AR}.adopt_live.adopt", AsyncMock(return_value="2:@2")
+            ) as adopt_it,
+        ):
+            yield SimpleNamespace(view=view, adopt=adopt_it)
+
+    async def call(self, provider="claude"):
+        return await auto_restore.adopt_live_session(
+            provider, "sess-1", (_USER, _CHAT, 1), "@1"
+        )
+
+    async def test_claude_gets_its_registry_pid_and_is_adopted(self, env, live) -> None:
+        assert await self.call() == "2:@2"
+
+        live.adopt.assert_awaited_once_with(
+            live.view, os.getpid(), {9: 1}, "@1", (_USER, _CHAT, 1)
+        )
+
+    async def test_codex_is_not_adopted(self, env, live) -> None:
+        assert await self.call("codex") is None
+
+        env.server_view.assert_not_called()
+        live.adopt.assert_not_called()
+
+    async def test_without_the_backend_capability_nothing_is_scanned(
+        self, env, live
+    ) -> None:
+        env.server_view.return_value = None
+
+        with patch(f"{_AR}._claude_registry_scan") as scan:
+            assert await self.call() is None
+
+        scan.assert_not_called()
+
+    async def test_a_session_that_is_not_live_is_not_adopted(self, env, live) -> None:
+        env.ps_start = "T-other"
+
+        assert await self.call() is None
+
+        live.adopt.assert_not_called()
+
+    async def test_a_failure_is_logged_and_returns_none(self, env, live) -> None:
+        live.adopt.side_effect = RuntimeError("boom")
+
+        with capture_logs() as logs:
+            assert await self.call() is None
+
+        assert "adopt_live_failed" in [log["event"] for log in logs]
+
+    async def test_a_miss_is_remembered_for_thirty_seconds(self, env, live) -> None:
+        live.adopt.return_value = None
+        clock = MagicMock(return_value=1000.0)
+
+        with (
+            patch(f"{_AR}.time.monotonic", clock),
+            patch(
+                f"{_AR}._claude_registry_scan", return_value=(os.getpid(), False)
+            ) as scan,
+        ):
+            await self.call()
+            clock.return_value = 1029.0
+            await self.call()
+            assert scan.call_count == 1
+            clock.return_value = 1031.0
+            await self.call()
+            assert scan.call_count == 2
+
+    async def test_a_hit_is_not_remembered(self, env, live) -> None:
+        await self.call()
+        await self.call()
+
+        assert live.adopt.await_count == 2
+
+
+class TestAdoptForTopic:
+    async def test_a_topic_without_a_known_session_is_not_adopted(self, env) -> None:
+        env.dead_topic(1, "@1", session="")
+
+        with patch(f"{_AR}.adopt_live_session", AsyncMock()) as adopt_it:
+            assert await auto_restore.adopt_for_topic(_USER, _CHAT, 1, "@1") is None
+
+        adopt_it.assert_not_called()
+
+
+class TestParentPids:
+    def test_ps_output_becomes_a_pid_to_parent_table(self) -> None:
+        done = SimpleNamespace(stdout="  1     0\n 20     1\njunk\n300    20\n")
+
+        with patch(f"{_AR}._run_ps", return_value=done):
+            assert auto_restore._parent_pids() == {1: 0, 20: 1, 300: 20}
+
+    def test_an_unrunnable_ps_gives_an_empty_table(self) -> None:
+        with patch(f"{_AR}._run_ps", side_effect=subprocess.TimeoutExpired("ps", 5)):
+            assert auto_restore._parent_pids() == {}
