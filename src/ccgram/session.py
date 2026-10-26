@@ -351,11 +351,12 @@ class SessionManager:
         caller has just linked it in). Folds through the same owner as the
         identity migration and writes the new window's session_map entry.
         Returns False with every store unchanged when no topic is bound to
-        ``old_window_id``. Also False when the fold ran but ``old_window_id`` had
-        no window state: the binding has then moved, and no session_map entry
-        is written.
+        ``old_window_id``, when it has no window state, or when the fold fails.
         """
-        if old_window_id not in thread_router.all_bound_window_ids():
+        if (
+            old_window_id not in thread_router.all_bound_window_ids()
+            or old_window_id not in self.window_states
+        ):
             return False
         self.reconcile_window_aliases(
             [WindowRef(new_window_id, "", "", alias_window_ids=(old_window_id,))]
