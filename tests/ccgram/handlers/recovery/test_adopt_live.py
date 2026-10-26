@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -270,7 +271,7 @@ class TestCodexIdentity:
 
     async def test_two_proven_windows_are_ambiguous(self, codex) -> None:
         codex.panes.append(pane("3", "@3", 101, command="codex", path=str(codex.cwd)))
-        codex.screens["%3"] = f"x · {_NAME} · y"
+        codex.screens["%3"] = f"x · {codex.cwd} · {_NAME} · y"
 
         assert await codex.adopt_codex() is None
 
@@ -300,3 +301,57 @@ class TestCodexIdentity:
         assert await codex.adopt_codex() is None
 
         codex.view.unlink_window_from_session.assert_awaited_once_with("@2")
+
+
+_REAL = (
+    "› Ask Codex to do anything\n\n"
+    "  GPT-6.1-Sol medium · ~/projects/startups/projects/Platform/agentsspore · "
+    "agentspore-oss · GPT-6.1-Sol · medium · Full Access · weekly 75% left · "
+    "0.164.0 · Main [default]  Pursuing goal (4h 12m)\n"
+    "  ← for agents · ? for shortcuts        ⚠ 2 warnings · f2 to view\n\n"
+)
+_CWD = Path("/Users/x/projects/startups/projects/Platform/agentsspore")
+
+
+def proves(screen: str, name: str = _NAME, cwd: Path = _CWD) -> bool:
+    return adopt_live.status_line_proves(screen, name, cwd)
+
+
+class TestStatusLineProof:
+    def test_the_real_status_line_proves_its_thread(self) -> None:
+        assert proves(_REAL)
+
+    def test_a_prefix_of_the_shown_thread_name_does_not(self) -> None:
+        assert not proves(_REAL, "agentspore")
+
+    def test_a_name_equal_to_the_folder_whose_next_field_differs_does_not(
+        self,
+    ) -> None:
+        assert not proves(_REAL, "agentsspore")
+
+    def test_a_name_only_in_body_text_above_the_last_lines_does_not(self) -> None:
+        body = "we renamed it to agentspore-oss\n" * 5
+        shown = _REAL.replace("agentspore-oss", "other")
+
+        assert not proves(body + shown)
+
+    def test_a_fixed_field_not_right_after_the_path_does_not(self) -> None:
+        assert not proves(_REAL, "medium")
+
+    def test_a_status_line_without_a_path_field_does_not(self) -> None:
+        assert not proves("GPT · agentspore-oss · medium")
+
+    def test_a_path_field_of_another_folder_does_not(self) -> None:
+        assert not proves(_REAL, cwd=Path("/Users/x/other"))
+
+    def test_an_empty_screen_does_not(self) -> None:
+        assert not proves("")
+
+    def test_a_folder_name_without_a_path_marker_is_not_a_path_field(self) -> None:
+        assert not proves("GPT · agentsspore · agentspore-oss · medium")
+
+    def test_a_status_line_scrolled_above_the_last_four_lines_does_not(self) -> None:
+        old = "  GPT · ~/p/agentsspore · agentspore-oss · medium\n"
+
+        assert proves(old + "a\nb\nc\n")
+        assert not proves(old + "a\nb\nc\nd\n")

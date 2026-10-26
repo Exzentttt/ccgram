@@ -11,7 +11,7 @@ killed, respawned or sent keys; a failed rebind unlinks the window again.
 
 A Codex session has no pid to follow (its rollout is held by a shared daemon), so
 :func:`adopt_codex` proves identity from the screen: a pane running ``codex`` in
-the topic's folder whose capture shows the session's thread name; exactly one
+the topic's folder whose status line names the session's thread; exactly one
 window must prove it.
 
 Public surface: :func:`adopt`, :func:`adopt_codex`.
@@ -135,14 +135,32 @@ def _codex_candidates(panes: list[ServerPane], cwd: Path) -> list[ServerPane]:
     return list(seen.values())
 
 
+def status_line_proves(screen: str, thread_name: str, cwd: Path) -> bool:
+    """Whether the Codex status line at the foot of ``screen`` names this thread.
+
+    Only the last four non-blank lines count (a hint line follows the status
+    line). Fields split on `` · ``; the folder field (a path, possibly
+    ``~``-abbreviated) must end in the folder name of ``cwd`` (as given or
+    resolved) and the very next field must equal ``thread_name``. Any other layout proves nothing.
+    """
+    folders = {cwd.name, cwd.resolve().name}
+    lines = [line for line in screen.splitlines() if line.strip()][-4:]
+    for line in lines:
+        fields = [f.strip() for f in line.split(" · ")]
+        for here, after in zip(fields, fields[1:]):
+            if "/" in here and Path(here).name in folders and after == thread_name:
+                return True
+    return False
+
+
 async def _windows_showing(
-    view: ServerView, candidates: list[ServerPane], thread_name: str
+    view: ServerView, candidates: list[ServerPane], thread_name: str, cwd: Path
 ) -> set[str]:
-    """Windows with a candidate pane whose screen shows ``thread_name``."""
+    """Windows with a candidate pane whose status line proves ``thread_name``."""
     shown: set[str] = set()
     for p in candidates:
         screen = await view.capture_server_pane(p.pane_id)
-        if screen is not None and thread_name in screen:
+        if screen is not None and status_line_proves(screen, thread_name, cwd):
             shown.add(p.window_id)
     return shown
 
@@ -164,5 +182,5 @@ async def adopt_codex(
         logger.warning("adopt_listing_unavailable")
         return None
     candidates = _codex_candidates(panes, cwd)
-    found = await _windows_showing(view, candidates, thread_name)
+    found = await _windows_showing(view, candidates, thread_name, cwd)
     return await _adopt_single(view, panes, found, old_window_id, topic)
