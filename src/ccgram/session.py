@@ -350,8 +350,11 @@ class SessionManager:
         For a session that now runs in another window of the same server (the
         caller has just linked it in). Folds through the same owner as the
         identity migration and writes the new window's session_map entry.
-        Returns False, with every store unchanged, when the fold did not apply.
+        Returns False, with every store unchanged, when no topic is bound to
+        ``old_window_id`` or the fold did not apply.
         """
+        if old_window_id not in thread_router.all_bound_window_ids():
+            return False
         self.reconcile_window_aliases(
             [WindowRef(new_window_id, "", "", alias_window_ids=(old_window_id,))]
         )

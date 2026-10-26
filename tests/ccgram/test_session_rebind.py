@@ -71,7 +71,13 @@ class TestRebindWindow:
     def test_an_unknown_old_window_reports_false(self, mgr) -> None:
         assert mgr.rebind_window("@5", "@9") is False
 
-    def test_a_window_state_without_a_topic_is_not_a_rebind(self, mgr) -> None:
+    def test_a_window_state_without_a_topic_changes_nothing(
+        self, mgr, tmp_path
+    ) -> None:
         window_store.window_states["@5"] = WindowState(session_id="sid-5", cwd="/x")
 
         assert mgr.rebind_window("@5", "@9") is False
+
+        assert set(window_store.window_states) == {"@1", "@5"}
+        assert thread_router.get_window_for_thread(_USER, _THREAD) == "@1"
+        assert not (tmp_path / "session_map.json").exists()

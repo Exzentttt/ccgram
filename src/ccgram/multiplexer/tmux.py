@@ -49,7 +49,7 @@ from .base import (
     WindowRef,
     WorkspaceRef,
 )
-from .tmux_server_view import TmuxServerViewMixin
+from .tmux_server_view import RESERVE_SESSION_PREFIX, TmuxServerViewMixin
 from .vim_state import (
     _vim_locks,
     _vim_state,
@@ -74,7 +74,6 @@ __all__ = [
 
 logger = structlog.get_logger()
 
-_RESERVE_SESSION_PREFIX = "_ccgram-reserve-"
 _WINDOW_ID = re.compile(r"@(\d+)")
 _RESERVE_MAX_WINDOWS = 10_000
 
@@ -1093,7 +1092,8 @@ class TmuxManager(TmuxServerViewMixin):
     async def ensure_session(self) -> None:
         """Ensure the tmux session exists (``get_or_create_session``)."""
         await asyncio.to_thread(self.get_or_create_session)
-        await self.mark_bot_session()
+        if not await self.mark_bot_session():
+            logger.warning("bot_session_mark_failed", session=self.session_name)
 
     async def capture_scrollback(
         self, window_id: str, lines: int = 200
@@ -1142,7 +1142,7 @@ class TmuxManager(TmuxServerViewMixin):
             return False
 
     def _reserve_window_ids(self, highest: int) -> bool:
-        session = f"{_RESERVE_SESSION_PREFIX}{self.session_name}"
+        session = f"{RESERVE_SESSION_PREFIX}{self.session_name}"
         target = f"={session}"
         self.server.cmd("kill-session", "-t", target)  # a leftover of a crash
         last = self._created_window_number("new-session", "-d", "-s", session)

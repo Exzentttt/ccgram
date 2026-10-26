@@ -19,10 +19,9 @@ logger = structlog.get_logger()
 
 _CMD_TIMEOUT_S = 10.0
 _BOT_OPTION = "@ccgram_bot"
-_RESERVE_SESSION_PREFIX = "_ccgram-reserve-"
-_PANE_FORMAT = (
-    f"#{{window_id}}|#{{pane_id}}|#{{pane_pid}}|#{{{_BOT_OPTION}}}|#{{session_name}}"
-)
+RESERVE_SESSION_PREFIX = "_ccgram-reserve-"
+_OWN_WINDOW = "_ccgram"
+_PANE_FORMAT = f"#{{window_id}}|#{{pane_id}}|#{{pane_pid}}|#{{{_BOT_OPTION}}}|#{{window_name}}|#{{session_name}}"
 
 
 class TmuxServerViewMixin:
@@ -69,17 +68,33 @@ class TmuxServerViewMixin:
         return out.decode("utf-8", errors="replace").splitlines()
 
     async def list_server_panes(self) -> list[ServerPane] | None:
-        """Every pane of every session on the server, or None when tmux cannot say."""
+        """Every pane of every session on the server, or None when tmux cannot say.
+
+        A session is bot-owned when marked, when it is this bot's own, when it
+        holds the bot's own window (another bot not yet restarted on a version
+        that marks), or when it is a reserve session.
+        """
         lines = await self._tmux("list-panes", "-a", "-F", _PANE_FORMAT)
         if lines is None:
             return None
-        panes: list[ServerPane] = []
-        for line in lines:
-            window_id, pane_id, pid, mark, session = line.split("|", 4)
-            if pid.isdigit():
-                owned = mark == "1" or session.startswith(_RESERVE_SESSION_PREFIX)
-                panes.append(ServerPane(session, window_id, pane_id, int(pid), owned))
-        return panes
+        rows = [line.split("|", 5) for line in lines]
+        owned = {
+            session
+            for *_, mark, name, session in rows
+            if mark == "1" or name == _OWN_WINDOW
+        }
+        owned.add(self.session_name)
+        return [
+            ServerPane(
+                session,
+                window_id,
+                pane_id,
+                int(pid),
+                session in owned or session.startswith(RESERVE_SESSION_PREFIX),
+            )
+            for window_id, pane_id, pid, mark, name, session in rows
+            if pid.isdigit()
+        ]
 
     async def mark_bot_session(self) -> bool:
         """Set the bot-session option on this session; adoption skips marked sessions."""

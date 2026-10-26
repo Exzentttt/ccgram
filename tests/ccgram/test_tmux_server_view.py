@@ -8,7 +8,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import libtmux
 import pytest
 
-from ccgram.multiplexer import server_view, tmux_server_view
+from pathlib import Path
+
+from structlog.testing import capture_logs
+
+from ccgram.multiplexer import server_view, tmux, tmux_server_view
 from ccgram.multiplexer.base import ServerPane, ServerView
 from ccgram.multiplexer.tmux import TmuxManager
 
@@ -59,6 +63,20 @@ class TestListing:
     ) -> None:
         assert not any(p.bot_owned for p in await panes_of(mux, "ccgram-foo"))
 
+    async def test_the_bots_own_session_is_bot_owned_without_a_mark(self, mux) -> None:
+        panes = await panes_of(mux, "bot")
+
+        assert panes and all(p.bot_owned for p in panes)
+
+    async def test_a_session_with_the_bots_own_window_is_bot_owned(self, mux) -> None:
+        mux.server.new_session(
+            session_name="old-bot", window_name="_ccgram", attach=False
+        )
+
+        panes = await panes_of(mux, "old-bot")
+
+        assert panes and all(p.bot_owned for p in panes)
+
     async def test_a_reserve_session_is_bot_owned_without_a_mark(self, mux) -> None:
         panes = await panes_of(mux, "_ccgram-reserve-x")
 
@@ -77,6 +95,20 @@ class TestMarking:
         await mux.ensure_session()
 
         assert all(p.bot_owned for p in await panes_of(mux, "bot"))
+
+    async def test_a_failed_mark_is_logged(self, mux) -> None:
+        with (
+            patch.object(mux, "get_or_create_session"),
+            patch.object(mux, "mark_bot_session", AsyncMock(return_value=False)),
+            capture_logs() as logs,
+        ):
+            await mux.ensure_session()
+
+        assert "bot_session_mark_failed" in [log["event"] for log in logs]
+
+    def test_the_reserve_prefix_is_defined_once(self) -> None:
+        assert tmux.RESERVE_SESSION_PREFIX is tmux_server_view.RESERVE_SESSION_PREFIX
+        assert '"_ccgram-reserve-"' not in Path(tmux.__file__).read_text()
 
     async def test_marking_a_missing_session_reports_failure(self, mux) -> None:
         mux.session_name = "nope"
