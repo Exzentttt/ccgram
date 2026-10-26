@@ -206,9 +206,12 @@ async def _send(notice: _Notice, ledger: _Ledger, bot: Bot) -> float | None:
     return retry_after
 
 
+def _rollout_pattern(session_id: str) -> str:
+    return f"rollout-????-??-??T??-??-??-{glob.escape(session_id)}.jsonl"
+
+
 def _codex_rollouts(session_id: str) -> list[Path]:
-    pattern = f"rollout-????-??-??T??-??-??-{glob.escape(session_id)}.jsonl"
-    return list(codex_sessions_dir().glob(f"**/{pattern}"))
+    return list(codex_sessions_dir().glob(f"**/{_rollout_pattern(session_id)}"))
 
 
 def _pid_alive(pid: int) -> bool:
@@ -307,6 +310,20 @@ async def _rollout_open(path: Path) -> bool | None:
     return False if proc.returncode == 1 and not out.strip() else None
 
 
+async def _namesake_cleared(session_id: str) -> bool:
+    """Whether every rollout of the session (live or archived) is found and closed."""
+    archived = codex_sessions_dir().parent / "archived_sessions"
+    paths = [
+        *await asyncio.to_thread(_codex_rollouts, session_id),
+        *await asyncio.to_thread(
+            lambda: list(archived.glob(_rollout_pattern(session_id)))
+        ),
+    ]
+    if not paths:
+        return False
+    return all([await _rollout_open(path) is False for path in paths])
+
+
 async def _rollout_live(session_id: str) -> bool | None:
     """Whether a process holds a rollout of the Codex session open; None if unsure."""
     paths = await asyncio.to_thread(_codex_rollouts, session_id)
@@ -351,8 +368,12 @@ async def _adopt_codex(
     if found is None:
         return None
     name, namesakes = found
-    for other in namesakes:  # a live namesake could be the one showing the name
-        if await _rollout_live(other) is not False:
+    # INVARIANT(adopt-codex): the app-server keeps a loaded thread's rollout open
+    # between turns (measured 2026-10-26, Codex 0.164.0), so a namesake counts as
+    # not live only with a rollout file found and closed. Without this a live
+    # namesake would be cleared and the wrong session adopted.
+    for other in namesakes:
+        if not await _namesake_cleared(other):
             return None
     return await adopt_live.adopt_codex(view, name, Path(cwd), old_window_id, topic)
 

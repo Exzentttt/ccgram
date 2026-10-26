@@ -2093,12 +2093,35 @@ class TestAdoptCodexSession:
         rows = [{"id": i, "thread_name": "thread-1"} for i in ("sess-1", *ids)]
         index.write_text("".join(json.dumps(r) + "\n" for r in rows))
 
-    async def test_a_name_shared_with_a_session_without_rollout_is_adopted(
+    async def test_a_name_shared_with_a_session_without_rollout_is_not_adopted(
         self, env, live
     ) -> None:
         self.namesakes("old-missing")
 
+        assert await self.call(live) is None
+
+        live.adopt.assert_not_called()
+
+    def archived(self, session: str) -> None:
+        folder = Path.home() / ".codex" / "archived_sessions"
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / f"rollout-2026-10-02T03-50-46-{session}.jsonl").write_text("{}\n")
+
+    async def test_a_namesake_archived_and_closed_is_cleared(self, env, live) -> None:
+        self.archived("old-archived")
+        self.namesakes("old-archived")
+        env.lsof_script = [(0, b"p1\n"), (1, b"")]
+
         assert await self.call(live) == "2:@2"
+
+    async def test_a_namesake_archived_and_open_is_not_adopted(self, env, live) -> None:
+        self.archived("old-archived")
+        self.namesakes("old-archived")
+        env.lsof_script = [(0, b"p1\n"), (0, b"p2\n")]
+
+        assert await self.call(live) is None
+
+        live.adopt.assert_not_called()
 
     async def test_a_name_shared_with_a_closed_rollout_is_adopted(
         self, env, live
