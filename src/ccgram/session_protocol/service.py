@@ -14,7 +14,7 @@ from typing import Any, Protocol
 from ..providers.base import HookEvent
 from .backend import CreationOptions, Prompt, SessionBackend, Target
 from .events import Event, EventHub
-from .message_builder import MessageBuilder
+from .message_builder import MessageBuilder, TranscriptChangedError
 from .messages import Message
 from .models import (
     Action,
@@ -76,6 +76,7 @@ class LocalSessionService:
         self._refresh_lock = asyncio.Lock()
         self._transcript_stamps: dict[str, tuple[int, int, int, int]] = {}
         self._builders: dict[str, MessageBuilder] = {}
+        self._digests: dict[str, tuple[int, str]] = {}
         self._builder_lock = asyncio.Lock()
         self._republish: set[str] = set()
         self._revisions: dict[str, dict[str, int]] = {}
@@ -226,6 +227,7 @@ class LocalSessionService:
             raise ProtocolError(
                 503, "backend_unavailable", "Transcript source is unavailable"
             ) from exc
+        self._digests[source_key] = observation.stamp[1], observation.record[3]
         return replace(
             target,
             history_generation=observation.generation,
@@ -274,29 +276,46 @@ class LocalSessionService:
                     target.transcript_stamp,
                     source_range,
                     dirty_only=dirty_only,
+                    digest=self._observed_digest(key, size),
                 )
             )
             try:
                 messages = await asyncio.shield(work)
             except asyncio.CancelledError:
-                # The worker thread outlives the cancelled await and owns the
-                # builder until it ends; its result is discarded, so rebuild.
-                while not work.done():
-                    with contextlib.suppress(asyncio.CancelledError):
-                        await asyncio.wait({work})
-                if not work.cancelled():
-                    work.exception()  # mark retrieved; the result is discarded
-                self._drop_builder(key)
+                await self._settle(work, key, builder, dirty_only)
                 raise
             except Exception as exc:
                 # A failed update may leave the index half-written: rebuild next poll.
-                self._drop_builder(key)
+                if not isinstance(exc, TranscriptChangedError):
+                    self._drop_builder(key)
                 if not isinstance(exc, OSError):
                     raise
                 raise ProtocolError(
                     503, "backend_unavailable", "Transcript is unavailable"
                 ) from exc
         return builder, messages
+
+    async def _settle(
+        self,
+        work: asyncio.Future[tuple[Message, ...]],
+        key: str,
+        builder: MessageBuilder,
+        dirty_only: bool,
+    ) -> None:
+        """Hold the builder lock until the orphaned worker ends, then clean up."""
+        while not work.done():
+            with contextlib.suppress(asyncio.CancelledError):
+                await asyncio.wait({work})
+        failure = None if work.cancelled() else work.exception()
+        if failure is None and not work.cancelled():
+            if dirty_only:  # the discarded result held the only record of them
+                builder.dirty |= {message.id for message in work.result()}
+        elif not isinstance(failure, TranscriptChangedError):
+            self._drop_builder(key)
+
+    def _observed_digest(self, key: str, size: int) -> str | None:
+        known = self._digests.get(key)
+        return known[1] if known and known[0] == size else None
 
     def _drop_builder(self, key: str) -> None:
         builder = self._builders.pop(key, None)

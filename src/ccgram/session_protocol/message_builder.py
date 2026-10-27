@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
 import pickle
 import tempfile
@@ -23,6 +24,10 @@ from .models import Message, Part
 _CHUNK = 1 << 20
 _TAIL = 4096
 _SPILL_MIN = 512
+
+
+class TranscriptChangedError(OSError):
+    """The source no longer matches what was observed; raised before any byte is consumed."""
 
 
 class _Spilled:
@@ -90,9 +95,10 @@ class MessageBuilder:
         source_range: tuple[int, int | None] | None = None,
         *,
         dirty_only: bool = False,
+        digest: str | None = None,
     ) -> tuple[Message, ...]:
         """Advance to the observed ``stamp`` of the file, then select messages."""
-        self.advance(path, stamp[1], stamp[0], stamp)
+        self.advance(path, stamp[1], stamp[0], stamp, digest)
         selected = self.messages(
             source_range, only=set(self.dirty) if dirty_only else None
         )
@@ -106,11 +112,15 @@ class MessageBuilder:
         size: int,
         ino: int,
         stamp: tuple[int, int, int, int] | None = None,
+        digest: str | None = None,
     ) -> None:
         """Consume transcript bytes up to ``size``; a partial last line waits.
 
-        Raises OSError unless the one open file is still the observed source; with
-        the observed ``stamp`` it must also be unmodified before and after the read.
+        Raises ``TranscriptChangedError`` (nothing consumed) unless the one open file is
+        still the observed source: a same-size file must carry the observed ``stamp``,
+        and a growing one is read only up to ``size``. A builder starting from zero
+        also checks the sha256 of those ``size`` bytes against the observed ``digest``;
+        a mismatch raises OSError after consuming, so the builder must be dropped.
         """
         with path.open("rb") as source:
             status = os.fstat(source.fileno())
@@ -119,23 +129,26 @@ class MessageBuilder:
                 or status.st_size < size
                 or self._ino not in (None, ino)
             ):
-                raise OSError("Transcript source was replaced")
-            if stamp and _stat_stamp(status) != stamp:
-                raise OSError("Transcript source changed since it was observed")
+                raise TranscriptChangedError("Transcript source was replaced")
+            if stamp and status.st_size == size and _stat_stamp(status) != stamp:
+                raise TranscriptChangedError("Transcript source was rewritten in place")
+            fresh = self.offset == 0 or self.provider == "gemini"
+            tail = len(self._tail)
+            if (
+                self.provider != "gemini"
+                and tail
+                and _read_at(source, self.offset - tail, tail) != self._tail
+            ):
+                raise TranscriptChangedError("Transcript source was rewritten")
             self._ino = ino
             if self.provider == "gemini":
                 self._reset()
                 self.feed(read_entries(_read_at(source, 0, size), self.provider))
                 self.offset = size
-                if stamp and _stat_stamp(os.fstat(source.fileno())) != stamp:
-                    raise OSError("Transcript source changed while reading")
-                return
-            tail = len(self._tail)
-            if tail and _read_at(source, self.offset - tail, tail) != self._tail:
-                raise OSError("Transcript source was rewritten")
-            self._consume(source, size)
-            if stamp and _stat_stamp(os.fstat(source.fileno())) != stamp:
-                raise OSError("Transcript source changed while reading")
+            else:
+                self._consume(source, size)
+            if fresh and digest and _digest(source, size) != digest:
+                raise OSError("Transcript bytes differ from the observed content")
 
     def _consume(self, source: BinaryIO, size: int) -> None:
         span = _CHUNK
@@ -342,3 +355,15 @@ def _read_at(source: BinaryIO, start: int, length: int) -> bytes:
 
 def _stat_stamp(status: os.stat_result) -> tuple[int, int, int, int]:
     return status.st_ino, status.st_size, status.st_mtime_ns, status.st_ctime_ns
+
+
+def _digest(source: BinaryIO, size: int) -> str:
+    whole, done = hashlib.sha256(), 0
+    source.seek(0)
+    while done < size:
+        chunk = source.read(min(_CHUNK, size - done))
+        if not chunk:
+            break
+        whole.update(chunk)
+        done += len(chunk)
+    return whole.hexdigest()

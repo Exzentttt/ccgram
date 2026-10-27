@@ -1,5 +1,6 @@
 """Per-poll transcript cost is O(appended bytes), never O(file size)."""
 
+import hashlib
 import json
 import asyncio
 import os
@@ -315,12 +316,12 @@ async def test_rotation_between_observation_and_read_never_mixes_generations(
         stream.write(b'{"type": "user", "uuid": "pad"}\n')
     real = MessageBuilder.advance
 
-    def rotate_then_advance(builder, target_path, size, ino, stamp):
+    def rotate_then_advance(builder, target_path, size, ino, *extra):
         replacement = tmp_path / "rotated"
         replacement.write_bytes(b"".join(json.dumps(r).encode() + b"\n" for r in new))
         replacement.replace(target_path)
         monkeypatch.setattr(MessageBuilder, "advance", real)
-        return real(builder, target_path, size, ino, stamp)
+        return real(builder, target_path, size, ino, *extra)
 
     monkeypatch.setattr(MessageBuilder, "advance", rotate_then_advance)
     await service.refresh()
@@ -509,10 +510,10 @@ async def test_vanishing_session_never_closes_a_builder_mid_update(
         MessageBuilder.advance,
     )
 
-    def blocked(builder, target_path, size, ino, stamp):
+    def blocked(builder, target_path, size, ino, *extra):
         entered.set()
         release.wait(5)
-        return real(builder, target_path, size, ino, stamp)
+        return real(builder, target_path, size, ino, *extra)
 
     monkeypatch.setattr(MessageBuilder, "advance", blocked)
     history = asyncio.create_task(service.history(session_id, None, 50))
@@ -627,3 +628,67 @@ async def test_cancelled_caller_keeps_the_builder_lock_until_the_worker_ends(
     release.set()
     await asyncio.gather(first, second, return_exceptions=True)
     assert active["max"] == 1
+
+
+def stamp_of(path):
+    stat = path.stat()
+    return stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns
+
+
+def jsonl(rows):
+    return b"".join(json.dumps(r).encode() + b"\n" for r in rows)
+
+
+def test_file_that_grows_after_observation_is_read_up_to_the_observed_size(tmp_path):
+    path = tmp_path / "t.jsonl"
+    rows = [claude_line("assistant", f"a{i}", f"t{i}") for i in range(3)]
+    observed = jsonl(rows)
+    path.write_bytes(observed)
+    stamp, digest = stamp_of(path), hashlib.sha256(observed).hexdigest()
+    path.write_bytes(observed + jsonl([claude_line("assistant", "late", "late")]))
+    builder = MessageBuilder("conv", "claude", 0)
+    messages = builder.update(path, stamp, digest=digest)
+    assert [m.parts[0].text for m in messages] == ["t0", "t1", "t2"]
+    assert builder.offset == len(observed)
+
+
+def test_rewrite_plus_append_is_caught_by_the_observed_digest(tmp_path):
+    path = tmp_path / "t.jsonl"
+    observed = jsonl([claude_line("assistant", f"a{i}", f"old{i}") for i in range(3)])
+    path.write_bytes(observed)
+    stamp, digest = stamp_of(path), hashlib.sha256(observed).hexdigest()
+    rewritten = observed.replace(b"old", b"new") + jsonl(
+        [claude_line("assistant", "late", "late")]
+    )
+    path.write_bytes(rewritten)
+    with pytest.raises(OSError, match="differ"):
+        MessageBuilder("conv", "claude", 0).update(path, stamp, digest=digest)
+
+
+async def test_cancelled_caller_keeps_a_builder_whose_worker_succeeded(
+    service, backend, tmp_path, monkeypatch
+):
+    lines = claude_session()
+    path = tmp_path / "t.jsonl"
+    path.write_bytes(jsonl(lines[:4]))
+    backend.target = replace(backend.target, transcript=path)
+    await service.refresh()
+    session_id = next(iter(service._snapshots))
+    (builder,) = service._builders.values()
+    with path.open("ab") as stream:
+        stream.write(jsonl(lines[4:]))
+    entered, release, real = threading.Event(), threading.Event(), MessageBuilder.advance
+
+    def blocked(self, *args):
+        entered.set()
+        release.wait(5)
+        return real(self, *args)
+
+    monkeypatch.setattr(MessageBuilder, "advance", blocked)
+    first = asyncio.create_task(service.history(session_id, None, 50))
+    while not entered.is_set():
+        await asyncio.sleep(0.01)
+    first.cancel()
+    release.set()
+    await asyncio.gather(first, return_exceptions=True)
+    assert list(service._builders.values()) == [builder]
