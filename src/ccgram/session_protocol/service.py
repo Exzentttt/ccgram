@@ -13,7 +13,7 @@ from typing import Any, Protocol
 from ..providers.base import HookEvent
 from .backend import CreationOptions, Prompt, SessionBackend, Target
 from .events import Event, EventHub
-from .messages import Message, build_messages, read_entries
+from .messages import Message, MessageBuilder
 from .models import (
     Action,
     ActionResult,
@@ -73,6 +73,9 @@ class LocalSessionService:
         self._targets: dict[str, Target] = {}
         self._refresh_lock = asyncio.Lock()
         self._transcript_stamps: dict[str, tuple[int, int, int, int]] = {}
+        self._builders: dict[str, MessageBuilder] = {}
+        self._builder_lock = asyncio.Lock()
+        self._republish: set[str] = set()
         self._revisions: dict[str, dict[str, int]] = {}
         # Lazy: ActionExecutor imports the service only for type checking.
         from .actions import ActionExecutor
@@ -86,6 +89,10 @@ class LocalSessionService:
             for target in targets:
                 _, snapshot = await self._update(target)
                 live.add(snapshot.id)
+            sources = {self._source_key(target) for target in targets}
+            self.store.retain_transcripts(sources)
+            for key in self._builders.keys() - sources:
+                del self._builders[key]
             for session_id in self._snapshots.keys() - live:
                 self.requests.close(session_id, "vanished")
                 self.hub.publish(
@@ -94,6 +101,7 @@ class LocalSessionService:
                 self._snapshots.pop(session_id)
                 self._targets.pop(session_id)
                 self._transcript_stamps.pop(session_id, None)
+                self._republish.discard(session_id)
                 self._revisions.pop(session_id, None)
 
     async def _update(self, target: Target) -> tuple[Target, SessionSnapshot]:
@@ -120,7 +128,6 @@ class LocalSessionService:
             target = replace(
                 target,
                 available=False,
-                transcript_content=None,
                 transcript_stamp=None,
                 status=Status("unknown", str(exc), "screen", utc_now()),
             )
@@ -135,9 +142,7 @@ class LocalSessionService:
             self.requests.close(session_id, "vanished")
             self._revisions.pop(session_id, None)
             self._transcript_stamps.pop(session_id, None)
-        self._targets[session_id] = replace(
-            target, transcript_content=None, transcript_stamp=None
-        )
+        self._targets[session_id] = replace(target, transcript_stamp=None)
         opened = self.requests.reconcile(
             session_id, target.conversation_id, version, prompt
         )
@@ -198,7 +203,7 @@ class LocalSessionService:
     async def _source_version(self, target: Target) -> Target:
         if target.transcript is None:
             return target
-        source_key = f"{target.id.casefold()}:{target.conversation_id}"
+        source_key = self._source_key(target)
         try:
             observation = await self.store.transcript_snapshot(
                 source_key, target.transcript
@@ -220,9 +225,43 @@ class LocalSessionService:
         return replace(
             target,
             history_generation=observation.generation,
-            transcript_content=observation.content,
             transcript_stamp=observation.stamp,
         )
+
+    @staticmethod
+    def _source_key(target: Target) -> str:
+        return f"{target.id.casefold()}:{target.conversation_id}"
+
+    async def _builder(self, target: Target) -> MessageBuilder:
+        """Builder advanced to the observed transcript size (appended bytes only)."""
+        if target.transcript is None:
+            raise ProtocolError(503, "backend_unavailable", "No transcript source")
+        if target.transcript_stamp is None:
+            raise ProtocolError(
+                503, "backend_unavailable", "Transcript observation is unavailable"
+            )
+        provider = target.transcript_provider or target.provider
+        size = target.transcript_stamp[1]
+        key = self._source_key(target)
+        async with self._builder_lock:
+            builder = self._builders.get(key)
+            if (
+                builder is None
+                or (builder.conversation_id, builder.provider, builder.generation)
+                != (target.conversation_id, provider, target.history_generation)
+                or builder.offset > size
+            ):
+                builder = MessageBuilder(
+                    target.conversation_id, provider, target.history_generation
+                )
+                self._builders[key] = builder
+            try:
+                await asyncio.to_thread(builder.advance, target.transcript, size)
+            except OSError as exc:
+                raise ProtocolError(
+                    503, "backend_unavailable", "Transcript is unavailable"
+                ) from exc
+        return builder
 
     async def _messages(
         self,
@@ -232,28 +271,12 @@ class LocalSessionService:
     ) -> tuple[Message, ...]:
         if target.transcript is None:
             return ()
-        try:
-            if target.transcript_content is None:
-                raise ProtocolError(
-                    503, "backend_unavailable", "Transcript observation is unavailable"
-                )
-            entries = await asyncio.to_thread(
-                read_entries,
-                target.transcript_content,
-                target.transcript_provider or target.provider,
-            )
-        except OSError as exc:
-            raise ProtocolError(
-                503, "backend_unavailable", "Transcript is unavailable"
-            ) from exc
-        messages = await asyncio.to_thread(
-            build_messages,
-            entries,
-            target.conversation_id,
-            target.transcript_provider or target.provider,
-            target.history_generation,
-            source_range=source_range,
-        )
+        builder = await self._builder(target)
+        return self._correlated(target, builder.messages(source_range))
+
+    def _correlated(
+        self, target: Target, messages: tuple[Message, ...]
+    ) -> tuple[Message, ...]:
         sid = next((sid for sid, t in self._targets.items() if t.id == target.id), "")
         return tuple(self._correlate(sid, message) for message in messages)
 
@@ -271,6 +294,7 @@ class LocalSessionService:
             )
             # A refresh may have observed the user entry before send acknowledgement.
             self._transcript_stamps.pop(session_id, None)
+            self._republish.add(session_id)
 
     async def _publish_messages(self, session_id: str, target: Target) -> None:
         if target.transcript is None:
@@ -278,7 +302,11 @@ class LocalSessionService:
         stamp = target.transcript_stamp
         if self._transcript_stamps.get(session_id) == stamp:
             return
-        messages = await self._messages(target)
+        builder = await self._builder(target)
+        republish = session_id in self._republish
+        messages = self._correlated(
+            target, builder.messages(only=None if republish else set(builder.dirty))
+        )
         revisions = self._revisions.setdefault(session_id, {})
         changed = False
         for message in messages:
@@ -286,6 +314,8 @@ class LocalSessionService:
                 changed = True
                 self.hub.publish("message.upsert", session_id, message)
                 revisions[message.id] = message.revision
+        builder.dirty.clear()
+        self._republish.discard(session_id)
         if stamp is not None:
             self._transcript_stamps[session_id] = stamp
         if changed:

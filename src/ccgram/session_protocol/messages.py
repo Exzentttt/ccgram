@@ -37,6 +37,7 @@ _CLAUDE_COMMAND_NAME_RE = re.compile(r"<command-name>(.*?)</command-name>", re.D
 _CLAUDE_LOCAL_STDOUT_RE = re.compile(
     r"<local-command-stdout>(.*?)</local-command-stdout>", re.DOTALL
 )
+_CHUNK = 8 << 20
 _ANSI_SGR_RE = re.compile(r"\x1b\[[0-9;]*m")
 
 
@@ -58,12 +59,13 @@ class TranscriptRecord:
 
 
 def read_entries(
-    source: Path | bytes, provider: str | None = None
+    source: Path | bytes, provider: str | None = None, *, base: int = 0
 ) -> list[SourceEntry]:
     """Parse complete JSONL records from a path or immutable byte snapshot.
 
     Byte offsets always refer to the original transcript. An unfinished final
-    line is ignored; the next poll will read it after it is completed.
+    line is ignored; the next poll will read it after it is completed. ``base``
+    is the transcript offset at which ``source`` starts.
     """
     raw = source.read_bytes() if isinstance(source, Path) else source
     result = []
@@ -81,7 +83,7 @@ def read_entries(
                 for index, entry in enumerate(document["messages"])
                 if isinstance(entry, dict)
             ]
-    offset = 0
+    offset = base
     for line in raw.splitlines(keepends=True):
         if not line.endswith(b"\n"):
             break
@@ -981,3 +983,150 @@ def build_messages(
             for offset in contributors[message.id]
         )
     )
+
+
+class MessageBuilder:
+    """Incremental ``build_messages``: feed appended lines, never re-parse the file.
+
+    Retains parsed messages (not transcript bytes). For every JSONL provider the
+    result equals ``build_messages(read_entries(whole file))``; Gemini keeps one
+    JSON document, so it is rebuilt from the whole file on each advance.
+    """
+
+    def __init__(self, conversation_id: str, provider: str, generation: int) -> None:
+        self.conversation_id = conversation_id
+        self.provider = provider
+        self.generation = generation
+        self.dirty: set[str] = set()
+        self._reset()
+
+    def _reset(self) -> None:
+        self.offset = 0
+        self._state = TranscriptParserState()
+        self._messages: dict[str, Message] = {}
+        self._contributors: dict[str, set[int]] = {}
+        self._record_count: dict[str, int] = {}
+        self._calls: dict[str, tuple[str, int]] = {}
+        self._results: dict[str, list[tuple[int, dict[str, Any], bool]]] = {}
+
+    def advance(self, path: Path, size: int) -> None:
+        """Consume transcript bytes up to ``size``; a partial last line waits."""
+        if self.provider == "gemini":
+            self._reset()
+            self.feed(read_entries(_read_range(path, 0, size), self.provider))
+            self.offset = size
+            return
+        span = _CHUNK
+        while self.offset < size:
+            end = min(size, self.offset + span)
+            raw = _read_range(path, self.offset, end)
+            consumed = raw.rfind(b"\n") + 1
+            if not consumed:
+                if end == size:
+                    return
+                span *= 2
+                continue
+            self.feed(read_entries(raw[:consumed], self.provider, base=self.offset))
+            self.offset += consumed
+
+    def feed(self, entries: list[SourceEntry]) -> None:
+        records, _ = parse_records(entries, self.provider, self._state)
+        touched: set[str] = set()
+        for entry, record in records:
+            for call_id, output, failed in record.results:
+                result = {"text": _text(output), "truncated": False}
+                self._results.setdefault(call_id, []).append(
+                    (entry.offset, result, failed)
+                )
+                owner = self._calls.get(call_id)
+                if owner:
+                    touched.add(owner[0])
+            if record.parts:
+                touched.add(self._record(entry, record))
+        for message_id in touched:
+            self._resolve(message_id)
+        self.dirty |= touched
+
+    def _record(self, entry: SourceEntry, record: TranscriptRecord) -> str:
+        generation = f"g{self.generation}/" if self.generation else ""
+        message_id = f"{self.conversation_id}/{generation}{record.key}"
+        self._contributors.setdefault(message_id, set()).add(entry.offset)
+        count = self._record_count.get(message_id, 0) + 1
+        self._record_count[message_id] = count
+        parts = tuple(
+            Part(
+                id=f"{message_id}#{i}",
+                **{name: value for name, value in part.items() if name in _PART_FIELDS},
+            )
+            for i, part in enumerate(record.parts)
+        )
+        self._messages[message_id] = Message(
+            message_id,
+            count,
+            self.conversation_id,
+            record.role,
+            record.time,
+            record.complete,
+            parts,
+            phase=record.phase,
+        )
+        for i, part in enumerate(parts):
+            if part.tool_call_id:
+                self._calls[part.tool_call_id] = message_id, i
+        return message_id
+
+    def _resolve(self, message_id: str) -> None:
+        """Re-apply every tool result owned by this message, in file order."""
+        message = self._messages[message_id]
+        parts = list(message.parts)
+        applied = False
+        for index, part in enumerate(parts):
+            call_id = part.tool_call_id
+            if not call_id or self._calls.get(call_id) != (message_id, index):
+                continue
+            for offset, output, failed in self._results.get(call_id, ()):
+                parts[index] = replace(
+                    parts[index],
+                    status="failed" if failed else "completed",
+                    output=output,
+                )
+                self._contributors[message_id].add(offset)
+                applied = True
+        revision = (
+            len(self._contributors[message_id])
+            if applied
+            else self._record_count[message_id]
+        )
+        self._messages[message_id] = replace(
+            message, parts=tuple(parts), revision=revision
+        )
+
+    def messages(
+        self,
+        source_range: tuple[int, int | None] | None = None,
+        *,
+        only: set[str] | None = None,
+    ) -> tuple[Message, ...]:
+        """All messages in first-seen order, optionally the ``only`` ids or a byte range."""
+        selected = [
+            message
+            for message in self._messages.values()
+            if only is None or message.id in only
+        ]
+        if source_range is None:
+            return tuple(selected)
+        start, end = source_range
+        return tuple(
+            message
+            for message in selected
+            if any(
+                offset >= start and (end is None or offset < end)
+                for offset in self._contributors[message.id]
+            )
+        )
+
+
+def _read_range(path: Path, start: int, end: int) -> bytes:
+    with path.open("rb") as source:
+        source.seek(start)
+        return source.read(end - start)
