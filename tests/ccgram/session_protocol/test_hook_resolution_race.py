@@ -48,12 +48,12 @@ async def test_obsolete_unmatched_resolution_preserves_newer_queued_evidence(
     entered, release = asyncio.Event(), threading.Event()
     loop = asyncio.get_running_loop()
 
-    def delayed_read(builder, source, size):
+    def delayed_read(builder, *args):
         if not release.is_set():
             loop.call_soon_threadsafe(entered.set)
             if not release.wait(5):
                 raise TimeoutError("test did not release transcript read")
-        return advance(builder, source, size)
+        return advance(builder, *args)
 
     monkeypatch.setattr(service_module.MessageBuilder, "advance", delayed_read)
     monkeypatch.setattr(

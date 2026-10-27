@@ -142,6 +142,7 @@ class LocalSessionService:
             self.requests.close(session_id, "vanished")
             self._revisions.pop(session_id, None)
             self._transcript_stamps.pop(session_id, None)
+            self._republish.add(session_id)
         self._targets[session_id] = replace(target, transcript_stamp=None)
         opened = self.requests.reconcile(
             session_id, target.conversation_id, version, prompt
@@ -232,16 +233,20 @@ class LocalSessionService:
     def _source_key(target: Target) -> str:
         return f"{target.id.casefold()}:{target.conversation_id}"
 
-    async def _builder(self, target: Target) -> MessageBuilder:
-        """Builder advanced to the observed transcript size (appended bytes only)."""
-        if target.transcript is None:
-            raise ProtocolError(503, "backend_unavailable", "No transcript source")
-        if target.transcript_stamp is None:
+    async def _built(
+        self,
+        target: Target,
+        *,
+        source_range: tuple[int, int | None] | None = None,
+        dirty_only: bool = False,
+    ) -> tuple[MessageBuilder, tuple[Message, ...]]:
+        """Advance the builder by appended bytes only, then select its messages."""
+        if target.transcript is None or target.transcript_stamp is None:
             raise ProtocolError(
                 503, "backend_unavailable", "Transcript observation is unavailable"
             )
         provider = target.transcript_provider or target.provider
-        size = target.transcript_stamp[1]
+        ino, size = target.transcript_stamp[:2]
         key = self._source_key(target)
         async with self._builder_lock:
             builder = self._builders.get(key)
@@ -256,12 +261,19 @@ class LocalSessionService:
                 )
                 self._builders[key] = builder
             try:
-                await asyncio.to_thread(builder.advance, target.transcript, size)
+                messages = await asyncio.to_thread(
+                    builder.update,
+                    target.transcript,
+                    size,
+                    ino,
+                    source_range,
+                    dirty_only=dirty_only,
+                )
             except OSError as exc:
                 raise ProtocolError(
                     503, "backend_unavailable", "Transcript is unavailable"
                 ) from exc
-        return builder
+        return builder, messages
 
     async def _messages(
         self,
@@ -271,8 +283,8 @@ class LocalSessionService:
     ) -> tuple[Message, ...]:
         if target.transcript is None:
             return ()
-        builder = await self._builder(target)
-        return self._correlated(target, builder.messages(source_range))
+        _, messages = await self._built(target, source_range=source_range)
+        return self._correlated(target, messages)
 
     def _correlated(
         self, target: Target, messages: tuple[Message, ...]
@@ -302,19 +314,20 @@ class LocalSessionService:
         stamp = target.transcript_stamp
         if self._transcript_stamps.get(session_id) == stamp:
             return
-        builder = await self._builder(target)
-        republish = session_id in self._republish
-        messages = self._correlated(
-            target, builder.messages(only=None if republish else set(builder.dirty))
+        builder, selected = await self._built(
+            target, dirty_only=session_id not in self._republish
         )
         revisions = self._revisions.setdefault(session_id, {})
         changed = False
-        for message in messages:
-            if revisions.get(message.id) != message.revision:
-                changed = True
-                self.hub.publish("message.upsert", session_id, message)
-                revisions[message.id] = message.revision
-        builder.dirty.clear()
+        try:
+            for message in self._correlated(target, selected):
+                if revisions.get(message.id) != message.revision:
+                    changed = True
+                    self.hub.publish("message.upsert", session_id, message)
+                    revisions[message.id] = message.revision
+        except Exception:
+            builder.dirty |= {message.id for message in selected}
+            raise
         self._republish.discard(session_id)
         if stamp is not None:
             self._transcript_stamps[session_id] = stamp

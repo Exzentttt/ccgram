@@ -146,7 +146,7 @@ async def test_lost_hook_processing_keeps_session_blocked(
             runtime.observe_hook(event)
         if failure == "processing":
 
-            def unavailable(self, path, size):
+            def unavailable(self, *args):
                 raise OSError("transcript unavailable")
 
             monkeypatch.setattr(

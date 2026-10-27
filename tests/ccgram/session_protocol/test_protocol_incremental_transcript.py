@@ -2,6 +2,7 @@
 
 import json
 import os
+import tracemalloc
 from dataclasses import replace
 from pathlib import Path
 
@@ -15,6 +16,7 @@ from ccgram.session_protocol.messages import (
 from ccgram.session_protocol.store import ProtocolStore
 
 WINDOW = 4096
+AUDIT = 1 << 20
 
 
 @pytest.fixture
@@ -80,7 +82,7 @@ async def test_append_reads_only_appended_bytes(tmp_path, reads):
     snapshot = await store.transcript_snapshot("k", path)
     assert snapshot.generation == 0
     assert snapshot.stamp[1] == 2_001_000
-    assert reads["bytes"] <= 1000 + 2 * WINDOW
+    assert reads["bytes"] <= 1000 + 3 * WINDOW + AUDIT
     store.close()
 
 
@@ -203,7 +205,7 @@ def test_incremental_builder_equals_full_reparse(tmp_path, provider, lines, cut)
     split = [0, *sorted({cut * len(raw) // 8, (cut * 3) % (len(raw) + 1)}), len(raw)]
     for end in split[1:]:
         path.write_bytes(raw[:end])
-        builder.advance(path, end)
+        builder.advance(path, end, path.stat().st_ino)
     assert builder.messages() == full
     for window in [(0, None), (200, 600), (0, 1)]:
         expected = build_messages(
@@ -217,10 +219,10 @@ def test_incremental_builder_waits_for_unfinished_line(tmp_path):
     path = tmp_path / "t.jsonl"
     builder = MessageBuilder("conv", "claude", 0)
     path.write_bytes(raw[:-10])
-    builder.advance(path, len(raw) - 10)
+    builder.advance(path, len(raw) - 10, path.stat().st_ino)
     partial = builder.messages()
     path.write_bytes(raw)
-    builder.advance(path, len(raw))
+    builder.advance(path, len(raw), path.stat().st_ino)
     assert len(partial) < len(builder.messages())
     assert builder.messages() == build_messages(
         read_entries(raw, "claude"), "conv", "claude"
@@ -233,11 +235,11 @@ def test_incremental_builder_reports_only_touched_messages(tmp_path):
     builder = MessageBuilder("conv", "claude", 0)
     head = b"".join(json.dumps(line).encode() + b"\n" for line in lines[:3])
     path.write_bytes(head)
-    builder.advance(path, len(head))
+    builder.advance(path, len(head), path.stat().st_ino)
     builder.dirty.clear()
     late = json.dumps(lines[3]).encode() + b"\n"
     path.write_bytes(head + late)
-    builder.advance(path, len(head + late))
+    builder.advance(path, len(head + late), path.stat().st_ino)
     assert builder.dirty == {"conv/a1"}
 
 
@@ -253,7 +255,7 @@ def test_gemini_document_is_rebuilt_from_the_whole_file(tmp_path):
         }
         raw = json.dumps(doc).encode()
         path.write_bytes(raw)
-        builder.advance(path, len(raw))
+        builder.advance(path, len(raw), path.stat().st_ino)
         assert builder.messages() == build_messages(
             read_entries(raw, "gemini"), "conv", "gemini"
         )
@@ -281,7 +283,7 @@ async def test_service_poll_cost_follows_appended_bytes(
         stream.write(extra)
     reset(reads)
     await service.refresh()
-    assert reads["bytes"] <= 2 * len(extra) + 2 * WINDOW
+    assert reads["bytes"] <= 2 * len(extra) + 3 * WINDOW + AUDIT
     assert upserts(service)[300:] == ["conv/new"]
     assert not hasattr(backend.target, "transcript_content")
 
@@ -293,8 +295,123 @@ def test_builder_chunking_handles_lines_longer_than_a_chunk(tmp_path, monkeypatc
     path = tmp_path / "t.jsonl"
     path.write_bytes(raw)
     builder = MessageBuilder("conv", "claude", 0)
-    builder.advance(path, len(raw))
+    builder.advance(path, len(raw), path.stat().st_ino)
     assert builder.offset == len(raw)
+    assert builder.messages() == build_messages(
+        read_entries(raw, "claude"), "conv", "claude"
+    )
+
+
+async def test_rotation_between_observation_and_read_never_mixes_generations(
+    service, backend, tmp_path, monkeypatch
+):
+    path = tmp_path / "t.jsonl"
+    rows = [claude_line("assistant", f"o{i}", f"old{i}") for i in range(3)]
+    path.write_bytes(b"".join(json.dumps(r).encode() + b"\n" for r in rows))
+    backend.target = replace(backend.target, transcript=path)
+    await service.refresh()
+    new = [claude_line("assistant", f"n{i}", f"new{i}") for i in range(6)]
+    with path.open("ab") as stream:
+        stream.write(b'{"type": "user", "uuid": "pad"}\n')
+    real = MessageBuilder.advance
+
+    def rotate_then_advance(builder, target_path, size, ino):
+        replacement = tmp_path / "rotated"
+        replacement.write_bytes(b"".join(json.dumps(r).encode() + b"\n" for r in new))
+        replacement.replace(target_path)
+        monkeypatch.setattr(MessageBuilder, "advance", real)
+        return real(builder, target_path, size, ino)
+
+    monkeypatch.setattr(MessageBuilder, "advance", rotate_then_advance)
+    await service.refresh()
+    await service.refresh()
+    _, events = service.hub.replay(service.hub.epoch, 0)
+    stale = [
+        e.data
+        for e in events
+        if e.type == "message.upsert" and "/g1/" not in e.data["id"]
+    ]
+    assert {m["parts"][0]["text"] for m in stale} <= {"old0", "old1", "old2"}
+
+
+async def test_rebinding_republishes_the_history(service, backend, tmp_path):
+    path = tmp_path / "t.jsonl"
+    rows = [claude_line("assistant", f"a{i}", f"t{i}") for i in range(3)]
+    path.write_bytes(b"".join(json.dumps(r).encode() + b"\n" for r in rows))
+    backend.target = replace(backend.target, transcript=path)
+    await service.refresh()
+    assert len(upserts(service)) == 3
+    backend.target = replace(backend.target, process_id=999)
+    await service.refresh()
+    assert len(upserts(service)) == 6
+
+
+async def test_mid_file_edit_is_found_by_the_audit_and_survives_restart(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr("ccgram.session_protocol.store._AUDIT", 2 * WINDOW)
+    path = tmp_path / "t.jsonl"
+    path.write_bytes(b"a" * 40_000)
+    db = tmp_path / "db"
+    store = ProtocolStore(db)
+    await store.transcript_snapshot("k", path)
+    data = bytearray(path.read_bytes())
+    data[30_000] = ord("Q")
+    path.write_bytes(bytes(data))
+    live = []
+    for _ in range(6):
+        with path.open("ab") as stream:
+            stream.write(b"b")
+        live.append((await store.transcript_snapshot("k", path)).generation)
+    assert live[0] == 0 and live[-1] == 1
+    store.close()
+    store = ProtocolStore(db)
+    assert (await store.transcript_snapshot("k", path)).generation == live[-1]
+    store.close()
+
+
+def test_reassigned_call_id_matches_a_full_reparse(tmp_path):
+    tool = {"type": "tool_use", "id": "t1", "name": "Bash", "input": {"command": "ls"}}
+    result = {"type": "tool_result", "tool_use_id": "t1", "content": "out"}
+    lines = [
+        claude_line("assistant", "a1", [tool]),
+        claude_line("user", "r1", [result]),
+        claude_line("assistant", "a2", [tool]),
+    ]
+    raw = [json.dumps(line).encode() + b"\n" for line in lines]
+    path = tmp_path / "t.jsonl"
+    builder = MessageBuilder("conv", "claude", 0)
+    for end in (2, 3):
+        path.write_bytes(b"".join(raw[:end]))
+        builder.advance(path, len(b"".join(raw[:end])), path.stat().st_ino)
+    full = build_messages(read_entries(b"".join(raw), "claude"), "conv", "claude")
+    assert builder.messages() == full
+
+
+def test_builder_keeps_large_fields_out_of_memory(tmp_path):
+    big = "z" * 6000
+    tool = {"type": "tool_use", "id": "t0", "name": "Bash", "input": {"command": "ls"}}
+    rows = []
+    for i in range(1000):
+        call = dict(tool, id=f"t{i}")
+        result = {
+            "type": "tool_result",
+            "tool_use_id": f"t{i}",
+            "content": big + str(i),
+        }
+        rows += [
+            claude_line("assistant", f"a{i}", [call]),
+            claude_line("user", f"r{i}", [result]),
+        ]
+    raw = b"".join(json.dumps(r).encode() + b"\n" for r in rows)
+    path = tmp_path / "t.jsonl"
+    path.write_bytes(raw)
+    tracemalloc.start()
+    builder = MessageBuilder("conv", "claude", 0)
+    builder.advance(path, len(raw), path.stat().st_ino)
+    retained, _ = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+    assert retained < 0.15 * len(raw)
     assert builder.messages() == build_messages(
         read_entries(raw, "claude"), "conv", "claude"
     )

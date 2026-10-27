@@ -338,6 +338,8 @@ class ProtocolStore:
 
 
 _WINDOW = 4096
+_BLOCK = 4096
+_AUDIT = 1 << 20
 _CHUNK = 1 << 20
 _Stamp = tuple[int, int, int, int]
 _Row = tuple[int, int, int, str, int]
@@ -345,13 +347,19 @@ _Row = tuple[int, int, int, str, int]
 
 @dataclass(frozen=True, slots=True)
 class _Tracked:
-    """In-memory proof of what was already read: no transcript bytes are kept."""
+    """In-memory proof of what was already read: no transcript bytes are kept.
+
+    ``blocks`` holds a short hash per complete 4 KiB block; every growth poll
+    re-checks the next ``_AUDIT`` bytes of them, so a rewrite of known bytes is
+    found within ``size / _AUDIT`` polls. The persisted ``record`` keeps the
+    prefix hash of the last full scan, which stays a true hash of its prefix.
+    """
 
     stamp: _Stamp
     dev: int
-    digest: Any
-    head: bytes
     tail: bytes
+    blocks: bytes
+    cursor: int
     record: _Row
 
 
@@ -381,12 +389,19 @@ def _read_at(source: Any, start: int, length: int) -> bytes:
     return source.read(length)
 
 
+def _block_hashes(data: bytes) -> bytes:
+    return b"".join(
+        hashlib.blake2b(data[i : i + _BLOCK], digest_size=8).digest()
+        for i in range(0, len(data) - _BLOCK + 1, _BLOCK)
+    )
+
+
 def _scan(
     source: Any, size: int, prefix_size: int
-) -> tuple[Any, str, bytes, bytes, int]:
-    """Stream the file once, hashing it whole and its first ``prefix_size`` bytes."""
-    digest, prefix = hashlib.sha256(), hashlib.sha256()
-    head = tail = b""
+) -> tuple[str, str, bytes, bytes, int]:
+    """Stream the file once: hashes of its first ``prefix_size`` bytes and of all."""
+    prefix, whole, blocks = hashlib.sha256(), hashlib.sha256(), []
+    pending = tail = b""
     done = 0
     source.seek(0)
     while done < size:
@@ -394,51 +409,61 @@ def _scan(
         if not chunk:
             break
         prefix.update(chunk[: max(prefix_size - done, 0)])
-        digest.update(chunk)
-        head = head if len(head) >= _WINDOW else (head + chunk)[:_WINDOW]
+        whole.update(chunk)
         tail = (tail + chunk)[-_WINDOW:]
+        pending += chunk
+        complete = len(pending) // _BLOCK * _BLOCK
+        blocks.append(_block_hashes(pending[:complete]))
+        pending = pending[complete:]
         done += len(chunk)
-    return digest, prefix.hexdigest(), head, tail, done
+    return prefix.hexdigest(), whole.hexdigest(), tail, b"".join(blocks), done
 
 
 def _extend(source: Any, before: os.stat_result, known: _Tracked) -> _Tracked | None:
-    """Read only appended bytes; ``None`` when the known bytes no longer match."""
-    old = known.record[1]
+    """Read appended bytes; ``None`` when the known bytes no longer match."""
+    old, size = known.record[1], before.st_size
+    complete = len(known.blocks) // 8
+    window = min(_AUDIT // _BLOCK, complete)
+    first = known.cursor if known.cursor < complete else 0
+    window = min(window, complete - first)
     if (
         before.st_ino != known.record[0]
         or before.st_dev != known.dev
-        or before.st_size < old
-        or _read_at(source, 0, len(known.head)) != known.head
+        or size < old
         or _read_at(source, old - len(known.tail), len(known.tail)) != known.tail
+        or _block_hashes(_read_at(source, first * _BLOCK, window * _BLOCK))
+        != known.blocks[first * 8 : (first + window) * 8]
     ):
         return None
-    appended = source.read(before.st_size - old)
-    if len(appended) != before.st_size - old:
-        return None
-    digest = known.digest.copy()
-    digest.update(appended)
-    size = before.st_size
-    record = (before.st_ino, size, size, digest.hexdigest(), known.record[4])
+    start = complete * _BLOCK
+    data = _read_at(source, start, size - start)
+    if len(data) != size - start:
+        raise OSError("Transcript changed while reading")
+    record = (before.st_ino, size, known.record[2], known.record[3], known.record[4])
     return _Tracked(
         _source_stamp(before),
         before.st_dev,
-        digest,
-        (known.head + appended)[:_WINDOW] if len(known.head) < _WINDOW else known.head,
-        (known.tail + appended)[-_WINDOW:],
+        (known.tail + data[old - start :])[-_WINDOW:],
+        known.blocks + _block_hashes(data),
+        first + window,
         record,
     )
 
 
-def _rescan(source: Any, before: os.stat_result, row: _Row | None) -> _Tracked | None:
+def _rescan(
+    source: Any, before: os.stat_result, row: _Row | None, changed: bool
+) -> _Tracked | None:
     size = before.st_size
-    digest, prefix, head, tail, done = _scan(source, size, row[2] if row else 0)
+    prefix, whole, tail, blocks, done = _scan(source, size, row[2] if row else 0)
     if done != size:
         return None
     generation = row[4] if row else 0
-    if row and (before.st_ino != row[0] or size < row[1] or prefix != row[3]):
+    if changed or (
+        row and (before.st_ino != row[0] or size < row[1] or prefix != row[3])
+    ):
         generation += 1
-    record = (before.st_ino, size, size, digest.hexdigest(), generation)
-    return _Tracked(_source_stamp(before), before.st_dev, digest, head, tail, record)
+    record = (before.st_ino, size, size, whole, generation)
+    return _Tracked(_source_stamp(before), before.st_dev, tail, blocks, 0, record)
 
 
 def _track_transcript(
@@ -452,7 +477,7 @@ def _track_transcript(
         with path.open("rb") as source:
             before = os.fstat(source.fileno())
             tracked = known and _extend(source, before, known)
-            tracked = tracked or _rescan(source, before, row)
+            tracked = tracked or _rescan(source, before, row, known is not None)
             after = os.fstat(source.fileno())
         current = path.stat()
         if (
