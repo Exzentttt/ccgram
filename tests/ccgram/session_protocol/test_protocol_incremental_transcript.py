@@ -315,12 +315,12 @@ async def test_rotation_between_observation_and_read_never_mixes_generations(
         stream.write(b'{"type": "user", "uuid": "pad"}\n')
     real = MessageBuilder.advance
 
-    def rotate_then_advance(builder, target_path, size, ino):
+    def rotate_then_advance(builder, target_path, size, ino, stamp):
         replacement = tmp_path / "rotated"
         replacement.write_bytes(b"".join(json.dumps(r).encode() + b"\n" for r in new))
         replacement.replace(target_path)
         monkeypatch.setattr(MessageBuilder, "advance", real)
-        return real(builder, target_path, size, ino)
+        return real(builder, target_path, size, ino, stamp)
 
     monkeypatch.setattr(MessageBuilder, "advance", rotate_then_advance)
     await service.refresh()
@@ -509,10 +509,10 @@ async def test_vanishing_session_never_closes_a_builder_mid_update(
         MessageBuilder.advance,
     )
 
-    def blocked(builder, target_path, size, ino):
+    def blocked(builder, target_path, size, ino, stamp):
         entered.set()
         release.wait(5)
-        return real(builder, target_path, size, ino)
+        return real(builder, target_path, size, ino, stamp)
 
     monkeypatch.setattr(MessageBuilder, "advance", blocked)
     history = asyncio.create_task(service.history(session_id, None, 50))
@@ -524,3 +524,106 @@ async def test_vanishing_session_never_closes_a_builder_mid_update(
     release.set()
     outcome = await asyncio.gather(history, refresh, return_exceptions=True)
     assert not any(isinstance(item, ValueError) for item in outcome)
+
+
+async def test_same_size_edit_outside_the_audit_window_is_not_cached_as_clean(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr("ccgram.session_protocol.store._AUDIT", 2 * WINDOW)
+    path = tmp_path / "t.jsonl"
+    path.write_bytes(b"a" * 40_000)
+    store = ProtocolStore(tmp_path / "db")
+    await store.transcript_snapshot("k", path)
+    data = bytearray(path.read_bytes())
+    data[30_000] = ord("Q")
+    path.write_bytes(bytes(data))
+    stat = path.stat()
+    os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns + 10_000_000_000))
+    generations = [
+        (await store.transcript_snapshot("k", path)).generation for _ in range(3)
+    ]
+    assert generations == [1, 1, 1]
+    store.close()
+
+
+async def test_touch_without_content_change_keeps_the_generation(tmp_path):
+    path = tmp_path / "t.jsonl"
+    path.write_bytes(b"a" * 20_000)
+    store = ProtocolStore(tmp_path / "db")
+    await store.transcript_snapshot("k", path)
+    stat = path.stat()
+    os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns + 10_000_000_000))
+    assert (await store.transcript_snapshot("k", path)).generation == 0
+    store.close()
+
+
+async def test_same_size_rewrite_between_observation_and_read_is_not_published(
+    service, backend, tmp_path, monkeypatch
+):
+    path = tmp_path / "t.jsonl"
+    rows = [claude_line("assistant", f"o{i}", f"old{i}") for i in range(3)]
+    path.write_bytes(b"".join(json.dumps(r).encode() + b"\n" for r in rows))
+    backend.target = replace(backend.target, transcript=path)
+    real = MessageBuilder.advance
+
+    def rewrite_then_advance(builder, target_path, *args, **kwargs):
+        raw = target_path.read_bytes().replace(b"old", b"new")
+        target_path.write_bytes(raw)
+        stat = target_path.stat()
+        os.utime(target_path, ns=(stat.st_atime_ns, stat.st_mtime_ns + 10**10))
+        monkeypatch.setattr(MessageBuilder, "advance", real)
+        return real(builder, target_path, *args, **kwargs)
+
+    monkeypatch.setattr(MessageBuilder, "advance", rewrite_then_advance)
+    await service.refresh()
+    await service.refresh()
+    _, events = service.hub.replay(service.hub.epoch, 0)
+    stale = [
+        e.data
+        for e in events
+        if e.type == "message.upsert" and "/g1/" not in e.data["id"]
+    ]
+    assert not {m["parts"][0]["text"] for m in stale} & {"new0", "new1", "new2"}
+
+
+async def test_cancelled_caller_keeps_the_builder_lock_until_the_worker_ends(
+    service, backend, tmp_path, monkeypatch
+):
+    lines = claude_session()
+    path = tmp_path / "t.jsonl"
+    path.write_bytes(b"".join(json.dumps(line).encode() + b"\n" for line in lines[:4]))
+    backend.target = replace(backend.target, transcript=path)
+    await service.refresh()
+    session_id = next(iter(service._snapshots))
+    with path.open("ab") as stream:
+        stream.write(b"".join(json.dumps(line).encode() + b"\n" for line in lines[4:]))
+    guard, active = threading.Lock(), {"now": 0, "max": 0}
+    entered, release, real = (
+        threading.Event(),
+        threading.Event(),
+        MessageBuilder.advance,
+    )
+
+    def tracked(builder, *args, **kwargs):
+        with guard:
+            active["now"] += 1
+            active["max"] = max(active["max"], active["now"])
+        entered.set()
+        release.wait(5)
+        try:
+            return real(builder, *args, **kwargs)
+        finally:
+            with guard:
+                active["now"] -= 1
+
+    monkeypatch.setattr(MessageBuilder, "advance", tracked)
+    first = asyncio.create_task(service.history(session_id, None, 50))
+    while not entered.is_set():
+        await asyncio.sleep(0.01)
+    first.cancel()
+    await asyncio.sleep(0.05)
+    second = asyncio.create_task(service.history(session_id, None, 50))
+    await asyncio.sleep(0.1)
+    release.set()
+    await asyncio.gather(first, second, return_exceptions=True)
+    assert active["max"] == 1

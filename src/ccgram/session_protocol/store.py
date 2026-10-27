@@ -473,6 +473,14 @@ def _rescan(
     )
 
 
+def _rewritten_in_place(before: os.stat_result, known: _Tracked) -> bool:
+    return (
+        before.st_size == known.record[1]
+        and before.st_ino == known.record[0]
+        and before.st_dev == known.dev
+    )
+
+
 def _track_transcript(
     path: Path, row: _Row | None, known: _Tracked | None
 ) -> TranscriptSnapshot:
@@ -483,8 +491,12 @@ def _track_transcript(
     for _ in range(3):
         with path.open("rb") as source:
             before = os.fstat(source.fileno())
-            tracked = known and _extend(source, before, known)
-            tracked = tracked or _rescan(source, before, row, known is not None)
+            if known and _rewritten_in_place(before, known):
+                # Same size, new stamp: an append-only audit window cannot clear it.
+                tracked = _rescan(source, before, known.record, False)
+            else:
+                tracked = known and _extend(source, before, known)
+                tracked = tracked or _rescan(source, before, row, known is not None)
             after = os.fstat(source.fileno())
         current = path.stat()
         if (

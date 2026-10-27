@@ -86,14 +86,13 @@ class MessageBuilder:
     def update(
         self,
         path: Path,
-        size: int,
-        ino: int,
+        stamp: tuple[int, int, int, int],
         source_range: tuple[int, int | None] | None = None,
         *,
         dirty_only: bool = False,
     ) -> tuple[Message, ...]:
-        """Advance to the observed ``size`` of file ``ino``, then select messages."""
-        self.advance(path, size, ino)
+        """Advance to the observed ``stamp`` of the file, then select messages."""
+        self.advance(path, stamp[1], stamp[0], stamp)
         selected = self.messages(
             source_range, only=set(self.dirty) if dirty_only else None
         )
@@ -101,10 +100,17 @@ class MessageBuilder:
             self.dirty = set()
         return selected
 
-    def advance(self, path: Path, size: int, ino: int) -> None:
+    def advance(
+        self,
+        path: Path,
+        size: int,
+        ino: int,
+        stamp: tuple[int, int, int, int] | None = None,
+    ) -> None:
         """Consume transcript bytes up to ``size``; a partial last line waits.
 
-        Raises OSError unless the one open file is still the observed source.
+        Raises OSError unless the one open file is still the observed source; with
+        the observed ``stamp`` it must also be unmodified before and after the read.
         """
         with path.open("rb") as source:
             status = os.fstat(source.fileno())
@@ -114,16 +120,22 @@ class MessageBuilder:
                 or self._ino not in (None, ino)
             ):
                 raise OSError("Transcript source was replaced")
+            if stamp and _stat_stamp(status) != stamp:
+                raise OSError("Transcript source changed since it was observed")
             self._ino = ino
             if self.provider == "gemini":
                 self._reset()
                 self.feed(read_entries(_read_at(source, 0, size), self.provider))
                 self.offset = size
+                if stamp and _stat_stamp(os.fstat(source.fileno())) != stamp:
+                    raise OSError("Transcript source changed while reading")
                 return
             tail = len(self._tail)
             if tail and _read_at(source, self.offset - tail, tail) != self._tail:
                 raise OSError("Transcript source was rewritten")
             self._consume(source, size)
+            if stamp and _stat_stamp(os.fstat(source.fileno())) != stamp:
+                raise OSError("Transcript source changed while reading")
 
     def _consume(self, source: BinaryIO, size: int) -> None:
         span = _CHUNK
@@ -326,3 +338,7 @@ class MessageBuilder:
 def _read_at(source: BinaryIO, start: int, length: int) -> bytes:
     source.seek(start)
     return source.read(length)
+
+
+def _stat_stamp(status: os.stat_result) -> tuple[int, int, int, int]:
+    return status.st_ino, status.st_size, status.st_mtime_ns, status.st_ctime_ns

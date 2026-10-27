@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import json
 from collections.abc import AsyncIterator, Collection
 from dataclasses import replace
@@ -248,7 +249,7 @@ class LocalSessionService:
                 503, "backend_unavailable", "Transcript observation is unavailable"
             )
         provider = target.transcript_provider or target.provider
-        ino, size = target.transcript_stamp[:2]
+        size = target.transcript_stamp[1]
         key = self._source_key(target)
         async with self._builder_lock:
             builder = self._builders.get(key)
@@ -266,15 +267,27 @@ class LocalSessionService:
                     self.store.path.parent,
                 )
                 self._builders[key] = builder
-            try:
-                messages = await asyncio.to_thread(
+            work = asyncio.ensure_future(
+                asyncio.to_thread(
                     builder.update,
                     target.transcript,
-                    size,
-                    ino,
+                    target.transcript_stamp,
                     source_range,
                     dirty_only=dirty_only,
                 )
+            )
+            try:
+                messages = await asyncio.shield(work)
+            except asyncio.CancelledError:
+                # The worker thread outlives the cancelled await and owns the
+                # builder until it ends; its result is discarded, so rebuild.
+                while not work.done():
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await asyncio.wait({work})
+                if not work.cancelled():
+                    work.exception()  # mark retrieved; the result is discarded
+                self._drop_builder(key)
+                raise
             except Exception as exc:
                 # A failed update may leave the index half-written: rebuild next poll.
                 self._drop_builder(key)
