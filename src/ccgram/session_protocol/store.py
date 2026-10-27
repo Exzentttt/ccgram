@@ -351,8 +351,9 @@ class _Tracked:
 
     ``blocks`` holds a short hash per complete 4 KiB block; every growth poll
     re-checks the next ``_AUDIT`` bytes of them, so a rewrite of known bytes is
-    found within ``size / _AUDIT`` polls. The persisted ``record`` keeps the
-    prefix hash of the last full scan, which stays a true hash of its prefix.
+    found within ``size / _AUDIT`` polls. ``digest`` is a running sha256 of every
+    byte read, so the persisted ``record`` always hashes its whole ``size`` prefix
+    and a restart's full read re-verifies everything seen.
     """
 
     stamp: _Stamp
@@ -361,6 +362,7 @@ class _Tracked:
     blocks: bytes
     cursor: int
     record: _Row
+    digest: Any
 
 
 @dataclass(frozen=True, slots=True)
@@ -398,8 +400,8 @@ def _block_hashes(data: bytes) -> bytes:
 
 def _scan(
     source: Any, size: int, prefix_size: int
-) -> tuple[str, str, bytes, bytes, int]:
-    """Stream the file once: hashes of its first ``prefix_size`` bytes and of all."""
+) -> tuple[str, Any, bytes, bytes, int]:
+    """Stream the file once: hash of its first ``prefix_size`` bytes, running hash of all."""
     prefix, whole, blocks = hashlib.sha256(), hashlib.sha256(), []
     pending = tail = b""
     done = 0
@@ -416,7 +418,7 @@ def _scan(
         blocks.append(_block_hashes(pending[:complete]))
         pending = pending[complete:]
         done += len(chunk)
-    return prefix.hexdigest(), whole.hexdigest(), tail, b"".join(blocks), done
+    return prefix.hexdigest(), whole, tail, b"".join(blocks), done
 
 
 def _extend(source: Any, before: os.stat_result, known: _Tracked) -> _Tracked | None:
@@ -439,7 +441,9 @@ def _extend(source: Any, before: os.stat_result, known: _Tracked) -> _Tracked | 
     data = _read_at(source, start, size - start)
     if len(data) != size - start:
         raise OSError("Transcript changed while reading")
-    record = (before.st_ino, size, known.record[2], known.record[3], known.record[4])
+    digest = known.digest.copy()
+    digest.update(data[old - start :])
+    record = (before.st_ino, size, size, digest.hexdigest(), known.record[4])
     return _Tracked(
         _source_stamp(before),
         before.st_dev,
@@ -447,6 +451,7 @@ def _extend(source: Any, before: os.stat_result, known: _Tracked) -> _Tracked | 
         known.blocks + _block_hashes(data),
         first + window,
         record,
+        digest,
     )
 
 
@@ -462,8 +467,10 @@ def _rescan(
         row and (before.st_ino != row[0] or size < row[1] or prefix != row[3])
     ):
         generation += 1
-    record = (before.st_ino, size, size, whole, generation)
-    return _Tracked(_source_stamp(before), before.st_dev, tail, blocks, 0, record)
+    record = (before.st_ino, size, size, whole.hexdigest(), generation)
+    return _Tracked(
+        _source_stamp(before), before.st_dev, tail, blocks, 0, record, whole
+    )
 
 
 def _track_transcript(

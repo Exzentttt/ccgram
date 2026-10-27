@@ -92,7 +92,7 @@ class LocalSessionService:
             sources = {self._source_key(target) for target in targets}
             self.store.retain_transcripts(sources)
             for key in self._builders.keys() - sources:
-                del self._builders[key]
+                self._drop_builder(key)
             for session_id in self._snapshots.keys() - live:
                 self.requests.close(session_id, "vanished")
                 self.hub.publish(
@@ -256,8 +256,12 @@ class LocalSessionService:
                 != (target.conversation_id, provider, target.history_generation)
                 or builder.offset > size
             ):
+                self._drop_builder(key)
                 builder = MessageBuilder(
-                    target.conversation_id, provider, target.history_generation
+                    target.conversation_id,
+                    provider,
+                    target.history_generation,
+                    self.store.path.parent,
                 )
                 self._builders[key] = builder
             try:
@@ -269,11 +273,20 @@ class LocalSessionService:
                     source_range,
                     dirty_only=dirty_only,
                 )
-            except OSError as exc:
+            except Exception as exc:
+                # A failed update may leave the index half-written: rebuild next poll.
+                self._drop_builder(key)
+                if not isinstance(exc, OSError):
+                    raise
                 raise ProtocolError(
                     503, "backend_unavailable", "Transcript is unavailable"
                 ) from exc
         return builder, messages
+
+    def _drop_builder(self, key: str) -> None:
+        builder = self._builders.pop(key, None)
+        if builder is not None:
+            builder.close()
 
     async def _messages(
         self,

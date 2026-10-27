@@ -1018,14 +1018,24 @@ class MessageBuilder:
     touched or handed out. Not thread-safe: callers serialise ``update``.
     """
 
-    def __init__(self, conversation_id: str, provider: str, generation: int) -> None:
+    def __init__(
+        self,
+        conversation_id: str,
+        provider: str,
+        generation: int,
+        spill_dir: Path | None = None,
+    ) -> None:
         self.conversation_id = conversation_id
         self.provider = provider
         self.generation = generation
         self.dirty: set[str] = set()
-        self._spill = tempfile.TemporaryFile()  # noqa: SIM115 (scratch file outlives __init__, freed with the builder)
+        self._spill = tempfile.TemporaryFile(dir=spill_dir)  # noqa: SIM115 (scratch file outlives __init__, closed by close())
         self._ino: int | None = None
         self._reset()
+
+    def close(self) -> None:
+        """Release the scratch file; the builder is unusable afterwards."""
+        self._spill.close()
 
     def _reset(self) -> None:
         self.offset = 0
@@ -1049,10 +1059,12 @@ class MessageBuilder:
     ) -> tuple[Message, ...]:
         """Advance to the observed ``size`` of file ``ino``, then select messages."""
         self.advance(path, size, ino)
-        only = None
+        selected = self.messages(
+            source_range, only=set(self.dirty) if dirty_only else None
+        )
         if dirty_only:
-            only, self.dirty = self.dirty, set()
-        return self.messages(source_range, only=only)
+            self.dirty = set()
+        return selected
 
     def advance(self, path: Path, size: int, ino: int) -> None:
         """Consume transcript bytes up to ``size``; a partial last line waits.
@@ -1212,12 +1224,19 @@ class MessageBuilder:
 
     def _blob(self, value: Any) -> _Spilled:
         data = pickle.dumps(value, pickle.HIGHEST_PROTOCOL)
-        os.pwrite(self._spill.fileno(), data, self._spill_end)
+        if os.pwrite(self._spill.fileno(), data, self._spill_end) != len(data):
+            raise OSError("Spill write was incomplete")
         self._spill_end += len(data)
         return _Spilled(self._spill_end - len(data), len(data))
 
     def _load(self, ref: _Spilled) -> Any:
-        return pickle.loads(os.pread(self._spill.fileno(), ref.length, ref.offset))
+        data = os.pread(self._spill.fileno(), ref.length, ref.offset)
+        try:
+            if len(data) != ref.length:
+                raise EOFError("short spill read")
+            return pickle.loads(data)
+        except (pickle.PickleError, EOFError) as exc:
+            raise OSError("Spill is unreadable") from exc
 
     def _offload(self, value: Any) -> Any:
         if value is None or isinstance(value, bool | int):

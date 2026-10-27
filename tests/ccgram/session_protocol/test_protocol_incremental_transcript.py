@@ -267,8 +267,9 @@ def upserts(service):
 
 
 async def test_service_poll_cost_follows_appended_bytes(
-    service, backend, tmp_path, reads
+    service, backend, tmp_path, reads, monkeypatch
 ):
+    monkeypatch.setattr("ccgram.session_protocol.store._AUDIT", 2 * WINDOW)
     path = tmp_path / "t.jsonl"
     lines = [claude_line("assistant", f"a{i}", "x" * 1000) for i in range(300)]
     path.write_bytes(b"".join(json.dumps(line).encode() + b"\n" for line in lines))
@@ -283,7 +284,7 @@ async def test_service_poll_cost_follows_appended_bytes(
         stream.write(extra)
     reset(reads)
     await service.refresh()
-    assert reads["bytes"] <= 2 * len(extra) + 3 * WINDOW + AUDIT
+    assert reads["bytes"] <= 2 * len(extra) + 3 * WINDOW + 2 * WINDOW
     assert upserts(service)[300:] == ["conv/new"]
     assert not hasattr(backend.target, "transcript_content")
 
@@ -415,3 +416,78 @@ def test_builder_keeps_large_fields_out_of_memory(tmp_path):
     assert builder.messages() == build_messages(
         read_entries(raw, "claude"), "conv", "claude"
     )
+
+
+def latest_revisions(service):
+    _, events = service.hub.replay(service.hub.epoch, 0)
+    return {
+        e.data["id"]: e.data["revision"] for e in events if e.type == "message.upsert"
+    }
+
+
+@pytest.mark.parametrize("failure", ["enospc", "short"])
+async def test_spill_failure_mid_advance_never_corrupts_the_builder(
+    service, backend, tmp_path, monkeypatch, failure
+):
+    lines = claude_session()
+    head = b"".join(json.dumps(line).encode() + b"\n" for line in lines[:4])
+    raw = head + b"".join(json.dumps(line).encode() + b"\n" for line in lines[4:])
+    path = tmp_path / "t.jsonl"
+    path.write_bytes(head)
+    backend.target = replace(backend.target, transcript=path)
+    await service.refresh()
+    with path.open("ab") as stream:
+        stream.write(raw[len(head) :])
+    real, calls = os.pwrite, {"n": 0}
+
+    def flaky(fd, data, offset):
+        calls["n"] += 1
+        if calls["n"] != 3:
+            return real(fd, data, offset)
+        if failure == "enospc":
+            raise OSError(28, "No space left on device")
+        return real(fd, data[: len(data) // 2], offset)
+
+    monkeypatch.setattr("ccgram.session_protocol.messages.os.pwrite", flaky)
+    await service.refresh()
+    await service.refresh()
+    await service.refresh()
+    full = build_messages(read_entries(raw, "claude"), "conv", "claude", 0)
+    assert latest_revisions(service) == {m.id: m.revision for m in full}
+
+
+async def test_spill_write_failure_is_a_503_not_an_escape(
+    service, backend, tmp_path, monkeypatch
+):
+    lines = claude_session()
+    path = tmp_path / "t.jsonl"
+    path.write_bytes(b"".join(json.dumps(line).encode() + b"\n" for line in lines))
+    backend.target = replace(backend.target, transcript=path)
+    real = os.pwrite
+    monkeypatch.setattr(
+        "ccgram.session_protocol.messages.os.pwrite",
+        lambda fd, data, offset: real(fd, data[: len(data) // 2], offset),
+    )
+    await service.refresh()
+    monkeypatch.undo()
+    await service.refresh()
+    assert latest_revisions(service)
+
+
+async def test_edit_past_the_last_full_scan_is_found_after_restart(tmp_path):
+    path = tmp_path / "t.jsonl"
+    path.write_bytes(b"a" * 4096)
+    db = tmp_path / "db"
+    store = ProtocolStore(db)
+    await store.transcript_snapshot("k", path)
+    for _ in range(4):
+        with path.open("ab") as stream:
+            stream.write(b"b" * 20_000)
+        await store.transcript_snapshot("k", path)
+    store.close()
+    data = bytearray(path.read_bytes())
+    data[50_000] = ord("Q")
+    path.write_bytes(bytes(data))
+    store = ProtocolStore(db)
+    assert (await store.transcript_snapshot("k", path)).generation == 1
+    store.close()
