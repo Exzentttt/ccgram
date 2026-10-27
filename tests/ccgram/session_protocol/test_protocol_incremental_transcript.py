@@ -692,3 +692,35 @@ async def test_cancelled_caller_keeps_a_builder_whose_worker_succeeded(
     release.set()
     await asyncio.gather(first, return_exceptions=True)
     assert list(service._builders.values()) == [builder]
+
+
+async def test_cancelled_refresh_does_not_lose_the_messages_it_consumed(
+    service, backend, tmp_path, monkeypatch
+):
+    lines = claude_session()
+    path = tmp_path / "t.jsonl"
+    path.write_bytes(jsonl(lines[:4]))
+    backend.target = replace(backend.target, transcript=path)
+    await service.refresh()
+    seen = set(latest_revisions(service))
+    with path.open("ab") as stream:
+        stream.write(jsonl(lines[4:]))
+    entered, release, real = threading.Event(), threading.Event(), MessageBuilder.advance
+
+    def blocked(self, *args):
+        entered.set()
+        release.wait(5)
+        return real(self, *args)
+
+    monkeypatch.setattr(MessageBuilder, "advance", blocked)
+    refresh = asyncio.create_task(service.refresh())
+    while not entered.is_set():
+        await asyncio.sleep(0.01)
+    refresh.cancel()
+    release.set()
+    await asyncio.gather(refresh, return_exceptions=True)
+    monkeypatch.setattr(MessageBuilder, "advance", real)
+    await service.refresh()
+    full = build_messages(read_entries(jsonl(lines), "claude"), "conv", "claude", 0)
+    assert latest_revisions(service) == {m.id: m.revision for m in full}
+    assert set(latest_revisions(service)) - seen
