@@ -92,8 +92,9 @@ class LocalSessionService:
                 live.add(snapshot.id)
             sources = {self._source_key(target) for target in targets}
             self.store.retain_transcripts(sources)
-            for key in self._builders.keys() - sources:
-                self._drop_builder(key)
+            async with self._builder_lock:
+                for key in self._builders.keys() - sources:
+                    self._drop_builder(key)
             for session_id in self._snapshots.keys() - live:
                 self.requests.close(session_id, "vanished")
                 self.hub.publish(

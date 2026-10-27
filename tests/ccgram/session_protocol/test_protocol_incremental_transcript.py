@@ -1,7 +1,9 @@
 """Per-poll transcript cost is O(appended bytes), never O(file size)."""
 
 import json
+import asyncio
 import os
+import threading
 import tracemalloc
 from dataclasses import replace
 from pathlib import Path
@@ -488,3 +490,37 @@ async def test_edit_past_the_last_full_scan_is_found_after_restart(tmp_path):
     store = ProtocolStore(db)
     assert (await store.transcript_snapshot("k", path)).generation == 1
     store.close()
+
+
+async def test_vanishing_session_never_closes_a_builder_mid_update(
+    service, backend, tmp_path, monkeypatch
+):
+    lines = claude_session()
+    path = tmp_path / "t.jsonl"
+    path.write_bytes(b"".join(json.dumps(line).encode() + b"\n" for line in lines[:4]))
+    backend.target = replace(backend.target, transcript=path)
+    await service.refresh()
+    session_id = next(iter(service._snapshots))
+    with path.open("ab") as stream:
+        stream.write(b"".join(json.dumps(line).encode() + b"\n" for line in lines[4:]))
+    entered, release, real = (
+        threading.Event(),
+        threading.Event(),
+        MessageBuilder.advance,
+    )
+
+    def blocked(builder, target_path, size, ino):
+        entered.set()
+        release.wait(5)
+        return real(builder, target_path, size, ino)
+
+    monkeypatch.setattr(MessageBuilder, "advance", blocked)
+    history = asyncio.create_task(service.history(session_id, None, 50))
+    while not entered.is_set():
+        await asyncio.sleep(0.01)
+    backend.disappear = True
+    refresh = asyncio.create_task(service.refresh())
+    await asyncio.sleep(0.1)
+    release.set()
+    outcome = await asyncio.gather(history, refresh, return_exceptions=True)
+    assert not any(isinstance(item, ValueError) for item in outcome)
