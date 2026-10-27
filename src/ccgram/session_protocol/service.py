@@ -132,6 +132,7 @@ class LocalSessionService:
                 target,
                 available=False,
                 transcript_stamp=None,
+                transcript_digest=None,
                 status=Status("unknown", str(exc), "screen", utc_now()),
             )
             sid, version = self.store.bind(target.id, target.binding, target.aliases)
@@ -146,7 +147,9 @@ class LocalSessionService:
             self._revisions.pop(session_id, None)
             self._transcript_stamps.pop(session_id, None)
             self._republish.add(session_id)
-        self._targets[session_id] = replace(target, transcript_stamp=None)
+        self._targets[session_id] = replace(
+            target, transcript_stamp=None, transcript_digest=None
+        )
         opened = self.requests.reconcile(
             session_id, target.conversation_id, version, prompt
         )
