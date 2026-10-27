@@ -724,3 +724,39 @@ async def test_cancelled_refresh_does_not_lose_the_messages_it_consumed(
     full = build_messages(read_entries(jsonl(lines), "claude"), "conv", "claude", 0)
     assert latest_revisions(service) == {m.id: m.revision for m in full}
     assert set(latest_revisions(service)) - seen
+
+
+async def test_history_verifies_its_own_observation_when_a_refresh_interleaves(
+    service, backend, tmp_path, monkeypatch
+):
+    path = tmp_path / "t.jsonl"
+    rows = [claude_line("assistant", f"o{i}", f"old{i}") for i in range(3)]
+    old = jsonl(rows)
+    path.write_bytes(old)
+    backend.target = replace(backend.target, transcript=path)
+    await service.refresh()
+    session_id = next(iter(service._snapshots))
+    # Drop the refresh builder so history starts a fresh one (digest check applies).
+    service._drop_builder(next(iter(service._builders)))
+    real = service._built
+
+    async def refresh_first(*args, **kwargs):
+        monkeypatch.setattr(service, "_built", real)
+        path.write_bytes(
+            old.replace(b"old", b"new") + jsonl([claude_line("user", "x", "late")])
+        )
+        await service.refresh()
+        return await real(*args, **kwargs)
+
+    monkeypatch.setattr(service, "_built", refresh_first)
+    outcome = await asyncio.gather(
+        service.history(session_id, None, 50), return_exceptions=True
+    )
+    texts = {
+        part.text
+        for page in outcome
+        if not isinstance(page, BaseException)
+        for message in page.messages
+        for part in message.parts
+    }
+    assert not texts & {"new0", "new1", "new2"}

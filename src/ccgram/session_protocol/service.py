@@ -76,7 +76,6 @@ class LocalSessionService:
         self._refresh_lock = asyncio.Lock()
         self._transcript_stamps: dict[str, tuple[int, int, int, int]] = {}
         self._builders: dict[str, MessageBuilder] = {}
-        self._digests: dict[str, tuple[int, str]] = {}
         self._builder_lock = asyncio.Lock()
         self._republish: set[str] = set()
         self._revisions: dict[str, dict[str, int]] = {}
@@ -227,11 +226,11 @@ class LocalSessionService:
             raise ProtocolError(
                 503, "backend_unavailable", "Transcript source is unavailable"
             ) from exc
-        self._digests[source_key] = observation.stamp[1], observation.record[3]
         return replace(
             target,
             history_generation=observation.generation,
             transcript_stamp=observation.stamp,
+            transcript_digest=observation.record[3],
         )
 
     @staticmethod
@@ -276,7 +275,7 @@ class LocalSessionService:
                     target.transcript_stamp,
                     source_range,
                     dirty_only=dirty_only,
-                    digest=self._observed_digest(key, size),
+                    digest=target.transcript_digest,
                 )
             )
             try:
@@ -312,10 +311,6 @@ class LocalSessionService:
                 builder.dirty |= {message.id for message in work.result()}
         elif not isinstance(failure, TranscriptChangedError):
             self._drop_builder(key)
-
-    def _observed_digest(self, key: str, size: int) -> str | None:
-        known = self._digests.get(key)
-        return known[1] if known and known[0] == size else None
 
     def _drop_builder(self, key: str) -> None:
         builder = self._builders.pop(key, None)

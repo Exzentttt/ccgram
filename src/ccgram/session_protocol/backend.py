@@ -72,6 +72,7 @@ class Target:
     transcript_provider: str = ""
     history_generation: int = 0
     transcript_stamp: tuple[int, int, int, int] | None = None
+    transcript_digest: str | None = None
     selected_pane_command: str | None = None
     foreground_argv: tuple[str, ...] = ()
     available: bool = True
