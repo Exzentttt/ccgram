@@ -8,11 +8,8 @@ from pathlib import Path
 
 import pytest
 
-from ccgram.session_protocol.messages import (
-    MessageBuilder,
-    build_messages,
-    read_entries,
-)
+from ccgram.session_protocol.message_builder import MessageBuilder
+from ccgram.session_protocol.messages import build_messages, read_entries
 from ccgram.session_protocol.store import ProtocolStore
 
 WINDOW = 4096
@@ -290,7 +287,7 @@ async def test_service_poll_cost_follows_appended_bytes(
 
 
 def test_builder_chunking_handles_lines_longer_than_a_chunk(tmp_path, monkeypatch):
-    monkeypatch.setattr("ccgram.session_protocol.messages._CHUNK", 64)
+    monkeypatch.setattr("ccgram.session_protocol.message_builder._CHUNK", 64)
     lines = [claude_line("assistant", f"a{i}", "y" * (50 * i)) for i in range(6)]
     raw = b"".join(json.dumps(line).encode() + b"\n" for line in lines)
     path = tmp_path / "t.jsonl"
@@ -448,7 +445,7 @@ async def test_spill_failure_mid_advance_never_corrupts_the_builder(
             raise OSError(28, "No space left on device")
         return real(fd, data[: len(data) // 2], offset)
 
-    monkeypatch.setattr("ccgram.session_protocol.messages.os.pwrite", flaky)
+    monkeypatch.setattr("ccgram.session_protocol.message_builder.os.pwrite", flaky)
     await service.refresh()
     await service.refresh()
     await service.refresh()
@@ -465,7 +462,7 @@ async def test_spill_write_failure_is_a_503_not_an_escape(
     backend.target = replace(backend.target, transcript=path)
     real = os.pwrite
     monkeypatch.setattr(
-        "ccgram.session_protocol.messages.os.pwrite",
+        "ccgram.session_protocol.message_builder.os.pwrite",
         lambda fd, data, offset: real(fd, data[: len(data) // 2], offset),
     )
     await service.refresh()

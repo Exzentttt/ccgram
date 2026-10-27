@@ -13,7 +13,8 @@ from typing import Any, Protocol
 from ..providers.base import HookEvent
 from .backend import CreationOptions, Prompt, SessionBackend, Target
 from .events import Event, EventHub
-from .messages import Message, MessageBuilder
+from .message_builder import MessageBuilder
+from .messages import Message
 from .models import (
     Action,
     ActionResult,
